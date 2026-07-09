@@ -4,10 +4,11 @@
 //! 「uncompressed_header → compressed_header がパニックせず最後まで読める」ことと、
 //! 読み取った tx_mode / skip_prob が妥当な値域に収まることを検証する。
 //!
-//! 係数（トークン）復号が未実装のため、`decode_tiles` による完全なタイル走査はまだ成功しない
-//! 可能性が高い。そのため本テストでは `compressed_header` の読了までを検証対象とし、
-//! `TileDecoder::decode_tiles` の呼び出しは「パニックしないこと」のみを確認する
-//! （成功・失敗どちらの `Result` も許容する）。タイル/パーティション/モード情報の詳細な
+//! `decode_tiles` はトークン復号・再構成まで含めて完全に実装済みだが、本テストでは
+//! 引き続き `compressed_header` の読了までを主目的として検証し、`TileDecoder::decode_tiles`
+//! の呼び出しは「パニックしないこと」のみを確認する（成功・失敗どちらの `Result` も許容する）。
+//! 完全なピクセル出力の正しさ（統計的な sanity チェック）は `tests/decode_test.rs` の
+//! `decode_keyframe` 経由のテストで検証している。タイル/パーティション/モード情報の詳細な
 //! 正しさは `src/tile.rs` 内の合成ビットストリームによる単体テストで検証している。
 //!
 //! テストベクタが存在しない環境では、該当テストは早期 return + `eprintln!` でスキップされる
