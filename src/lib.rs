@@ -13,6 +13,7 @@
 
 pub mod bit_reader;
 pub mod bool_coder;
+pub mod compressed_header;
 pub mod header;
 pub mod ivf;
 pub mod prob_tables;
