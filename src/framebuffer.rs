@@ -58,6 +58,16 @@ impl Plane {
         }
         out
     }
+
+    /// [`Plane::crop`] と同じだが、`Vec<u8>` ではなく新しい [`Plane`] として返す
+    /// （仕様 8.10 節 `FrameStore` への格納・DPB 参照フレームデータ用）。
+    pub fn crop_to_plane(&self, crop_width: usize, crop_height: usize) -> Plane {
+        Plane {
+            width: crop_width,
+            height: crop_height,
+            data: self.crop(crop_width, crop_height),
+        }
+    }
 }
 
 #[cfg(test)]

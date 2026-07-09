@@ -12,6 +12,11 @@
 //! - クリップ境界 `max_x`/`max_y`（= 仕様の `maxX`/`maxY`、プレーンごとに異なる）
 
 use crate::framebuffer::Plane;
+use crate::mv::Mv;
+use crate::prob_tables::{
+    BLOCK_8X8, INTERP_EXTEND, NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP,
+    REF_SCALE_SHIFT, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, SUBPEL_SHIFTS,
+};
 use crate::prob_tables::{
     D117_PRED, D135_PRED, D153_PRED, D207_PRED, D45_PRED, D63_PRED, DC_PRED, H_PRED, TM_PRED,
     TX_4X4, V_PRED,
@@ -263,15 +268,303 @@ pub fn predict_intra(
     }
 }
 
-/// `predict_inter()`（仕様 8.5.2 節 "Inter prediction process"）のプレースホルダー。
+/// 参照フレーム 1 プレーン分のビュー（仕様の `FrameStore[ refIdx ][ plane ]` +
+/// `RefFrameWidth`/`RefFrameHeight` 相当）。`width`/`height` は輝度（プレーン 0）基準の
+/// フレーム全体サイズ（仕様 8.5.2.3 節のスケーリング計算で使う `RefFrameWidth[refIdx]` そのもの。
+/// クロマプレーンでも輝度サイズを渡すこと）。`plane` は該当プレーンぶんクロップ済みの参照
+/// ピクセルデータ（`Plane::width`/`height` がそのまま仕様の `lastX+1`/`lastY+1` になる）。
+pub struct RefPlaneView<'a> {
+    pub plane: &'a Plane,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[inline]
+fn round_mv_comp_q2(value: i32) -> i32 {
+    if value < 0 {
+        (value - 1) / 2
+    } else {
+        (value + 1) / 2
+    }
+}
+
+#[inline]
+fn round_mv_comp_q4(value: i32) -> i32 {
+    if value < 0 {
+        (value - 2) / 4
+    } else {
+        (value + 2) / 4
+    }
+}
+
+/// `clip1(x)` = `Clip3( 0, (1<<BitDepth)-1, x )`（仕様 4 節）。
+#[inline]
+fn clip1(x: i32, bit_depth: u8) -> i32 {
+    clip3(0, (1i32 << bit_depth) - 1, x)
+}
+
+/// 動きベクトル選択処理（仕様 8.5.2.1 節 "Motion vector selection process"）。
+fn select_mv(
+    plane: usize,
+    ref_list: usize,
+    block_idx: usize,
+    mi_size: u8,
+    block_mvs: &[[Mv; 4]; 2],
+    subsampling_x: u32,
+    subsampling_y: u32,
+) -> Mv {
+    let bm = &block_mvs[ref_list];
+    if plane == 0 || mi_size >= BLOCK_8X8 {
+        return bm[block_idx];
+    }
+    match (subsampling_x, subsampling_y) {
+        (0, 0) => bm[block_idx],
+        (0, 1) => [
+            round_mv_comp_q2(bm[block_idx][0] + bm[block_idx + 2][0]),
+            round_mv_comp_q2(bm[block_idx][1] + bm[block_idx + 2][1]),
+        ],
+        (1, 0) => [
+            round_mv_comp_q2(bm[block_idx][0] + bm[block_idx + 1][0]),
+            round_mv_comp_q2(bm[block_idx][1] + bm[block_idx + 1][1]),
+        ],
+        _ => [
+            round_mv_comp_q4(bm[0][0] + bm[1][0] + bm[2][0] + bm[3][0]),
+            round_mv_comp_q4(bm[0][1] + bm[1][1] + bm[2][1] + bm[3][1]),
+        ],
+    }
+}
+
+/// 動きベクトルクランプ処理（仕様 8.5.2.2 節 "Motion vector clamping process"）。
+#[allow(clippy::too_many_arguments)]
+fn clamp_mv_for_plane(
+    plane: usize,
+    mv: Mv,
+    mi_row: u32,
+    mi_col: u32,
+    mi_size: u8,
+    mi_rows: u32,
+    mi_cols: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+) -> Mv {
+    let (sx, sy) = if plane == 0 {
+        (0i32, 0i32)
+    } else {
+        (subsampling_x as i32, subsampling_y as i32)
+    };
+    let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as i32;
+    let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as i32;
+    let mi_row = mi_row as i32;
+    let mi_col = mi_col as i32;
+    let mi_rows = mi_rows as i32;
+    let mi_cols = mi_cols as i32;
+
+    let mb_to_top_edge = -((mi_row * 8) * 16) >> sy;
+    let mb_to_bottom_edge = ((mi_rows - bh - mi_row) * 8 * 16) >> sy;
+    let mb_to_left_edge = -((mi_col * 8) * 16) >> sx;
+    let mb_to_right_edge = ((mi_cols - bw - mi_col) * 8 * 16) >> sx;
+
+    let spel_left = (INTERP_EXTEND + ((bw * 8) >> sx)) << SUBPEL_BITS;
+    let spel_right = spel_left - SUBPEL_SHIFTS;
+    let spel_top = (INTERP_EXTEND + ((bh * 8) >> sy)) << SUBPEL_BITS;
+    let spel_bottom = spel_top - SUBPEL_SHIFTS;
+
+    [
+        clip3(
+            mb_to_top_edge - spel_top,
+            mb_to_bottom_edge + spel_bottom,
+            (2 * mv[0]) >> sy,
+        ),
+        clip3(
+            mb_to_left_edge - spel_left,
+            mb_to_right_edge + spel_right,
+            (2 * mv[1]) >> sx,
+        ),
+    ]
+}
+
+/// 動きベクトルスケーリング処理（仕様 8.5.2.3 節 "Motion vector scaling process"）。
+/// 戻り値は `(startX, startY, stepX, stepY)`（1/16 ペル単位）。
+#[allow(clippy::too_many_arguments)]
+fn scale_mv_for_plane(
+    plane: usize,
+    x: usize,
+    y: usize,
+    clamped_mv: Mv,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    ref_width: u32,
+    ref_height: u32,
+    frame_width: u32,
+    frame_height: u32,
+) -> (i64, i64, i64, i64) {
+    let x_scale = ((ref_width as i64) << REF_SCALE_SHIFT) / frame_width as i64;
+    let y_scale = ((ref_height as i64) << REF_SCALE_SHIFT) / frame_height as i64;
+    let base_x = ((x as i64) * x_scale) >> REF_SCALE_SHIFT;
+    let base_y = ((y as i64) * y_scale) >> REF_SCALE_SHIFT;
+    let luma_x = if plane > 0 {
+        (x as u32) << subsampling_x
+    } else {
+        x as u32
+    } as i64;
+    let luma_y = if plane > 0 {
+        (y as u32) << subsampling_y
+    } else {
+        y as u32
+    } as i64;
+    let frac_x = ((16 * luma_x * x_scale) >> REF_SCALE_SHIFT) & SUBPEL_MASK as i64;
+    let frac_y = ((16 * luma_y * y_scale) >> REF_SCALE_SHIFT) & SUBPEL_MASK as i64;
+    let d_x = ((clamped_mv[1] as i64 * x_scale) >> REF_SCALE_SHIFT) + frac_x;
+    let d_y = ((clamped_mv[0] as i64 * y_scale) >> REF_SCALE_SHIFT) + frac_y;
+    let step_x = (16 * x_scale) >> REF_SCALE_SHIFT;
+    let step_y = (16 * y_scale) >> REF_SCALE_SHIFT;
+    let start_x = (base_x << SUBPEL_BITS) + d_x;
+    let start_y = (base_y << SUBPEL_BITS) + d_y;
+    (start_x, start_y, step_x, step_y)
+}
+
+/// ブロック単位のインター予測処理（仕様 8.5.2.4 節 "Block inter prediction process"）。
+/// 戻り値は `pred[r][c]`（`r`=0..h-1, `c`=0..w-1）の行優先 `Vec<i32>`。
+#[allow(clippy::too_many_arguments)]
+fn block_inter_predict(
+    ref_plane: &Plane,
+    x: i64,
+    y: i64,
+    x_step: i64,
+    y_step: i64,
+    w: usize,
+    h: usize,
+    interp_filter: u8,
+    bit_depth: u8,
+) -> Vec<i32> {
+    let last_x = ref_plane.width as i64 - 1;
+    let last_y = ref_plane.height as i64 - 1;
+    let intermediate_height = (((h as i64 - 1) * y_step + 15) >> 4) + 8;
+    let filters = &SUBPEL_FILTERS[interp_filter as usize];
+
+    let mut intermediate = vec![0i32; (intermediate_height as usize) * w];
+    for r in 0..intermediate_height {
+        let ref_y = ((y >> 4) + r - 3).clamp(0, last_y) as usize;
+        for c in 0..w {
+            let p = x + x_step * (c as i64);
+            let coeffs = &filters[(p & 15) as usize];
+            let mut s = 0i32;
+            for (t, &coeff) in coeffs.iter().enumerate() {
+                let ref_x = ((p >> 4) + t as i64 - 3).clamp(0, last_x) as usize;
+                s += coeff * ref_plane.get(ref_x, ref_y) as i32;
+            }
+            intermediate[(r as usize) * w + c] = clip1(round2(s, 7), bit_depth);
+        }
+    }
+
+    let mut pred = vec![0i32; h * w];
+    for r in 0..h {
+        let p = (y & 15) + y_step * (r as i64);
+        let coeffs = &filters[(p & 15) as usize];
+        let base_row = (p >> 4) as usize;
+        for c in 0..w {
+            let mut s = 0i32;
+            for (t, &coeff) in coeffs.iter().enumerate() {
+                s += coeff * intermediate[(base_row + t) * w + c];
+            }
+            pred[r * w + c] = clip1(round2(s, 7), bit_depth);
+        }
+    }
+    pred
+}
+
+/// `predict_inter()`（仕様 8.5.2 節 "Inter prediction process"）。
 ///
-/// M3 前半（インターフレームのビットストリーム復号）時点では動き補償・サブピクセル補間
-/// フィルタを実装しておらず、呼び出し元（[`crate::tile::TileDecoder::residual`]）はモード
-/// 情報（`ref_frame`/`mv`/`interp_filter`、`MiInfo` に記録済み）を読み取るだけでこの関数を
-/// 呼ぶ。仕様 7.4.15 節 NOTE のとおり `predict_inter` はシンタックス復号処理に一切影響しない
-/// （呼ばなくてもビットストリームは正しく読み進められる）ため、本関数は意図的に無を行う
-/// スタブとして残し、M3 後半で実際の動き補償処理に置き換える。
-pub fn predict_inter_stub() {}
+/// `dst` の `(x, y)` を左上とする `w x h` の領域に、動き補償・サブピクセル補間済みの
+/// インター予測サンプルを書き込む。`block_idx` は仕様の `blockIdx`（4x4 単位で、この
+/// ブロックまでにどれだけ予測済みかを表す。`MiSize < BLOCK_8X8` のときのみ意味を持つ）。
+#[allow(clippy::too_many_arguments)]
+pub fn predict_inter(
+    dst: &mut Plane,
+    plane: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    block_idx: usize,
+    ref_frame: [u8; 2],
+    block_mvs: &[[Mv; 4]; 2],
+    interp_filter: u8,
+    mi_row: u32,
+    mi_col: u32,
+    mi_size: u8,
+    mi_rows: u32,
+    mi_cols: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    frame_width: u32,
+    frame_height: u32,
+    bit_depth: u8,
+    refs: [Option<&RefPlaneView>; 2],
+) {
+    use crate::prob_tables::INTRA_FRAME;
+    let is_compound = ref_frame[1] > INTRA_FRAME;
+    let n_refs = 1 + is_compound as usize;
+
+    let mut preds: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
+    for (ref_list, pred_slot) in preds.iter_mut().enumerate().take(n_refs) {
+        let mv = select_mv(
+            plane,
+            ref_list,
+            block_idx,
+            mi_size,
+            block_mvs,
+            subsampling_x,
+            subsampling_y,
+        );
+        let clamped = clamp_mv_for_plane(
+            plane,
+            mv,
+            mi_row,
+            mi_col,
+            mi_size,
+            mi_rows,
+            mi_cols,
+            subsampling_x,
+            subsampling_y,
+        );
+        let view = refs[ref_list].expect("参照フレームスロットが存在しない（DPB 未初期化）");
+        let (start_x, start_y, step_x, step_y) = scale_mv_for_plane(
+            plane,
+            x,
+            y,
+            clamped,
+            subsampling_x,
+            subsampling_y,
+            view.width,
+            view.height,
+            frame_width,
+            frame_height,
+        );
+        *pred_slot = block_inter_predict(
+            view.plane,
+            start_x,
+            start_y,
+            step_x,
+            step_y,
+            w,
+            h,
+            interp_filter,
+            bit_depth,
+        );
+    }
+
+    for i in 0..h {
+        for j in 0..w {
+            let value = if is_compound {
+                round2(preds[0][i * w + j] + preds[1][i * w + j], 1)
+            } else {
+                preds[0][i * w + j]
+            };
+            dst.set(x + j, y + i, value as u8);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
