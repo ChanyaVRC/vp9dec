@@ -15,26 +15,27 @@
 //! を意味する。同じサンプルが複数回フィルタされ得るため、この走査順（縦→横、スーパーブロック
 //! ラスタ順）を厳密に守る必要がある（仕様 8.8 節の NOTE を参照）。
 //!
-//! # M2b（キーフレームのみ）における簡略化
+//! # 既知の簡略化
 //!
-//! 本実装が対象とするキーフレームでは以下が常に成立するため、仕様の一般形から簡略化している:
-//! - `RefFrames[ row ][ col ][ 0 ] <= INTRA_FRAME` は常に真（`isIntra` は常に `true`）。
-//! - `YModes` は常にイントラモード（`NEARESTMV`/`NEARMV`/`NEWMV` を取らない）ため、
-//!   仕様 8.8.4 節の `modeType` は常に 0。
-//! - `ref` は常に `INTRA_FRAME`（0）。
+//! - `isIntra`（`RefFrames[row][col][0] <= INTRA_FRAME`）・`modeType`（`YModes` が
+//!   `NEARESTMV`/`NEARMV`/`NEWMV` かどうか）は M3 で `MiInfo` に追加した `ref_frame`/`y_mode`
+//!   から実値を参照する（`superblock_loop_filter` 参照）。
 //! - `segmentation_enabled == true` のフレームは `tile.rs` が `TileError::SegmentationNotSupported`
 //!   として拒否するため、`seg_feature_active( SEG_LVL_ALT_L )` は常に偽と仮定できる
 //!   （仕様 8.8.1 節 手順 2 は発生しない）。
-//!
-//! M3（インター予測）で `MiInfo` に `ref_frame` を追加する際は、`is_intra`/`mode_type` の
-//! 決め打ちを外し、実際の参照フレーム・予測モードを見るように改修する必要がある
-//! （README.md の M3 引き継ぎメモ参照）。
+//! - `loop_filter_ref_deltas`/`loop_filter_mode_deltas` はフレーム間で持続する状態だが
+//!   （仕様 7.2 節 `setup_past_independence`）、本実装は毎フレーム `parse_loop_filter_params`
+//!   内でデフォルト値 `[1, 0, -1, -1]`/`[0, 0]` から起動する（前フレームからの引き継ぎ未実装）。
+//!   これはループフィルタの出力画素にのみ影響し、ビットストリームの読み取りには影響しない
+//!   （`loop_filter_params()` が読むビット数は現在のデルタ値に依存しないため）。M3 後半で
+//!   フレーム間状態として引き継ぐよう改修する。
 
 use crate::framebuffer::Plane;
 use crate::header::LoopFilterParams;
 use crate::prob_tables::{
-    BLOCK_16X16, BLOCK_8X8, MAX_TXSIZE_LOOKUP, NUM_8X8_BLOCKS_HIGH_LOOKUP,
-    NUM_8X8_BLOCKS_WIDE_LOOKUP, SS_SIZE_LOOKUP, TX_16X16, TX_4X4, TX_8X8,
+    BLOCK_16X16, BLOCK_8X8, MAX_TXSIZE_LOOKUP, NEARESTMV, NEARMV, NEWMV,
+    NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP, SS_SIZE_LOOKUP, TX_16X16, TX_4X4,
+    TX_8X8,
 };
 use crate::tile::MiGrid;
 
@@ -391,9 +392,9 @@ fn superblock_loop_filter(
                 mi_size.max(BLOCK_16X16)
             };
             let skip = mi.skip;
-            // M2b はキーフレームのみを対象とするため isIntra は常に真
-            // （モジュールコメント参照。MiInfo は ref_frame を保持しない）。
-            let is_intra = true;
+            // 仕様 8.8.2 節手順9: isIntra = RefFrames[loopRow][loopCol][0] <= INTRA_FRAME。
+            let ref_frame = mi.ref_frame[0];
+            let is_intra = ref_frame == INTRA_FRAME as u8;
 
             let is_block_edge = if pass == 0 {
                 x % (8 * NUM_8X8_BLOCKS_WIDE_LOOKUP[sb_size as usize] as u32) == 0
@@ -425,7 +426,9 @@ fn superblock_loop_filter(
                 tx_sz, is_32_edge, pass, x, y, sub_x, sub_y, mi_cols, mi_rows,
             );
 
-            let lvl = lvl_lookup[mi.segment_id as usize][INTRA_FRAME][0];
+            // 仕様 8.8.4 節: modeType = 1 if mode in {NEARESTMV,NEARMV,NEWMV} else 0。
+            let mode_type = matches!(mi.y_mode, NEARESTMV | NEARMV | NEWMV) as usize;
+            let lvl = lvl_lookup[mi.segment_id as usize][ref_frame as usize][mode_type];
 
             if apply_filter && lvl > 0 {
                 let (limit, blimit, thresh) = adaptive_filter_strength(lvl, sharpness);

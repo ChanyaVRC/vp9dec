@@ -263,6 +263,16 @@ pub fn predict_intra(
     }
 }
 
+/// `predict_inter()`（仕様 8.5.2 節 "Inter prediction process"）のプレースホルダー。
+///
+/// M3 前半（インターフレームのビットストリーム復号）時点では動き補償・サブピクセル補間
+/// フィルタを実装しておらず、呼び出し元（[`crate::tile::TileDecoder::residual`]）はモード
+/// 情報（`ref_frame`/`mv`/`interp_filter`、`MiInfo` に記録済み）を読み取るだけでこの関数を
+/// 呼ぶ。仕様 7.4.15 節 NOTE のとおり `predict_inter` はシンタックス復号処理に一切影響しない
+/// （呼ばなくてもビットストリームは正しく読み進められる）ため、本関数は意図的に無を行う
+/// スタブとして残し、M3 後半で実際の動き補償処理に置き換える。
+pub fn predict_inter_stub() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
