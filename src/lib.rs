@@ -11,5 +11,7 @@
 //!
 //! （モジュールは以降のコミットで段階的に追加する。）
 
+pub mod bit_reader;
 pub mod bool_coder;
+pub mod header;
 pub mod ivf;
