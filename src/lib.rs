@@ -19,6 +19,7 @@ pub mod framebuffer;
 pub mod header;
 pub mod ivf;
 pub mod loop_filter;
+pub mod md5;
 pub mod predict;
 pub mod prob_tables;
 pub mod quant;
