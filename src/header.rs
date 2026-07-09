@@ -3,13 +3,22 @@
 //! 非圧縮フレームヘッダは bool デコーダではなく、[`crate::bit_reader::BitReader`] による
 //! 素朴な MSB 優先のビット読み出し（`f(n)` / `s(n)` descriptor、仕様 9.1 節）でパースされる。
 //!
-//! M1 時点では、以下のみをサポートする:
-//! - `show_existing_frame == 1` のケース（既存フレームの再表示指示のみを返す）
-//! - `frame_type == KEY_FRAME` のケース（uncompressed_header の全フィールドをパースする）
-//!
-//! インターフレーム・イントラオンリーフレームのパースは M2 以降で対応する。
+//! M1/M2 ではキーフレームのみサポートしていたが、M3 でインターフレーム・イントラオンリー
+//! フレームのパースにも対応した（仕様 6.2 節の `uncompressed_header()` 全体）。
+//! `frame_size_with_refs()`（仕様 6.2.5 節）は参照フレームスロットのサイズ
+//! （`RefFrameWidth`/`RefFrameHeight`）を必要とするため、[`parse_uncompressed_header`] は
+//! それを外部から渡してもらう設計にしている（呼び出し側がフレーム間状態を保持する）。
 
 use crate::bit_reader::BitReader;
+// `ref_frame`/`interpolation_filter` の値・参照フレームスロット数は複数モジュール
+// （tile.rs の動きベクトル予測・compressed_header.rs の frame_reference_mode など）から
+// 共通して使うため、`prob_tables` に一元定義してある。
+pub use crate::prob_tables::{
+    ALTREF_FRAME, BILINEAR, EIGHTTAP, EIGHTTAP_SHARP, EIGHTTAP_SMOOTH, GOLDEN_FRAME, INTRA_FRAME,
+    LAST_FRAME, NUM_REF_FRAMES, SWITCHABLE,
+};
+
+const LITERAL_TO_TYPE: [u8; 4] = [EIGHTTAP_SMOOTH, EIGHTTAP, EIGHTTAP_SHARP, BILINEAR];
 
 /// `frame_type` syntax element の値（仕様 7.2 節）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,8 +49,6 @@ pub enum HeaderError {
     /// `color_space == CS_RGB` かつ `profile_low_bit == 0`
     /// （仕様の適合性要件違反。プロファイル 0 と 2 では RGB は使用できない）。
     InvalidColorConfigForProfile,
-    /// `frame_type != KEY_FRAME`。インターフレーム・イントラオンリーフレームは M2 以降で対応する。
-    UnsupportedNonKeyFrame,
 }
 
 /// ループフィルタ関連パラメータ（仕様 6.2.8 節 `loop_filter_params`）。
@@ -95,6 +102,13 @@ pub struct NewFrameHeader {
     pub frame_type: FrameType,
     pub show_frame: bool,
     pub error_resilient_mode: bool,
+    /// `FrameIsIntra`。キーフレームでは常に真。非キーフレームでは `intra_only` と同じ値。
+    pub frame_is_intra: bool,
+    /// `intra_only`。`frame_type == NonKeyFrame` かつ `show_frame == 0` の場合のみ
+    /// ビットストリームから読まれる（それ以外は 0）。
+    pub intra_only: bool,
+    /// `reset_frame_context`（仕様 7.2 節）。`error_resilient_mode == 1` の場合は常に 0。
+    pub reset_frame_context: u8,
     pub color_config: ColorConfig,
     pub width: u32,
     pub height: u32,
@@ -102,6 +116,18 @@ pub struct NewFrameHeader {
     pub render_height: u32,
     /// 更新対象となる参照フレームスロットのビットマスク。キーフレームでは常に 0xFF。
     pub refresh_frame_flags: u8,
+    /// インター予測で参照するフレームスロット番号（`LAST_FRAME`/`GOLDEN_FRAME`/`ALTREF_FRAME`
+    /// の順）。`FrameIsIntra == 1` の場合は意味を持たない（`[0, 0, 0]`）。
+    pub ref_frame_idx: [u8; 3],
+    /// `ref_frame_sign_bias[ i ]`。添字は `ref_frame` の値（`INTRA_FRAME`..`ALTREF_FRAME`、
+    /// つまり 0..3）と同じ意味論。`FrameIsIntra == 1` では常に `[false; 4]`
+    /// （`setup_past_independence()` による）。
+    pub ref_frame_sign_bias: [bool; 4],
+    /// `allow_high_precision_mv`。`FrameIsIntra == 1` またはイントラオンリーフレームでは
+    /// 意味を持たない（`false`）。
+    pub allow_high_precision_mv: bool,
+    /// `interpolation_filter`（`EIGHTTAP`..`SWITCHABLE` の値）。
+    pub interpolation_filter: u8,
     pub refresh_frame_context: bool,
     pub frame_parallel_decoding_mode: bool,
     pub frame_context_idx: u8,
@@ -246,6 +272,37 @@ fn parse_render_size(r: &mut BitReader, width: u32, height: u32) -> (u32, u32) {
     }
 }
 
+/// `frame_size_with_refs()`（仕様 6.2.5 節）。`ref_frame_idx` が指すスロットのいずれかで
+/// `found_ref == 1` になれば、そのスロットのサイズ（`ref_frame_sizes` として外部から渡す）を
+/// そのまま `FrameWidth`/`FrameHeight` として採用する。どれも見つからなければ `frame_size()`
+/// を読む。
+fn parse_frame_size_with_refs(
+    r: &mut BitReader,
+    ref_frame_idx: [u8; 3],
+    ref_frame_sizes: &[(u32, u32); NUM_REF_FRAMES],
+) -> (u32, u32) {
+    let mut found = None;
+    for &idx in ref_frame_idx.iter() {
+        let found_ref = r.flag();
+        if found_ref {
+            found = Some(ref_frame_sizes[idx as usize]);
+            break;
+        }
+    }
+    found.unwrap_or_else(|| parse_frame_size(r))
+}
+
+/// `read_interpolation_filter()`（仕様 6.2.7 節）。
+fn parse_interpolation_filter(r: &mut BitReader) -> u8 {
+    let is_filter_switchable = r.flag();
+    if is_filter_switchable {
+        SWITCHABLE
+    } else {
+        let raw = r.f(2) as usize;
+        LITERAL_TO_TYPE[raw]
+    }
+}
+
 /// `loop_filter_params()`（仕様 6.2.8 節）。
 fn parse_loop_filter_params(r: &mut BitReader) -> LoopFilterParams {
     let level = r.f(6) as u8;
@@ -375,9 +432,15 @@ fn parse_tile_info(r: &mut BitReader, sb64_cols: u32) -> (u32, u32) {
 
 /// `uncompressed_header()`（仕様 6.2 節）をパースする。
 ///
+/// `ref_frame_sizes` は `frame_size_with_refs()`（仕様 6.2.5 節）が参照する
+/// `RefFrameWidth`/`RefFrameHeight` 相当のスロット別サイズ表。キーフレーム・イントラオンリー
+/// フレームでは参照されない（呼び出し側はダミー値を渡してよい）。
+///
 /// 戻り値はパース結果と、`trailing_bits()` によるバイト境界揃えまで含めた消費バイト数の組。
-/// `show_existing_frame == 1` の場合、または `frame_type == KEY_FRAME` の場合にのみ成功する。
-pub fn parse_uncompressed_header(data: &[u8]) -> Result<(FrameHeader, usize), HeaderError> {
+pub fn parse_uncompressed_header(
+    data: &[u8],
+    ref_frame_sizes: &[(u32, u32); NUM_REF_FRAMES],
+) -> Result<(FrameHeader, usize), HeaderError> {
     let mut r = BitReader::new(data);
 
     let frame_marker = r.f(2);
@@ -412,34 +475,106 @@ pub fn parse_uncompressed_header(data: &[u8]) -> Result<(FrameHeader, usize), He
     let show_frame = r.flag();
     let error_resilient_mode = r.flag();
 
-    if frame_type != FrameType::KeyFrame {
-        // インターフレーム・イントラオンリーフレームは M2 以降で対応する。
-        return Err(HeaderError::UnsupportedNonKeyFrame);
-    }
+    let mut ref_frame_idx = [0u8; 3];
+    let mut ref_frame_sign_bias = [false; 4];
+    let mut allow_high_precision_mv = false;
+    let mut interpolation_filter = SWITCHABLE;
+    let mut intra_only = false;
+    let mut reset_frame_context = 0u8;
 
-    // frame_sync_code()
-    let sync = [r.f(8), r.f(8), r.f(8)];
-    if sync != [0x49, 0x83, 0x42] {
-        return Err(HeaderError::InvalidSyncCode);
-    }
+    let (color_config, width, height, render_width, render_height, refresh_frame_flags);
+    let frame_is_intra;
 
-    let color_config = parse_color_config(&mut r, profile)?;
-    let (width, height) = parse_frame_size(&mut r);
-    let (render_width, render_height) = parse_render_size(&mut r, width, height);
-    // refresh_frame_flags はビットストリームからは読まず、キーフレームでは常に 0xFF が代入される。
-    let refresh_frame_flags = 0xFFu8;
+    if frame_type == FrameType::KeyFrame {
+        // frame_sync_code()
+        let sync = [r.f(8), r.f(8), r.f(8)];
+        if sync != [0x49, 0x83, 0x42] {
+            return Err(HeaderError::InvalidSyncCode);
+        }
+        color_config = parse_color_config(&mut r, profile)?;
+        let (w, h) = parse_frame_size(&mut r);
+        let (rw, rh) = parse_render_size(&mut r, w, h);
+        width = w;
+        height = h;
+        render_width = rw;
+        render_height = rh;
+        // refresh_frame_flags はビットストリームからは読まず、キーフレームでは常に 0xFF。
+        refresh_frame_flags = 0xFFu8;
+        frame_is_intra = true;
+    } else {
+        intra_only = if !show_frame { r.flag() } else { false };
+        frame_is_intra = intra_only;
+        reset_frame_context = if !error_resilient_mode {
+            r.f(2) as u8
+        } else {
+            0
+        };
+
+        if intra_only {
+            // frame_sync_code()
+            let sync = [r.f(8), r.f(8), r.f(8)];
+            if sync != [0x49, 0x83, 0x42] {
+                return Err(HeaderError::InvalidSyncCode);
+            }
+            color_config = if profile > 0 {
+                parse_color_config(&mut r, profile)?
+            } else {
+                ColorConfig {
+                    bit_depth: 8,
+                    color_space: CS_BT_601,
+                    color_range: false,
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                }
+            };
+            refresh_frame_flags = r.f(8) as u8;
+            let (w, h) = parse_frame_size(&mut r);
+            let (rw, rh) = parse_render_size(&mut r, w, h);
+            width = w;
+            height = h;
+            render_width = rw;
+            render_height = rh;
+        } else {
+            refresh_frame_flags = r.f(8) as u8;
+            for i in 0..3 {
+                ref_frame_idx[i] = r.f(3) as u8;
+                ref_frame_sign_bias[LAST_FRAME as usize + i] = r.flag();
+            }
+            let (w, h) = parse_frame_size_with_refs(&mut r, ref_frame_idx, ref_frame_sizes);
+            width = w;
+            height = h;
+            let (rw, rh) = parse_render_size(&mut r, w, h);
+            render_width = rw;
+            render_height = rh;
+            allow_high_precision_mv = r.flag();
+            interpolation_filter = parse_interpolation_filter(&mut r);
+            // プロファイル・ビット深度・カラースペースはインターフレームのビットストリーム
+            // からは読まれない（参照フレームと一致することが要件、仕様 7.2 節）。この
+            // デコーダは複数フレームにまたがるカラーコンフィグの引き継ぎをまだ保持していない
+            // ため、`decode_keyframe`/`Decoder` 側で直前のキーフレームの値を使い回す。
+            color_config = ColorConfig {
+                bit_depth: 8,
+                color_space: CS_UNKNOWN,
+                color_range: false,
+                subsampling_x: 1,
+                subsampling_y: 1,
+            };
+        }
+    }
 
     let (refresh_frame_context, frame_parallel_decoding_mode) = if !error_resilient_mode {
         (r.flag(), r.flag())
     } else {
         (false, true)
     };
-    let _frame_context_idx_raw = r.f(2) as u8;
-    // FrameIsIntra == 1 (キーフレーム) のため setup_past_independence() が必ず呼ばれ、
-    // 仕様上 frame_context_idx はここで 0 にリセットされる。以降の非圧縮ヘッダの
-    // パースにはこの値は影響しないため、フィールドにはビットストリームの生の値ではなく
-    // リセット後の値 (0) を保持する。
-    let frame_context_idx = 0u8;
+    let frame_context_idx_raw = r.f(2) as u8;
+    // FrameIsIntra || error_resilient_mode の場合 setup_past_independence() が呼ばれ、
+    // 仕様上 frame_context_idx はここで 0 にリセットされる。
+    let frame_context_idx = if frame_is_intra || error_resilient_mode {
+        0
+    } else {
+        frame_context_idx_raw
+    };
 
     let loop_filter = parse_loop_filter_params(&mut r);
     let quantization = parse_quantization_params(&mut r);
@@ -458,12 +593,19 @@ pub fn parse_uncompressed_header(data: &[u8]) -> Result<(FrameHeader, usize), He
             frame_type,
             show_frame,
             error_resilient_mode,
+            frame_is_intra,
+            intra_only,
+            reset_frame_context,
             color_config,
             width,
             height,
             render_width,
             render_height,
             refresh_frame_flags,
+            ref_frame_idx,
+            ref_frame_sign_bias,
+            allow_high_precision_mv,
+            interpolation_filter,
             refresh_frame_context,
             frame_parallel_decoding_mode,
             frame_context_idx,
@@ -581,10 +723,14 @@ mod tests {
         w.finish()
     }
 
+    /// テストで参照フレームサイズが不要な場合に使うダミー値。
+    const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
+
     #[test]
     fn parses_minimal_keyframe_header() {
         let data = build_minimal_keyframe_header();
-        let (header, _consumed) = parse_uncompressed_header(&data).expect("should parse");
+        let (header, _consumed) =
+            parse_uncompressed_header(&data, &NO_REF_SIZES).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert_eq!(f.profile, 0);
@@ -618,7 +764,7 @@ mod tests {
         w.push_bits(0, 30);
         let data = w.finish();
         assert_eq!(
-            parse_uncompressed_header(&data),
+            parse_uncompressed_header(&data, &NO_REF_SIZES),
             Err(HeaderError::InvalidFrameMarker)
         );
     }
@@ -638,26 +784,89 @@ mod tests {
         w.push_bits(0x00, 8);
         let data = w.finish();
         assert_eq!(
-            parse_uncompressed_header(&data),
+            parse_uncompressed_header(&data, &NO_REF_SIZES),
             Err(HeaderError::InvalidSyncCode)
         );
     }
 
-    #[test]
-    fn rejects_non_key_frame() {
+    /// 最小構成のインター（非イントラオンリー）フレーム非圧縮ヘッダを組み立てる。
+    /// profile=0, error_resilient_mode=0, 単一参照, SWITCHABLE でないフィルタ。
+    fn build_minimal_inter_frame_header() -> Vec<u8> {
         let mut w = BitWriter::new();
-        w.push_bits(2, 2);
-        w.push_bits(0, 1);
-        w.push_bits(0, 1);
+        w.push_bits(2, 2); // frame_marker
+        w.push_bits(0, 1); // profile_low_bit
+        w.push_bits(0, 1); // profile_high_bit -> profile=0
         w.push_flag(false); // show_existing_frame
-        w.push_bits(1, 1); // NON_KEY_FRAME
+        w.push_bits(1, 1); // frame_type = NON_KEY_FRAME
+        w.push_flag(true); // show_frame = 1 -> intra_only は読まれない (0)
+        w.push_flag(false); // error_resilient_mode
+                            // reset_frame_context (error_resilient_mode==0 のため f(2) を読む)
+        w.push_bits(0, 2);
+        // refresh_frame_flags
+        w.push_bits(0x01, 8);
+        // ref_frame_idx[3] + ref_frame_sign_bias[3]
+        for _ in 0..3 {
+            w.push_bits(0, 3); // ref_frame_idx = 0
+            w.push_flag(false); // sign_bias
+        }
+        // frame_size_with_refs: found_ref=1 (最初のスロット) -> ref_frame_sizes[0] を使う
+        w.push_flag(true);
+        // render_size
+        w.push_flag(false);
+        // allow_high_precision_mv
+        w.push_flag(false);
+        // read_interpolation_filter: is_filter_switchable=0, raw=0(EIGHTTAP_SMOOTH経由)
+        w.push_flag(false);
+        w.push_bits(0, 2);
+        // error_resilient_mode==0 -> refresh_frame_context, frame_parallel_decoding_mode
         w.push_flag(true);
         w.push_flag(false);
-        let data = w.finish();
-        assert_eq!(
-            parse_uncompressed_header(&data),
-            Err(HeaderError::UnsupportedNonKeyFrame)
-        );
+        w.push_bits(0, 2); // frame_context_idx
+                           // loop_filter_params
+        w.push_bits(0, 6);
+        w.push_bits(0, 3);
+        w.push_flag(false);
+        // quantization_params (lossless)
+        w.push_bits(0, 8);
+        w.push_flag(false);
+        w.push_flag(false);
+        w.push_flag(false);
+        // segmentation
+        w.push_flag(false);
+        // tile_info: width=8 -> ループなし
+        w.push_bits(0, 1);
+        // header_size_in_bytes
+        w.push_bits(3, 16);
+
+        w.finish()
+    }
+
+    #[test]
+    fn parses_inter_frame_using_ref_frame_size() {
+        let data = build_minimal_inter_frame_header();
+        let mut ref_sizes = NO_REF_SIZES;
+        ref_sizes[0] = (8, 8);
+        let (header, _consumed) =
+            parse_uncompressed_header(&data, &ref_sizes).expect("should parse");
+        match header {
+            FrameHeader::New(f) => {
+                assert_eq!(f.frame_type, FrameType::NonKeyFrame);
+                assert!(!f.frame_is_intra);
+                assert!(!f.intra_only);
+                // frame_size_with_refs で found_ref=1 のスロット 0 のサイズを継承する。
+                assert_eq!(f.width, 8);
+                assert_eq!(f.height, 8);
+                assert_eq!(f.refresh_frame_flags, 0x01);
+                assert_eq!(f.ref_frame_idx, [0, 0, 0]);
+                assert!(!f.allow_high_precision_mv);
+                assert_eq!(f.interpolation_filter, EIGHTTAP_SMOOTH);
+                assert_eq!(f.header_size_in_bytes, 3);
+                // 非エラーレジリエント・非イントラなので frame_context_idx はビット
+                // ストリームの生値のまま保持される。
+                assert_eq!(f.frame_context_idx, 0);
+            }
+            FrameHeader::ShowExistingFrame { .. } => panic!("unexpected"),
+        }
     }
 
     #[test]
@@ -670,7 +879,8 @@ mod tests {
         w.push_bits(5, 3); // frame_to_show_map_idx = 5
         let data = w.finish();
 
-        let (header, consumed) = parse_uncompressed_header(&data).expect("should parse");
+        let (header, consumed) =
+            parse_uncompressed_header(&data, &NO_REF_SIZES).expect("should parse");
         assert_eq!(
             header,
             FrameHeader::ShowExistingFrame {
@@ -728,7 +938,7 @@ mod tests {
         w.push_bits(42, 16); // header_size_in_bytes
 
         let data = w.finish();
-        let (header, _) = parse_uncompressed_header(&data).expect("should parse");
+        let (header, _) = parse_uncompressed_header(&data, &NO_REF_SIZES).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert!(f.error_resilient_mode);

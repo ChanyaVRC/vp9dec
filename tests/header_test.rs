@@ -11,8 +11,10 @@
 
 use std::path::Path;
 
-use vp9dec::header::{parse_uncompressed_header, FrameHeader, FrameType};
+use vp9dec::header::{parse_uncompressed_header, FrameHeader, FrameType, NUM_REF_FRAMES};
 use vp9dec::ivf::IvfReader;
+
+const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
 
 /// 指定したテストベクタで「IVF が読める / 第 1 フレームがキーフレーム /
 /// ヘッダの width・height が IVF ヘッダと一致する」ことを検証する。
@@ -46,12 +48,13 @@ fn check_vector(relative_path: &str) {
         .unwrap_or_else(|| panic!("{} contains no frames", path.display()))
         .unwrap_or_else(|e| panic!("failed to read first frame of {}: {e:?}", path.display()));
 
-    let (parsed, _consumed) = parse_uncompressed_header(first_frame.data).unwrap_or_else(|e| {
-        panic!(
-            "failed to parse uncompressed header of first frame in {}: {e:?}",
-            path.display()
-        )
-    });
+    let (parsed, _consumed) = parse_uncompressed_header(first_frame.data, &NO_REF_SIZES)
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to parse uncompressed header of first frame in {}: {e:?}",
+                path.display()
+            )
+        });
 
     match parsed {
         FrameHeader::New(f) => {

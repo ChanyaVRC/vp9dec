@@ -17,9 +17,11 @@
 use std::path::Path;
 
 use vp9dec::compressed_header::parse_compressed_header;
-use vp9dec::header::{parse_uncompressed_header, FrameHeader};
+use vp9dec::header::{parse_uncompressed_header, FrameHeader, NUM_REF_FRAMES};
 use vp9dec::ivf::IvfReader;
 use vp9dec::tile::TileDecoder;
+
+const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
 
 fn check_vector(relative_path: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -47,12 +49,13 @@ fn check_vector(relative_path: &str) {
         .unwrap_or_else(|| panic!("{} contains no frames", path.display()))
         .unwrap_or_else(|e| panic!("failed to read first frame of {}: {e:?}", path.display()));
 
-    let (parsed, consumed) = parse_uncompressed_header(first_frame.data).unwrap_or_else(|e| {
-        panic!(
-            "failed to parse uncompressed header of first frame in {}: {e:?}",
-            path.display()
-        )
-    });
+    let (parsed, consumed) = parse_uncompressed_header(first_frame.data, &NO_REF_SIZES)
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to parse uncompressed header of first frame in {}: {e:?}",
+                path.display()
+            )
+        });
 
     let header = match parsed {
         FrameHeader::New(h) => h,
