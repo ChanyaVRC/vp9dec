@@ -7,7 +7,8 @@
 //! - M1: IVF コンテナパーサ、bool デコーダ、非圧縮フレームヘッダのパース
 //! - M2: イントラ予測によるキーフレームのデコード
 //! - M2b: ループフィルタ（デブロッキングフィルタ）＋公式コンフォーマンス検証
-//! - M3: インター予測（動き補償）
+//! - M3 前半: インターフレームのビットストリーム復号（動き補償の手前まで）
+//! - M3 後半: 動き補償・確率適応・参照フレーム管理＋全フレーム MD5 コンフォーマンス
 //! - M4: コンフォーマンステスト完全通過
 //!
 //! （モジュールは以降のコミットで段階的に追加する。）
@@ -15,6 +16,8 @@
 pub mod bit_reader;
 pub mod bool_coder;
 pub mod compressed_header;
+pub mod counts;
+pub mod dpb;
 pub mod framebuffer;
 pub mod header;
 pub mod ivf;
@@ -29,6 +32,8 @@ pub mod tile;
 pub mod transform;
 
 use compressed_header::{parse_compressed_header_ex, CompressedHeaderError, FrameContextStore};
+use counts::{adapt_coef_probs, adapt_noncoef_probs};
+use dpb::{Dpb, RefFrameData};
 use header::{
     parse_uncompressed_header, ColorConfig, FrameHeader, FrameType, HeaderError, NUM_REF_FRAMES,
 };
@@ -43,9 +48,6 @@ pub enum DecodeError {
     CompressedHeader(CompressedHeaderError),
     /// タイル・モード情報・トークン復号に失敗した。
     Tile(TileError),
-    /// `show_existing_frame == 1` のフレームは `decode_keyframe` の対象外
-    /// （新規デコードを行わず、既存フレームの再表示指示のみを含むため）。
-    ShowExistingFrameNotSupported,
     /// [`decode_keyframe`] にキーフレーム以外（インターフレーム・イントラオンリーフレーム）
     /// が渡された。
     NotAKeyFrame,
@@ -54,6 +56,9 @@ pub enum DecodeError {
     /// 8bit（`BitDepth == 8`）以外のフレーム。[`framebuffer::Plane`] が `u8` 固定のため、
     /// 10bit/12bit フレームは現時点ではサポート対象外。
     UnsupportedBitDepth(u8),
+    /// `show_existing_frame` が指す DPB スロットにフレームが格納されていない
+    /// （通常のコンフォーマンスビットストリームでは発生しない）。
+    MissingReferenceFrame,
 }
 
 impl From<HeaderError> for DecodeError {
@@ -110,6 +115,41 @@ fn crop_to_frame(
     }
 }
 
+/// [`crop_to_frame`] と同じクロップ計算で、DPB 格納用の [`RefFrameData`] を組み立てる
+/// （仕様 8.10 節 "Reference frame update process" ステップ 1）。
+fn build_ref_frame_data(
+    planes: &[framebuffer::Plane; 3],
+    width: u32,
+    height: u32,
+    color_config: &ColorConfig,
+) -> RefFrameData {
+    let sub_x = color_config.subsampling_x as u32;
+    let sub_y = color_config.subsampling_y as u32;
+    let uv_width = ((width + sub_x) >> sub_x) as usize;
+    let uv_height = ((height + sub_y) >> sub_y) as usize;
+
+    RefFrameData {
+        width,
+        height,
+        subsampling_x: sub_x,
+        subsampling_y: sub_y,
+        bit_depth: color_config.bit_depth,
+        y: planes[0].crop_to_plane(width as usize, height as usize),
+        u: planes[1].crop_to_plane(uv_width, uv_height),
+        v: planes[2].crop_to_plane(uv_width, uv_height),
+    }
+}
+
+fn ref_frame_data_to_frame(data: &RefFrameData) -> Frame {
+    Frame {
+        width: data.width,
+        height: data.height,
+        y: data.y.crop(data.y.width, data.y.height),
+        u: data.u.crop(data.u.width, data.u.height),
+        v: data.v.crop(data.v.width, data.v.height),
+    }
+}
+
 /// 1 枚のキーフレームをデコードする。
 ///
 /// `frame_data` は IVF 等のコンテナから取り出した、1 フレーム分の VP9 ビットストリーム
@@ -125,36 +165,23 @@ fn crop_to_frame(
 pub fn decode_keyframe(frame_data: &[u8]) -> Result<Frame, DecodeError> {
     // キーフレームであることを事前に確認する（decode_frame は非キーフレームも受け付けるため）。
     let dummy_ref_sizes = [(0u32, 0u32); NUM_REF_FRAMES];
-    let (parsed, _consumed) = parse_uncompressed_header(frame_data, &dummy_ref_sizes)?;
+    let dummy_lf_deltas = (
+        header::DEFAULT_LOOP_FILTER_REF_DELTAS,
+        header::DEFAULT_LOOP_FILTER_MODE_DELTAS,
+    );
+    let (parsed, _consumed) =
+        parse_uncompressed_header(frame_data, &dummy_ref_sizes, dummy_lf_deltas)?;
     match &parsed {
         FrameHeader::New(h) if h.frame_type == FrameType::KeyFrame => {}
         FrameHeader::New(_) => return Err(DecodeError::NotAKeyFrame),
-        FrameHeader::ShowExistingFrame { .. } => {
-            return Err(DecodeError::ShowExistingFrameNotSupported)
-        }
+        FrameHeader::ShowExistingFrame { .. } => return Err(DecodeError::NotAKeyFrame),
     }
 
     let mut decoder = Decoder::new();
     match decoder.decode_frame(frame_data)? {
-        DecodeOutcome::Decoded(frame) => Ok(frame),
-        DecodeOutcome::ShowExisting { .. } => unreachable!("show_existing_frame は上で排除済み"),
+        Some(frame) => Ok(frame),
+        None => unreachable!("キーフレームは常に show_frame == 1（frame_is_intra の要件）"),
     }
-}
-
-/// [`Decoder::decode_frame`] の戻り値。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecodeOutcome {
-    /// `show_existing_frame == 1`。新規デコードは行われていない。
-    ShowExisting { frame_to_show_map_idx: u8 },
-    /// 新規にデコードされたフレーム。
-    ///
-    /// **注意（M3 前半の制約）**: `is_inter` ブロックの画素は動き補償が未実装のため
-    /// 実際の予測結果ではない（[`predict::predict_inter_stub`] 参照）。インターフレームを
-    /// 含む場合、返る `Frame` のピクセル値は正しくない。ビットストリームを最後まで
-    /// パニックなく読み切れることの検証、および `show_frame`/`refresh_frame_flags` 等の
-    /// フレーム間状態遷移の検証にのみ使うこと。M3 後半で動き補償を実装した後は、
-    /// キーフレーム同様に公式 MD5 コンフォーマンスと比較できるようになる想定。
-    Decoded(Frame),
 }
 
 /// 複数フレームを順にデコードするための状態付きデコーダ。
@@ -162,15 +189,14 @@ pub enum DecodeOutcome {
 /// VP9 はフレーム間で以下の状態を引き継ぐため、1 フレームずつ独立に処理できない
 /// （`decode_keyframe` はキーフレーム単体のみを扱うため、この状態を持たない）:
 /// - 参照フレームスロット（`RefFrameWidth`/`RefFrameHeight`、仕様 6.2.5 節
-///   `frame_size_with_refs`）。
+///   `frame_size_with_refs`）と実ピクセルデータ（[`Dpb`]、仕様 8.10 節）。
 /// - フレームコンテキスト（`frame_context_idx` で選択される確率テーブル 4 スロット、
 ///   仕様 7.1.2 節 `load_probs`/`save_probs`）。[`FrameContextStore`] 参照。
 /// - `UsePrevFrameMvs`（仕様 7.2.6 節）が真のとき参照する前フレームの `Mvs`/`RefFrames`
 ///   （本実装では前フレームの [`MiGrid`] をまるごと保持する）。
-///
-/// **既知の制約（M3 前半）**: 確率適応（仕様 8.4 節 `adapt_coef_probs`/`adapt_noncoef_probs`）
-/// は未実装。動き補償（仕様 8.5.2 節 `predict_inter`）も未実装（[`DecodeOutcome::Decoded`]
-/// 参照）。参照フレームの実ピクセルデータも保持しない（動き補償が無いため不要）。
+/// - ループフィルタの `ref_deltas`/`mode_deltas`（仕様 7.2 節、`setup_past_independence()`
+///   でのみリセットされる）。
+/// - `LastFrameType`（仕様 7.2 節。確率適応の `updateFactor` 計算に使う、仕様 8.4.3 節）。
 pub struct Decoder {
     ref_frame_sizes: [(u32, u32); NUM_REF_FRAMES],
     frame_contexts: FrameContextStore,
@@ -185,6 +211,12 @@ pub struct Decoder {
     /// 値を引き継ぐ（仕様 7.2 節: 参照フレームとビット深度・サブサンプリングが一致することが
     /// 適合性要件）。
     last_color_config: Option<ColorConfig>,
+    /// 参照フレームの実ピクセルデータ（仕様 8.10 節 `FrameStore`）。
+    dpb: Dpb,
+    /// ループフィルタの `ref_deltas`/`mode_deltas`（仕様 7.2 節で持続する状態）。
+    loop_filter_deltas: ([i8; 4], [i8; 2]),
+    /// `LastFrameType`（仕様 7.2 節）。`show_existing_frame` フレームでは更新されない。
+    last_frame_type: Option<FrameType>,
 }
 
 impl Default for Decoder {
@@ -202,22 +234,36 @@ impl Decoder {
             prev_show_frame: None,
             prev_mi_grid: None,
             last_color_config: None,
+            dpb: Dpb::new(),
+            loop_filter_deltas: (
+                header::DEFAULT_LOOP_FILTER_REF_DELTAS,
+                header::DEFAULT_LOOP_FILTER_MODE_DELTAS,
+            ),
+            last_frame_type: None,
         }
     }
 
-    /// 1 フレーム分の VP9 ビットストリームをデコードし、内部状態（参照フレームサイズ・
-    /// フレームコンテキスト・前フレームの MV）を更新する。呼び出し側は IVF などのコンテナ
+    /// 1 フレーム分の VP9 ビットストリームをデコードする。呼び出し側は IVF などのコンテナ
     /// から取り出したフレームを表示順ではなくビットストリーム順（デコード順）に渡すこと。
-    pub fn decode_frame(&mut self, frame_data: &[u8]) -> Result<DecodeOutcome, DecodeError> {
-        let (parsed, consumed) = parse_uncompressed_header(frame_data, &self.ref_frame_sizes)?;
+    ///
+    /// 戻り値は「表示すべきフレームが得られたか」を表す: `show_existing_frame == 1` または
+    /// `show_frame == 1` の場合は `Some(Frame)`、それ以外（`show_frame == 0` の非表示
+    /// フレーム、いわゆる droppable/altref フレーム）の場合は `None` を返す。内部状態
+    /// （参照フレームバッファ・フレームコンテキスト・前フレームの MV 等）はどちらの場合も
+    /// 正しく更新される。
+    pub fn decode_frame(&mut self, frame_data: &[u8]) -> Result<Option<Frame>, DecodeError> {
+        let (parsed, consumed) =
+            parse_uncompressed_header(frame_data, &self.ref_frame_sizes, self.loop_filter_deltas)?;
         let mut header = match parsed {
             FrameHeader::New(h) => h,
             FrameHeader::ShowExistingFrame {
                 frame_to_show_map_idx,
             } => {
-                return Ok(DecodeOutcome::ShowExisting {
-                    frame_to_show_map_idx,
-                })
+                let data = self
+                    .dpb
+                    .get(frame_to_show_map_idx)
+                    .ok_or(DecodeError::MissingReferenceFrame)?;
+                return Ok(Some(ref_frame_data_to_frame(data)));
             }
         };
 
@@ -258,6 +304,9 @@ impl Decoder {
         if header.frame_is_intra || header.error_resilient_mode {
             self.frame_contexts.reset_all();
         }
+        // `load_probs`/`load_probs2`（仕様 6.1 節 `frame()` 冒頭）に相当する開始時点の値。
+        // `refresh_probs()`（仕様 6.1.2 節）で forward update 前のこの値へ戻したうえで
+        // backward adaptation を適用するため、compressed_header 呼び出し後も保持しておく。
         let starting_probs = self.frame_contexts.load(header.frame_context_idx);
 
         let compressed = parse_compressed_header_ex(
@@ -267,8 +316,16 @@ impl Decoder {
             header.interpolation_filter,
             header.ref_frame_sign_bias,
             header.allow_high_precision_mv,
-            starting_probs,
+            starting_probs.clone(),
         )?;
+
+        // 動き補償用に、このフレームが参照する DPB スロットのピクセルデータを解決する
+        // （仕様 8.5.2.3〜8.5.2.4 節）。`FrameIsIntra == 1` の場合は参照しない。
+        let resolved_refs: [Option<RefFrameData>; 3] = if header.frame_is_intra {
+            [None, None, None]
+        } else {
+            std::array::from_fn(|i| self.dpb.get(header.ref_frame_idx[i]).cloned())
+        };
 
         let tile_data = &frame_data[compressed_end..];
         let prev_grid = if use_prev_frame_mvs {
@@ -276,19 +333,66 @@ impl Decoder {
         } else {
             None
         };
-        let mut tile_decoder =
-            TileDecoder::new_with_prev(&header, &compressed, use_prev_frame_mvs, prev_grid);
+        let mut tile_decoder = TileDecoder::new_with_prev(
+            &header,
+            &compressed,
+            use_prev_frame_mvs,
+            prev_grid,
+            resolved_refs,
+        );
         tile_decoder.decode_tiles(tile_data)?;
         tile_decoder.apply_loop_filter(&header.loop_filter);
 
-        // refresh_probs()（仕様 6.1.2 節）: backward adaptation（adapt_coef_probs/
-        // adapt_noncoef_probs）は未実装のため、forward update（diff_update_prob）適用後の
-        // 値をそのまま保存する（FrameContextStore のドキュメント参照）。
+        // refresh_probs()（仕様 6.1.2 節）。
+        let final_probs = if !header.error_resilient_mode && !header.frame_parallel_decoding_mode {
+            // load_probs( frame_context_idx ): tx_probs/skip_prob を除くすべてのテーブルを
+            // forward update 前の値（starting_probs）へ戻す。tx_probs/skip_prob は
+            // compressed_header() の forward update 後の値のまま残す。
+            let mut working = starting_probs.clone();
+            working.tx_probs = compressed.probs.tx_probs;
+            working.skip_prob = compressed.probs.skip_prob;
+
+            let counts = tile_decoder.counts();
+            // 仕様 8.4.3 節: updateFactor の決定。
+            let update_factor = if header.frame_is_intra {
+                112
+            } else if self.last_frame_type == Some(FrameType::KeyFrame) {
+                128
+            } else {
+                112
+            };
+            adapt_coef_probs(&mut working.coef_probs, counts, update_factor);
+
+            if !header.frame_is_intra {
+                // load_probs2( frame_context_idx ): tx_probs/skip_prob も forward update 前へ
+                // 戻したうえで adapt_noncoef_probs を適用する。
+                working.tx_probs = starting_probs.tx_probs;
+                working.skip_prob = starting_probs.skip_prob;
+                adapt_noncoef_probs(
+                    &mut working,
+                    counts,
+                    header.interpolation_filter,
+                    compressed.tx_mode,
+                    header.allow_high_precision_mv,
+                );
+            }
+            working
+        } else {
+            compressed.probs.clone()
+        };
         if header.refresh_frame_context {
             self.frame_contexts
-                .save(header.frame_context_idx, compressed.probs.clone());
+                .save(header.frame_context_idx, final_probs);
         }
 
+        // Reference frame update process（仕様 8.10 節）。
+        let ref_data = build_ref_frame_data(
+            tile_decoder.planes(),
+            header.width,
+            header.height,
+            &header.color_config,
+        );
+        self.dpb.update(header.refresh_frame_flags, &ref_data);
         for (slot, size) in self.ref_frame_sizes.iter_mut().enumerate() {
             if (header.refresh_frame_flags >> slot) & 1 == 1 {
                 *size = (header.width, header.height);
@@ -300,13 +404,21 @@ impl Decoder {
         self.prev_frame_dims = Some((header.width, header.height));
         self.prev_show_frame = Some(header.show_frame);
         self.prev_mi_grid = Some(tile_decoder.mi_grid().clone());
-
-        let frame = crop_to_frame(
-            tile_decoder.planes(),
-            header.width,
-            header.height,
-            &header.color_config,
+        self.loop_filter_deltas = (
+            header.loop_filter.ref_deltas,
+            header.loop_filter.mode_deltas,
         );
-        Ok(DecodeOutcome::Decoded(frame))
+        self.last_frame_type = Some(header.frame_type);
+
+        if header.show_frame {
+            Ok(Some(crop_to_frame(
+                tile_decoder.planes(),
+                header.width,
+                header.height,
+                &header.color_config,
+            )))
+        } else {
+            Ok(None)
+        }
     }
 }

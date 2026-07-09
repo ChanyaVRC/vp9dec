@@ -18,7 +18,7 @@
 use std::path::Path;
 
 use vp9dec::ivf::IvfReader;
-use vp9dec::{DecodeOutcome, Decoder};
+use vp9dec::Decoder;
 
 fn check_vector(relative_path: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -43,13 +43,13 @@ fn check_vector(relative_path: &str) {
     let mut decoder = Decoder::new();
     let mut frame_count = 0usize;
     let mut decoded_count = 0usize;
-    let mut show_existing_count = 0usize;
+    let mut hidden_count = 0usize;
 
     for (i, frame) in reader.enumerate() {
         let frame = frame
             .unwrap_or_else(|e| panic!("{}: failed to read IVF frame {i}: {e:?}", path.display()));
         match decoder.decode_frame(frame.data) {
-            Ok(DecodeOutcome::Decoded(f)) => {
+            Ok(Some(f)) => {
                 decoded_count += 1;
                 // 最低限の健全性: プレーンサイズが frame.width/height から導出した想定値と一致する。
                 assert_eq!(
@@ -59,8 +59,8 @@ fn check_vector(relative_path: &str) {
                     path.display()
                 );
             }
-            Ok(DecodeOutcome::ShowExisting { .. }) => {
-                show_existing_count += 1;
+            Ok(None) => {
+                hidden_count += 1;
             }
             Err(e) => panic!(
                 "{}: frame {i} (of {} total so far) failed to decode: {e:?}",
@@ -72,7 +72,7 @@ fn check_vector(relative_path: &str) {
     }
 
     eprintln!(
-        "[ok] {}: {frame_count} IVF フレームすべてを読み切った（新規デコード {decoded_count} 件、show_existing_frame {show_existing_count} 件）",
+        "[ok] {}: {frame_count} IVF フレームすべてを読み切った（表示フレーム {decoded_count} 件、非表示フレーム {hidden_count} 件）",
         path.display()
     );
     assert!(
