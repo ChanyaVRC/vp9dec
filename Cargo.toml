@@ -1,0 +1,8 @@
+[package]
+name = "vp9dec"
+version = "0.1.0"
+edition = "2021"
+description = "完全自作の VP9 デコーダ（ゼロ依存・Noiria への統合を見据えた実装）"
+license = "MIT"
+
+[dependencies]

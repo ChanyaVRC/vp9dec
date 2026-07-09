@@ -1,0 +1,5 @@
+/target
+
+# WebM 公式テストベクタ（README の手順に従い実行時にダウンロードする）
+tests/vectors/*
+!tests/vectors/.gitkeep
