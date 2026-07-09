@@ -17,6 +17,8 @@
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
 use crate::compressed_header::{CompressedHeader, CompressedHeaderProbs};
+use crate::counts::Counts;
+use crate::dpb::RefFrameData;
 use crate::framebuffer::Plane;
 use crate::header::{self, NewFrameHeader};
 use crate::mv::{
@@ -24,20 +26,21 @@ use crate::mv::{
     MV_BORDER, MV_PRED_BORDER, ZERO_MV,
 };
 use crate::predict::predict_intra as predict_intra_block;
+use crate::predict::{predict_inter, RefPlaneView};
 use crate::prob_tables::{
     coefband_8x8plus, mode2txfm_map, pareto, ALTREF_FRAME, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID,
     B_HEIGHT_LOG2_LOOKUP, B_WIDTH_LOG2_LOOKUP, CAT_PROBS, COEFBAND_4X4, COMPOUND_REFERENCE,
-    COUNTER_TO_CONTEXT, DCT_VAL_CATEGORY6, DC_PRED, DEFAULT_UV_MODE_PROBS, ENERGY_CLASS,
-    EXTRA_BITS, GOLDEN_FRAME, IDX_N_COLUMN_TO_SUBBLOCK, INTERP_FILTER_TREE, INTER_MODE_TREE,
-    INTRA_FRAME, INTRA_MODE_TREE, KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS,
-    LAST_FRAME, MAX_TXSIZE_LOOKUP, MI_WIDTH_LOG2_LOOKUP, MODE_2_COUNTER, MV_CLASS_TREE, MV_FR_TREE,
-    MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_TREE, MV_REF_BLOCKS, NEARESTMV,
-    NEARMV, NEWMV, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
-    NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_HORZ, PARTITION_NONE,
-    PARTITION_SPLIT, PARTITION_TREE, PARTITION_VERT, REFERENCE_MODE_SELECT, REF_NONE,
-    SINGLE_REFERENCE, SIZE_GROUP_LOOKUP, SS_SIZE_LOOKUP, SUBSIZE_LOOKUP, SWITCHABLE, TX_16X16,
-    TX_32X32, TX_4X4, TX_8X8, TX_MODE_SELECT, TX_MODE_TO_BIGGEST_TX_SIZE, TX_SIZE_16_TREE,
-    TX_SIZE_32_TREE, TX_SIZE_8_TREE, ZEROMV, ZERO_TOKEN,
+    COUNTER_TO_CONTEXT, DCT_VAL_CATEGORY6, DC_PRED, ENERGY_CLASS, EXTRA_BITS, GOLDEN_FRAME,
+    IDX_N_COLUMN_TO_SUBBLOCK, INTERP_FILTER_TREE, INTER_MODE_TREE, INTRA_FRAME, INTRA_MODE_TREE,
+    KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, LAST_FRAME, MAX_TXSIZE_LOOKUP,
+    MI_WIDTH_LOG2_LOOKUP, MODE_2_COUNTER, MV_CLASS_TREE, MV_FR_TREE, MV_JOINT_HNZVNZ,
+    MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_TREE, MV_REF_BLOCKS, NEARESTMV, NEARMV, NEWMV,
+    NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP, NUM_8X8_BLOCKS_HIGH_LOOKUP,
+    NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_TREE,
+    PARTITION_VERT, REFERENCE_MODE_SELECT, REF_NONE, SINGLE_REFERENCE, SIZE_GROUP_LOOKUP,
+    SS_SIZE_LOOKUP, SUBSIZE_LOOKUP, SWITCHABLE, TX_16X16, TX_32X32, TX_4X4, TX_8X8, TX_MODE_SELECT,
+    TX_MODE_TO_BIGGEST_TX_SIZE, TX_SIZE_16_TREE, TX_SIZE_32_TREE, TX_SIZE_8_TREE, ZEROMV,
+    ZERO_TOKEN,
 };
 use crate::quant::{get_ac_quant, get_dc_quant};
 use crate::scan::{get_scan, TxSize};
@@ -212,6 +215,20 @@ pub struct TileDecoder {
     /// 直前にデコードしたフレームの `MiGrid`（`PrevMvs`/`PrevRefFrames` 相当）。
     /// `use_prev_frame_mvs == false` の場合は参照されない（`None` でもよい）。
     prev_mi_grid: Option<MiGrid>,
+
+    // --- 動き補償（仕様 8.5.2 節）に必要な追加状態。---
+    /// `FrameWidth`/`FrameHeight`（表示・スケーリング計算用の実サイズ。`mi_cols*8` 等の
+    /// パディング済みサイズとは異なる）。
+    frame_width: u32,
+    frame_height: u32,
+    /// この 1 フレームの復号に使う参照フレームの実ピクセルデータ（DPB から解決済み、
+    /// 呼び出し側が `header.ref_frame_idx` を使って解決済み）。添字は `ref_frame` 値
+    /// `LAST_FRAME..=ALTREF_FRAME` から `LAST_FRAME` を引いたもの。`FrameIsIntra == 1` の
+    /// 場合は全要素 `None`。
+    resolved_refs: [Option<RefFrameData>; 3],
+
+    // --- 確率適応（仕様 8.4 節）用のカウンタ収集（仕様 9.3.4 節）。---
+    counts: Counts,
 }
 
 impl TileDecoder {
@@ -224,17 +241,20 @@ impl TileDecoder {
     /// `bit_depth` を検査すること。`use_prev_frame_mvs`/`prev_mi_grid` は常に
     /// `false`/`None`（キーフレーム・M2 互換の単純なコンストラクタ）。
     pub fn new(header: &NewFrameHeader, compressed: &CompressedHeader) -> Self {
-        Self::new_with_prev(header, compressed, false, None)
+        Self::new_with_prev(header, compressed, false, None, [None, None, None])
     }
 
     /// [`TileDecoder::new`] のインターフレーム対応版。`use_prev_frame_mvs`/`prev_mi_grid`
     /// は仕様 7.2.6 節の `UsePrevFrameMvs` とそれが参照する前フレームの `Mvs`/`RefFrames`
-    /// （`find_mv_refs` の `usePrev` 分岐、仕様 6.5.1 節）に対応する。
+    /// （`find_mv_refs` の `usePrev` 分岐、仕様 6.5.1 節）に対応する。`resolved_refs` は
+    /// 動き補償（仕様 8.5.2 節）で使う参照フレームの実ピクセルデータ（[`crate::dpb::Dpb`]
+    /// から呼び出し側が解決したもの、添字は `ref_frame_idx` と同じ）。
     pub fn new_with_prev(
         header: &NewFrameHeader,
         compressed: &CompressedHeader,
         use_prev_frame_mvs: bool,
         prev_mi_grid: Option<MiGrid>,
+        resolved_refs: [Option<RefFrameData>; 3],
     ) -> Self {
         assert_eq!(
             header.color_config.bit_depth, 8,
@@ -300,7 +320,16 @@ impl TileDecoder {
             comp_var_ref: compressed.comp_var_ref,
             use_prev_frame_mvs,
             prev_mi_grid,
+            frame_width: header.width,
+            frame_height: header.height,
+            resolved_refs,
+            counts: Counts::new(),
         }
+    }
+
+    /// 収集済みのシンタックス要素カウンタ（仕様 8.4 節の確率適応に使う）。
+    pub fn counts(&self) -> &Counts {
+        &self.counts
     }
 
     pub fn mi_grid(&self) -> &MiGrid {
@@ -490,7 +519,10 @@ impl TileDecoder {
             &self.probs.partition_probs[ctx]
         };
 
-        if has_rows && has_cols {
+        // 仕様 9.3: `partition` は常に type T のシンタックス要素であり、hasRows/hasCols に
+        // よってビットを読まない（tree selection process が直接値を返す）場合でも、
+        // 仕様 9.3.4 節のカウント処理は必ず呼ばれる（`counts_partition[ctx][syntax]`）。
+        let partition = if has_rows && has_cols {
             r.read_tree(&PARTITION_TREE, |node| probs[node]) as u8
         } else if has_cols {
             // cols_partition_tree: node2 は 1 に固定される。
@@ -508,7 +540,11 @@ impl TileDecoder {
             }
         } else {
             PARTITION_SPLIT
+        };
+        if !self.frame_is_intra {
+            self.counts.partition[ctx][partition as usize] += 1;
         }
+        partition
     }
 
     /// `decode_block( r, c, subsize )`（仕様 6.4.4 節）。
@@ -603,22 +639,90 @@ impl TileDecoder {
             let pred_max_y = ((self.mi_rows * 8) >> sub_y).saturating_sub(1) as usize;
 
             if is_inter {
-                // `predict_inter()`（仕様 8.5.2 節）: 動き補償・サブピクセル補間は M3 後半で
-                // 実装する。ビットストリームの読み取り自体には影響しない（仕様 7.4.15 節 NOTE）
-                // ため、ここではモード情報（`info.ref_frame`/`info.mv`/`info.interp_filter`）を
-                // 記録済みであることを前提に、画素生成はスタブ呼び出しのみに留める。
+                // `predict_inter()`（仕様 8.5.2 節）: 動き補償・サブピクセル補間。
+                let refs: [Option<&RefFrameData>; 2] = [
+                    if info.ref_frame[0] > INTRA_FRAME {
+                        self.resolved_refs[(info.ref_frame[0] - LAST_FRAME) as usize].as_ref()
+                    } else {
+                        None
+                    },
+                    if info.ref_frame[1] > INTRA_FRAME {
+                        self.resolved_refs[(info.ref_frame[1] - LAST_FRAME) as usize].as_ref()
+                    } else {
+                        None
+                    },
+                ];
+                let ref_views: [Option<RefPlaneView>; 2] = std::array::from_fn(|i| {
+                    refs[i].map(|r| RefPlaneView {
+                        plane: match plane {
+                            0 => &r.y,
+                            1 => &r.u,
+                            _ => &r.v,
+                        },
+                        width: r.width,
+                        height: r.height,
+                    })
+                });
+                let ref_view_refs: [Option<&RefPlaneView>; 2] =
+                    [ref_views[0].as_ref(), ref_views[1].as_ref()];
+
                 if info.mi_size < BLOCK_8X8 {
                     let mut y = 0u32;
                     while y < num4x4h {
                         let mut x = 0u32;
                         while x < num4x4w {
-                            crate::predict::predict_inter_stub();
+                            let block_idx = (y * num4x4w + x) as usize;
+                            predict_inter(
+                                &mut self.planes[plane],
+                                plane,
+                                (base_x + 4 * x) as usize,
+                                (base_y + 4 * y) as usize,
+                                4,
+                                4,
+                                block_idx,
+                                info.ref_frame,
+                                &info.sub_mvs,
+                                info.interp_filter,
+                                row,
+                                col,
+                                info.mi_size,
+                                self.mi_rows,
+                                self.mi_cols,
+                                self.subsampling_x,
+                                self.subsampling_y,
+                                self.frame_width,
+                                self.frame_height,
+                                self.bit_depth,
+                                ref_view_refs,
+                            );
                             x += 1;
                         }
                         y += 1;
                     }
                 } else {
-                    crate::predict::predict_inter_stub();
+                    predict_inter(
+                        &mut self.planes[plane],
+                        plane,
+                        base_x as usize,
+                        base_y as usize,
+                        (num4x4w * 4) as usize,
+                        (num4x4h * 4) as usize,
+                        0,
+                        info.ref_frame,
+                        &info.sub_mvs,
+                        info.interp_filter,
+                        row,
+                        col,
+                        info.mi_size,
+                        self.mi_rows,
+                        self.mi_cols,
+                        self.subsampling_x,
+                        self.subsampling_y,
+                        self.frame_width,
+                        self.frame_height,
+                        self.bit_depth,
+                        ref_view_refs,
+                    );
                 }
             }
 
@@ -813,13 +917,24 @@ impl TileDecoder {
             };
 
             let probs =
-                &self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][band][ctx];
+                self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][band][ctx];
 
             if check_eob {
                 let more_coefs = r.read_bool(probs[0]);
+                self.counts.more_coefs[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
+                    [more_coefs as usize] += 1;
                 if !more_coefs {
                     break;
                 }
+            } else {
+                // 仕様 9.3.4 節末尾の "special case"（PDF 上は本文が欠落しているが、9.3 節の
+                // 一般規則「T 型シンタックス要素は、たとえビットを読まなくてもカウント処理は
+                // 必ず呼ばれる」（partition の hasRows/hasCols==false と同型のパターン）から
+                // 導かれる唯一の一貫した解釈として、checkEob==0 のため実際には more_coefs を
+                // 読まない箇所でも、値 1（コンテキストは token と同じ ctx）としてカウントする。
+                // 全フレーム MD5 コンフォーマンスで実証的に検証済み。
+                self.counts.more_coefs[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
+                    [1] += 1;
             }
 
             let token = r.read_tree(&crate::prob_tables::TOKEN_TREE, |node| {
@@ -831,6 +946,8 @@ impl TileDecoder {
                     pareto(node, probs[2])
                 }
             }) as u8;
+            self.counts.token[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
+                [(token as usize).min(2)] += 1;
             token_cache[pos] = ENERGY_CLASS[token as usize];
 
             if token == ZERO_TOKEN {
@@ -921,7 +1038,7 @@ impl TileDecoder {
     /// `read_skip( )`（仕様 6.4.8 節）。セグメンテーション未サポートのため
     /// `seg_feature_active( SEG_LVL_SKIP )` は常に false として扱う。
     fn read_skip(
-        &self,
+        &mut self,
         r: &mut BoolDecoder,
         row: u32,
         col: u32,
@@ -935,12 +1052,16 @@ impl TileDecoder {
         if avail_l && self.mi_grid.get(row, col - 1).skip {
             ctx += 1;
         }
-        r.read_bool(self.probs.skip_prob[ctx])
+        let skip = r.read_bool(self.probs.skip_prob[ctx]);
+        if !self.frame_is_intra {
+            self.counts.skip[ctx][skip as usize] += 1;
+        }
+        skip
     }
 
     /// `read_tx_size( allowSelect )`（仕様 6.4.10 節）。
     fn read_tx_size(
-        &self,
+        &mut self,
         r: &mut BoolDecoder,
         mi_size: u8,
         allow_select: bool,
@@ -972,12 +1093,16 @@ impl TileDecoder {
                 above = left;
             }
             let ctx = ((above as u32 + left as u32) > max_tx_size as u32) as usize;
-            let probs = &self.probs.tx_probs[max_tx_size as usize][ctx];
-            match max_tx_size {
+            let probs = self.probs.tx_probs[max_tx_size as usize][ctx];
+            let tx_size = match max_tx_size {
                 TX_32X32 => r.read_tree(&TX_SIZE_32_TREE, |node| probs[node]) as u8,
                 TX_16X16 => r.read_tree(&TX_SIZE_16_TREE, |node| probs[node]) as u8,
                 _ => r.read_tree(&TX_SIZE_8_TREE, |node| probs[node]) as u8,
+            };
+            if !self.frame_is_intra {
+                self.counts.tx_size[max_tx_size as usize][ctx][tx_size as usize] += 1;
             }
+            tx_size
         } else {
             max_tx_size.min(TX_MODE_TO_BIGGEST_TX_SIZE[self.tx_mode as usize])
         }
@@ -1129,7 +1254,7 @@ impl TileDecoder {
 
     /// `read_is_inter( )`（仕様 6.4.13 節）。`seg_feature_active( SEG_LVL_REF_FRAME )` は
     /// セグメンテーション未サポートのため常に false。
-    fn read_is_inter(&self, r: &mut BoolDecoder, n: &NeighborRefInfo) -> bool {
+    fn read_is_inter(&mut self, r: &mut BoolDecoder, n: &NeighborRefInfo) -> bool {
         let ctx = if n.avail_u && n.avail_l {
             if n.left_intra && n.above_intra {
                 3
@@ -1145,7 +1270,9 @@ impl TileDecoder {
         } else {
             0
         };
-        r.read_bool(self.probs.is_inter_prob[ctx])
+        let is_inter = r.read_bool(self.probs.is_inter_prob[ctx]);
+        self.counts.is_inter[ctx][is_inter as usize] += 1;
+        is_inter
     }
 
     /// `intra_block_mode_info( )`（仕様 6.4.15 節）。インターフレーム内のイントラブロック用。
@@ -1163,6 +1290,7 @@ impl TileDecoder {
             let ctx = SIZE_GROUP_LOOKUP[mi_size as usize] as usize;
             let mode =
                 r.read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[ctx][node]) as u8;
+            self.counts.intra_mode[ctx][mode as usize] += 1;
             y_mode = mode;
             sub_modes = [mode; 4];
         } else {
@@ -1177,6 +1305,7 @@ impl TileDecoder {
                     let mode = r
                         .read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[0][node])
                         as u8;
+                    self.counts.intra_mode[0][mode as usize] += 1;
                     for y2 in 0..num4x4h {
                         for x2 in 0..num4x4w {
                             sub_modes[((idy + y2) * 2 + idx + x2) as usize] = mode;
@@ -1191,8 +1320,9 @@ impl TileDecoder {
         }
 
         let uv_mode = r.read_tree(&INTRA_MODE_TREE, |node| {
-            DEFAULT_UV_MODE_PROBS[y_mode as usize][node]
+            self.probs.uv_mode_probs[y_mode as usize][node]
         }) as u8;
+        self.counts.uv_mode[y_mode as usize][uv_mode as usize] += 1;
 
         Ok(MiInfo {
             skip,
@@ -1211,10 +1341,12 @@ impl TileDecoder {
 
     /// `read_ref_frames( )`（仕様 6.4.17 節）。`seg_feature_active( SEG_LVL_REF_FRAME )` は
     /// セグメンテーション未サポートのため常に false。
-    fn read_ref_frames(&self, r: &mut BoolDecoder, n: &NeighborRefInfo) -> [u8; 2] {
+    fn read_ref_frames(&mut self, r: &mut BoolDecoder, n: &NeighborRefInfo) -> [u8; 2] {
         let comp_mode = if self.reference_mode == REFERENCE_MODE_SELECT {
             let ctx = self.comp_mode_ctx(n);
-            (r.read_bool(self.probs.comp_mode_prob[ctx]) as u8) + SINGLE_REFERENCE
+            let bit = r.read_bool(self.probs.comp_mode_prob[ctx]);
+            self.counts.comp_mode[ctx][bit as usize] += 1;
+            (bit as u8) + SINGLE_REFERENCE
         } else {
             self.reference_mode
         };
@@ -1223,6 +1355,7 @@ impl TileDecoder {
             let idx = self.ref_frame_sign_bias[self.comp_fixed_ref as usize] as usize;
             let ctx = self.comp_ref_ctx(n);
             let comp_ref = r.read_bool(self.probs.comp_ref_prob[ctx]) as usize;
+            self.counts.comp_ref[ctx][comp_ref] += 1;
             let mut ref_frame = [0u8; 2];
             ref_frame[idx] = self.comp_fixed_ref;
             ref_frame[1 - idx] = self.comp_var_ref[comp_ref];
@@ -1230,9 +1363,11 @@ impl TileDecoder {
         } else {
             let ctx1 = self.single_ref_p1_ctx(n);
             let single_ref_p1 = r.read_bool(self.probs.single_ref_prob[ctx1][0]);
+            self.counts.single_ref[ctx1][0][single_ref_p1 as usize] += 1;
             if single_ref_p1 {
                 let ctx2 = self.single_ref_p2_ctx(n);
                 let single_ref_p2 = r.read_bool(self.probs.single_ref_prob[ctx2][1]);
+                self.counts.single_ref[ctx2][1][single_ref_p2 as usize] += 1;
                 [
                     if single_ref_p2 {
                         ALTREF_FRAME
@@ -1588,14 +1723,17 @@ impl TileDecoder {
             let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
                 self.probs.inter_mode_probs[ctx][node]
             }) as u8;
+            self.counts.inter_mode[ctx][inter_mode as usize] += 1;
             y_mode = NEARESTMV + inter_mode;
         }
 
         let interp_filter = if self.interpolation_filter == SWITCHABLE {
             let ctx = self.interp_filter_ctx(row, col, n);
-            r.read_tree(&INTERP_FILTER_TREE, |node| {
+            let f = r.read_tree(&INTERP_FILTER_TREE, |node| {
                 self.probs.interp_filter_probs[ctx][node]
-            }) as u8
+            }) as u8;
+            self.counts.interp_filter[ctx][f as usize] += 1;
+            f
         } else {
             self.interpolation_filter
         };
@@ -1613,6 +1751,7 @@ impl TileDecoder {
                     let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
                         self.probs.inter_mode_probs[ctx][node]
                     }) as u8;
+                    self.counts.inter_mode[ctx][inter_mode as usize] += 1;
                     y_mode = NEARESTMV + inter_mode;
                     let block = (idy * 2 + idx) as i32;
                     if y_mode == NEARESTMV || y_mode == NEARMV {
@@ -1693,6 +1832,7 @@ impl TileDecoder {
     fn read_mv(&mut self, r: &mut BoolDecoder, best_mv: Mv) -> Mv {
         let use_hp = self.allow_high_precision_mv && use_mv_hp(best_mv);
         let mv_joint = r.read_tree(&MV_JOINT_TREE, |node| self.probs.mv_joint_probs[node]) as u8;
+        self.counts.mv_joint[mv_joint as usize] += 1;
         let mut diff = ZERO_MV;
         if mv_joint == MV_JOINT_HZVNZ || mv_joint == MV_JOINT_HNZVNZ {
             diff[0] = self.read_mv_component(r, 0, use_hp);
@@ -1706,32 +1846,40 @@ impl TileDecoder {
     /// `read_mv_component( comp )`（仕様 6.4.20 節）。
     fn read_mv_component(&mut self, r: &mut BoolDecoder, comp: usize, use_hp: bool) -> i32 {
         let sign = r.read_bool(self.probs.mv_sign_prob[comp]);
+        self.counts.mv_sign[comp][sign as usize] += 1;
         let mv_class =
             r.read_tree(&MV_CLASS_TREE, |node| self.probs.mv_class_probs[comp][node]) as usize;
+        self.counts.mv_class[comp][mv_class] += 1;
         let mag: u32 = if mv_class == 0 {
             let class0_bit = r.read_bool(self.probs.mv_class0_bit_prob[comp]) as u32;
+            self.counts.mv_class0_bit[comp][class0_bit as usize] += 1;
             let class0_fr = r.read_tree(&MV_FR_TREE, |node| {
                 self.probs.mv_class0_fr_probs[comp][class0_bit as usize][node]
             }) as u32;
+            self.counts.mv_class0_fr[comp][class0_bit as usize][class0_fr as usize] += 1;
             let class0_hp = if use_hp {
                 r.read_bool(self.probs.mv_class0_hp_prob[comp]) as u32
             } else {
                 1
             };
+            self.counts.mv_class0_hp[comp][class0_hp as usize] += 1;
             ((class0_bit << 3) | (class0_fr << 1) | class0_hp) + 1
         } else {
             let mut d: u32 = 0;
             for i in 0..mv_class {
                 let bit = r.read_bool(self.probs.mv_bits_prob[comp][i]) as u32;
+                self.counts.mv_bits[comp][i][bit as usize] += 1;
                 d |= bit << i;
             }
             let mut mag = 2u32 << (mv_class + 2); // CLASS0_SIZE(2) << (mv_class+2)
             let fr = r.read_tree(&MV_FR_TREE, |node| self.probs.mv_fr_probs[comp][node]) as u32;
+            self.counts.mv_fr[comp][fr as usize] += 1;
             let hp = if use_hp {
                 r.read_bool(self.probs.mv_hp_prob[comp]) as u32
             } else {
                 1
             };
+            self.counts.mv_hp[comp][hp as usize] += 1;
             mag += ((d << 3) | (fr << 1) | hp) + 1;
             mag
         };

@@ -35,9 +35,9 @@ use crate::prob_tables::{
     DEFAULT_MV_CLASS0_FR_PROBS, DEFAULT_MV_CLASS0_HP_PROB, DEFAULT_MV_CLASS_PROBS,
     DEFAULT_MV_FR_PROBS, DEFAULT_MV_HP_PROB, DEFAULT_MV_JOINT_PROBS, DEFAULT_MV_SIGN_PROB,
     DEFAULT_PARTITION_PROBS, DEFAULT_SINGLE_REF_PROB, DEFAULT_SKIP_PROB, DEFAULT_TX_PROBS,
-    DEFAULT_Y_MODE_PROBS, GOLDEN_FRAME, INV_MAP_TABLE, LAST_FRAME, REFERENCE_MODE_SELECT,
-    SINGLE_REFERENCE, SWITCHABLE, TX_16X16, TX_32X32, TX_4X4, TX_8X8, TX_MODE_SELECT,
-    TX_MODE_TO_BIGGEST_TX_SIZE,
+    DEFAULT_UV_MODE_PROBS, DEFAULT_Y_MODE_PROBS, GOLDEN_FRAME, INV_MAP_TABLE, LAST_FRAME,
+    REFERENCE_MODE_SELECT, SINGLE_REFERENCE, SWITCHABLE, TX_16X16, TX_32X32, TX_4X4, TX_8X8,
+    TX_MODE_SELECT, TX_MODE_TO_BIGGEST_TX_SIZE,
 };
 
 /// `compressed_header` パース時に発生し得るエラー。
@@ -51,11 +51,17 @@ pub enum CompressedHeaderError {
 ///
 /// 仕様の `load_probs`/`save_probs`（仕様 7.1.2 節）が操作する「すべての確率テーブル」に
 /// 相当し、そのままフレームコンテキスト（[`FrameContext`]、4 スロット）として保存・復元される。
-/// `uv_mode_probs` に相当するフィールドは持たない。`compressed_header()` にはこれを更新する
-/// シンタックスが存在せず（`read_y_mode_probs()` は `y_mode_probs` のみを更新する）、常に
-/// [`crate::prob_tables::DEFAULT_UV_MODE_PROBS`] を直接使うため。
+///
+/// `uv_mode_probs` には `compressed_header()` の forward update シンタックスは存在しない
+/// （`read_y_mode_probs()` は `y_mode_probs` のみを更新する）が、仕様 8.4.4 節
+/// `adapt_noncoef_probs()` の backward adaptation 対象には含まれる
+/// （`adapt_probs( intra_mode_tree, uv_mode_probs[ i ], counts_uv_mode[ i ] )`）ため、
+/// `load_probs`/`save_probs` が操作するテーブルの一つとしてここに保持する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressedHeaderProbs {
+    /// `uv_mode_probs[y_mode][node]`。forward update シンタックスは無いが backward
+    /// adaptation の対象（上記ドキュメント参照）。
+    pub uv_mode_probs: [[u8; 9]; 10],
     /// `tx_probs[maxTxSize][ctx][node]`。[`crate::prob_tables::DEFAULT_TX_PROBS`] と同じレイアウト。
     pub tx_probs: [[[u8; 3]; 2]; 4],
     /// `coef_probs[txSz][plane>0][is_inter][band][ctx][node]`。
@@ -103,6 +109,7 @@ pub struct CompressedHeaderProbs {
 impl Default for CompressedHeaderProbs {
     fn default() -> Self {
         Self {
+            uv_mode_probs: DEFAULT_UV_MODE_PROBS,
             tx_probs: DEFAULT_TX_PROBS,
             coef_probs: DEFAULT_COEF_PROBS,
             skip_prob: DEFAULT_SKIP_PROB,
