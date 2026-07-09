@@ -16,3 +16,4 @@ pub mod bool_coder;
 pub mod header;
 pub mod ivf;
 pub mod quant;
+pub mod transform;
