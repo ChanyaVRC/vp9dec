@@ -19,13 +19,14 @@ https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-
 | --- | --- | --- |
 | M1 | コンテナ (IVF) パーサ、bool デコーダ、非圧縮フレームヘッダのパース | 完了 |
 | M2 | イントラ予測によるキーフレームのデコード（圧縮ヘッダ・タイル・トークン復号・変換・量子化・再構成） | 完了（ループフィルタを除く） |
-| M2b | ループフィルタ（デブロッキングフィルタ、仕様 8.8 節） | 未着手 |
+| M2b | ループフィルタ（デブロッキングフィルタ、仕様 8.8 節）＋公式コンフォーマンス検証 | 完了 |
 | M3 | インター予測（動き補償）によるフレーム間デコード | 未着手 |
 | M4 | VP9 コンフォーマンステストベクタの完全通過 | 未着手 |
 
-`decode_keyframe()`（`src/lib.rs`）で実際にキーフレームを最後までデコードし、YUV420 の
-`Frame` を得られる。ただしループフィルタ（M2b）が未適用のため、ブロック境界に軽微な
-ノイズが残る場合がある。
+`decode_keyframe()`（`src/lib.rs`）で実際にキーフレームを最後までデコードし、ループフィルタ
+適用済み・表示サイズにクロップ済みの YUV420 `Frame` を得られる。手元の 2 本のテストベクタでは、
+最初のキーフレームのデコード結果（Y→U→V 連結の I420 バイト列）の MD5 が libvpx 公式配布の
+`.ivf.md5` と完全一致することを確認済み（`tests/conformance_test.rs`、詳細は後述）。
 
 ## M1 で実装したもの
 
@@ -81,31 +82,39 @@ https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-
 
 ### 既知の制約
 
-- **ループフィルタ未実装（M2b）**: デブロッキングフィルタ（仕様 8.8 節）は未実装のため、
-  出力画像にはブロック境界の軽微なノイズが残る場合がある。`decode_keyframe` はこれを
-  補正しない。
 - 8bit（`BitDepth == 8`）のみサポート。`Plane` が `u8` 固定のため、10bit/12bit フレームは
   `decode_keyframe` が `DecodeError::UnsupportedBitDepth` を返す。
 - セグメンテーション: `segmentation_enabled == true` のフレームは `TileError::SegmentationNotSupported`
   を返す（既知の制約、M1 から継続）。手元のテストベクタでは両方とも
-  `segmentation_enabled == false` であることを確認済み。
+  `segmentation_enabled == false` であることを確認済み。ループフィルタ（後述）もこれに合わせ、
+  `seg_feature_active( SEG_LVL_ALT_L )` を常に偽と仮定して簡略化している。
 - 仕様書 9.3.2 節の `partition` の確率選択processの記載についての既知の誤記（erratum）判断は
   M1 から変更なし。詳細は `src/tile.rs` の `read_partition` のコメントを参照。
 
-### M2b（ループフィルタ）への引き継ぎメモ
+## M2b（ループフィルタ + 公式コンフォーマンス検証）
 
-- 実装箇所の候補: `src/lib.rs::decode_keyframe` の中で `decoder.decode_tiles(...)` の直後、
-  `decoder.planes()` を読む前に `loop_filter_frame()`（仕様 8.8.1 節）相当の処理を挟む形になる。
-  `TileDecoder` に `pub fn planes_mut(&mut self) -> &mut [Plane; 3]`
-  （または専用のループフィルタ関数に `&mut self` を渡す形）を追加する必要がある。
-- ループフィルタの強度・要否判定には `MiGrid`（`tx_size`/`skip`/`mi_size`/`y_mode` 等）と
-  `header.loop_filter`（`level`/`sharpness`/`ref_deltas`/`mode_deltas`）の両方が必要。
-  `MiGrid` は既に `TileDecoder::mi_grid()` で読み取り専用アクセス可能。`loop_filter` パラメータは
-  `NewFrameHeader.loop_filter` に保持済み（`src/header.rs`）だが `TileDecoder` はまだ保持して
-  いないので、`TileDecoder::new` に渡すか、フィルタ処理を `TileDecoder` の外（`lib.rs`）に
-  独立した関数として置き `&NewFrameHeader` を直接渡すほうが自然。
-- `filter_level == 0` の場合は仕様上フィルタ処理自体をスキップしてよい（両テストベクタで
-  実際の値を確認しておくこと）。
+以下を実装済み。
+
+- `src/loop_filter.rs`（新規）: デブロッキングフィルタ（仕様 8.8 節）。フレーム全体の走査
+  順序（スーパーブロックのラスタ順 →Y/U/V→ 縦エッジ→横エッジ、仕様 8.8 節冒頭の擬似コード）、
+  フィルタ強度計算（`build_lvl_lookup`、仕様 8.8.1 節 "Loop filter frame init process"）、エッジ判定（ブロック境界・
+  変換ブロック境界・フレーム端の除外、仕様 8.8.2 節）、フィルタサイズ決定（仕様 8.8.3 節）、
+  適応フィルタ強度（`limit`/`blimit`/`thresh`、仕様 8.8.4 節）、フィルタ本体（narrow filter =
+  4タップ、wide filter = 8/16タップ、flat/flat2 判定を含む、仕様 8.8.5 節）をすべて疑似コード
+  どおりの整数演算で実装した。キーフレームのみを対象とするため、`isIntra` は常に真、
+  `modeType` は常に 0 に決め打ちしている（`MiInfo` が `ref_frame` を持たないため。M3 引き継ぎ
+  メモ参照）。`src/tile.rs::TileDecoder::apply_loop_filter()` から呼び出し、
+  `src/lib.rs::decode_keyframe` がタイル復号直後・クロップ前に適用する。
+- `src/md5.rs`（新規）: MD5（RFC 1321）の自作実装（依存クレートゼロ方針のため）。
+  既知ベクタ（空文字列・`"abc"`・`"message digest"` 等、RFC 1321 に掲載の値）でユニットテスト済み。
+- `tests/conformance_test.rs`（新規）: libvpx 公式配布の `.ivf.md5`（`tests/vectors/` に
+  ダウンロード、取得手順は後述）と、`decode_keyframe` の最初のキーフレーム出力（Y→U→V 連結の
+  I420 バイト列）の MD5 を比較する。**両テストベクタ（`vp90-2-12-droppable_1`・
+  `vp90-2-09-subpixel-00`）とも完全一致を確認済み**。特に `vp90-2-09-subpixel-00` は
+  キーフレームが疑似乱数状のノイズパターンに見える（`target/dump/*.png` 参照）ため M2 時点では
+  デコード結果の正しさに疑義が残っていたが、公式 MD5 と一致したことで正しいデコード結果
+  であることが確定した（サブピクセル補間フィルタの効果は後続のインターフレームで初めて
+  現れる設計と考えられる。M3 実装後、動き補償ありの中間フレームで改めて目視検収するとよい）。
 
 ### M3（インター予測）への引き継ぎメモ
 
@@ -119,14 +128,17 @@ https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-
 - `src/tile.rs` の `mode_info()` は `intra_frame_mode_info()` のみ。`inter_frame_mode_info()`
   （仕様 6.4.11〜6.4.20 節、`find_mv_refs`/MV 予測・復号を含む）が未実装。
 - `src/predict.rs` に `predict_inter()`（仕様 8.5.2 節、動き補償・サブピクセル補間フィルタ）を
-  追加する必要がある。`vp90-2-09-subpixel-00.ivf` はサブピクセル補間フィルタのテスト用ベクタ
-  （名前のとおり）で、キーフレーム自体は疑似乱数的なノイズパターンであることを
-  `examples/decode_to_png.rs` の出力で確認済み（後続のインターフレームで初めてサブピクセル
-  補間の効果が現れる設計と推測される。M3 実装後、動き補償ありの中間フレームで改めて
-  目視検収するとよい）。
+  追加する必要がある。
 - `MiGrid`/`above_partition_context`/`left_partition_context`/`above_nonzero_context`/
   `left_nonzero_context` は `TileDecoder` の非公開フィールドだが、`pub fn mi_grid(&self)`/
   `pub fn planes(&self)` で読み取り専用アクセスができる。
+- **`src/loop_filter.rs` の `is_intra`/`mode_type` 決め打ちの解消が必須**: 現状 `MiInfo` に
+  `ref_frame` が無いため、`superblock_loop_filter` 内で `is_intra = true`・`mode_type = 0` を
+  決め打ちしている（仕様 8.8.4 節 `RefFrames[loopRow][loopCol][0]`/`YModes` 相当）。インター
+  フレーム対応時は `MiInfo` に `ref_frame`（と、必要なら `NEARESTMV`/`NEARMV`/`NEWMV` 判定用の
+  実際の `y_mode` の意味論）を追加し、`LvlLookup` の `ref`/`mode` 添字を実値から求めるよう
+  改修すること。`build_lvl_lookup` 自体は `ref`/`mode` の全組み合わせを既に計算済みなので
+  そのまま使える。
 
 ## テスト
 
@@ -144,7 +156,10 @@ IVF パーサとヘッダパーサを検証する。`tests/compressed_header_tes
 検証する。`tests/decode_test.rs` は `decode_keyframe()`（公開 API）で最初のキーフレームを
 最後まで完全にデコードし、Y プレーンの統計値（分散が 0 でない・全ピクセル同値でない・
 `min < 50 && max > 200`）で実写系ベクタとして妥当な出力であることを検証する。
-テストベクタはリポジトリに含めていない（`.gitignore` 対象）ため、
+`tests/conformance_test.rs`（M2b で追加）は、`decode_keyframe()` の最初のキーフレーム出力
+（Y→U→V 連結の I420 バイト列）の MD5 が libvpx 公式配布の `.ivf.md5` と完全一致することを
+検証する（ループフィルタ・クロップ・プレーン連結順がすべて正しくないと一致しないビット完全
+検証）。テストベクタ・MD5 ファイルはリポジトリに含めていない（`.gitignore` 対象）ため、
 以下の手順で事前にダウンロードしておく必要がある。ダウンロードしていない場合、該当テストは
 早期 return + `eprintln!` でスキップされ、テストスイート全体は失敗しない。
 
@@ -154,9 +169,17 @@ curl -o tests/vectors/vp90-2-12-droppable_1.ivf \
   https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/vp90-2-12-droppable_1.ivf
 curl -o tests/vectors/vp90-2-09-subpixel-00.ivf \
   https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/vp90-2-09-subpixel-00.ivf
+curl -o tests/vectors/vp90-2-12-droppable_1.ivf.md5 \
+  https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/vp90-2-12-droppable_1.ivf.md5
+curl -o tests/vectors/vp90-2-09-subpixel-00.ivf.md5 \
+  https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/vp90-2-09-subpixel-00.ivf.md5
 ```
 
 （PowerShell の場合は `Invoke-WebRequest -Uri <URL> -OutFile <path>` を使用する。）
+
+`.ivf.md5` は `md5sum` 互換フォーマット（`<32文字hex>␠␠<ファイル名>`）で、1 行 = 1 出力フレーム
+（Y→U→V 連結の I420 バイト列）の MD5 を記録している。`tests/conformance_test.rs` は 1 行目
+（最初の出力フレーム = 最初のキーフレーム）のみを使用する。
 
 テストベクタの一覧は libvpx リポジトリの
 [`test/test-data.sha1`](https://github.com/webmproject/libvpx/blob/main/test/test-data.sha1) に
