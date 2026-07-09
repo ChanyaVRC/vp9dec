@@ -20,7 +20,8 @@ https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-
 | M1 | コンテナ (IVF) パーサ、bool デコーダ、非圧縮フレームヘッダのパース | 完了 |
 | M2 | イントラ予測によるキーフレームのデコード（圧縮ヘッダ・タイル・トークン復号・変換・量子化・再構成） | 完了（ループフィルタを除く） |
 | M2b | ループフィルタ（デブロッキングフィルタ、仕様 8.8 節）＋公式コンフォーマンス検証 | 完了 |
-| M3 | インター予測（動き補償）によるフレーム間デコード | 未着手 |
+| M3 前半 | インターフレームのビットストリーム復号（ヘッダ・確率テーブル・モード情報・MV・残差トークン。動き補償の手前まで） | 完了 |
+| M3 後半 | 動き補償・サブピクセル補間・参照フレーム管理・確率適応（forward/backward）・全フレーム MD5 コンフォーマンス | 未着手 |
 | M4 | VP9 コンフォーマンステストベクタの完全通過 | 未着手 |
 
 `decode_keyframe()`（`src/lib.rs`）で実際にキーフレームを最後までデコードし、ループフィルタ
@@ -34,7 +35,8 @@ https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-
 - `src/bool_coder.rs` : VP9 の算術符号（bool coder）デコーダ（仕様 9.2 節）。
   検証用に対になるエンコーダをテスト内に実装し、ラウンドトリップで一致することを確認している。
 - `src/header.rs` : 非圧縮フレームヘッダ（uncompressed_header, 仕様 6.2 節）のパース。
-  キーフレームのみサポートし、インターフレーム／イントラオンリーフレームは M2 以降で対応する。
+  M1 時点ではキーフレームのみサポートしていた（インターフレーム／イントラオンリーフレームは
+  M3 前半で対応済み。詳細は後述の「M3 前半」節を参照）。
 
 ## M2（キーフレームのイントラ復号）
 
@@ -116,29 +118,111 @@ https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-
   であることが確定した（サブピクセル補間フィルタの効果は後続のインターフレームで初めて
   現れる設計と考えられる。M3 実装後、動き補償ありの中間フレームで改めて目視検収するとよい）。
 
-### M3（インター予測）への引き継ぎメモ
+## M3 前半（インターフレームのビットストリーム復号）
 
-- `src/header.rs` はキーフレーム（`frame_type == KEY_FRAME`）のみ対応。インターフレームの
-  `uncompressed_header` 追加フィールド（`ref_frame_idx`、`ref_frame_sign_bias`、
-  `allow_high_precision_mv`、`interpolation_filter`、`frame_size_with_refs` 等）が未パース。
-- `src/compressed_header.rs` の `read_inter_mode_probs()` 以降（`inter_mode_probs`/
-  `interp_filter_probs`/`is_inter_prob`/`frame_reference_mode`/`comp_mode_probs`/
-  `single_ref_prob`/`comp_ref_prob`/`y_mode_probs`（非キーフレーム版）/`partition_probs`
-  （非キーフレーム版）/`mv_probs`）が未実装。`FrameIsIntra == 0` でのみ呼ばれる。
-- `src/tile.rs` の `mode_info()` は `intra_frame_mode_info()` のみ。`inter_frame_mode_info()`
-  （仕様 6.4.11〜6.4.20 節、`find_mv_refs`/MV 予測・復号を含む）が未実装。
-- `src/predict.rs` に `predict_inter()`（仕様 8.5.2 節、動き補償・サブピクセル補間フィルタ）を
-  追加する必要がある。
-- `MiGrid`/`above_partition_context`/`left_partition_context`/`above_nonzero_context`/
-  `left_nonzero_context` は `TileDecoder` の非公開フィールドだが、`pub fn mi_grid(&self)`/
-  `pub fn planes(&self)` で読み取り専用アクセスができる。
-- **`src/loop_filter.rs` の `is_intra`/`mode_type` 決め打ちの解消が必須**: 現状 `MiInfo` に
-  `ref_frame` が無いため、`superblock_loop_filter` 内で `is_intra = true`・`mode_type = 0` を
-  決め打ちしている（仕様 8.8.4 節 `RefFrames[loopRow][loopCol][0]`/`YModes` 相当）。インター
-  フレーム対応時は `MiInfo` に `ref_frame`（と、必要なら `NEARESTMV`/`NEARMV`/`NEWMV` 判定用の
-  実際の `y_mode` の意味論）を追加し、`LvlLookup` の `ref`/`mode` 添字を実値から求めるよう
-  改修すること。`build_lvl_lookup` 自体は `ref`/`mode` の全組み合わせを既に計算済みなので
-  そのまま使える。
+動き補償・サブピクセル補間そのもの（画素生成）を除き、インターフレームのビットストリームを
+最初から最後まで正しく読み切れるところまでを実装した。以下を実装済み。
+
+- `src/header.rs` : `uncompressed_header()`（仕様 6.2 節）の非キーフレーム分岐を完全実装。
+  `intra_only`/`reset_frame_context`/`refresh_frame_flags`（インター用）/`ref_frame_idx`/
+  `ref_frame_sign_bias`/`frame_size_with_refs()`（仕様 6.2.5 節）/`allow_high_precision_mv`/
+  `read_interpolation_filter()`（仕様 6.2.7 節）を追加。`frame_size_with_refs()` が参照する
+  `RefFrameWidth`/`RefFrameHeight` はフレーム間状態のため、`parse_uncompressed_header()` は
+  それを呼び出し側から `&[(u32,u32); NUM_REF_FRAMES]` として受け取る設計にした
+  （状態自体は `Decoder`（`src/lib.rs`）が保持する）。インターフレームは `color_config` を
+  再送しないため、`Decoder` が直近のキーフレーム/イントラオンリーフレームの値を引き継ぐ。
+- `src/prob_tables.rs` : インター関連のツリー（`INTER_MODE_TREE`/`INTERP_FILTER_TREE`/
+  `MV_JOINT_TREE`/`MV_CLASS_TREE`/`MV_FR_TREE`）と、仕様 10.5 節から機械抽出したデフォルト
+  確率テーブル一式（`DEFAULT_PARTITION_PROBS`/`DEFAULT_Y_MODE_PROBS`/`DEFAULT_UV_MODE_PROBS`/
+  `DEFAULT_IS_INTER_PROB`/`DEFAULT_COMP_MODE_PROB`/`DEFAULT_COMP_REF_PROB`/
+  `DEFAULT_SINGLE_REF_PROB`/`DEFAULT_INTER_MODE_PROBS`/`DEFAULT_INTERP_FILTER_PROBS`/
+  MV 系 8 種）、および仕様 6.5 節 "Motion vector prediction" の定数テーブル
+  （`MV_REF_BLOCKS`/`MODE_2_COUNTER`/`COUNTER_TO_CONTEXT`/`IDX_N_COLUMN_TO_SUBBLOCK`/
+  `SIZE_GROUP_LOOKUP`）を追加。`mode2txfm_map()` はインターモード値（`NEARESTMV`..`NEWMV`）
+  も受け付けるよう拡張（仕様 10.2 節の表は MB_MODE_COUNT=14 全体を定義しており、インター
+  モードはすべて `DCT_DCT` に写像される）。
+- `src/compressed_header.rs` : `read_inter_mode_probs`/`read_interp_filter_probs`/
+  `read_is_inter_probs`/`frame_reference_mode`（`setup_compound_reference_mode` を含む）/
+  `frame_reference_mode_probs`/`read_y_mode_probs`/`read_partition_probs`（いずれも非キー
+  フレーム版）/`mv_probs`（`update_mv_prob` を含む、仕様 6.3.9〜6.3.18 節）を実装。
+  `CompressedHeaderProbs` を「`load_probs`/`save_probs` が操作するすべての確率テーブル」
+  （`uv_mode_probs` を除く。更新シンタックスが存在せず常にデフォルト値のため）に拡張し、
+  `FrameContext`（= `CompressedHeaderProbs` の別名）と 4 スロットの `FrameContextStore`
+  を追加した。`parse_compressed_header_ex()` が新しいインター対応版のエントリポイントで、
+  `parse_compressed_header()`（キーフレーム専用、既存 API）はその薄いラッパーとして残した。
+- `src/tile.rs` : `inter_frame_mode_info()`（仕様 6.4.11 節）以下を全面実装。
+  `read_is_inter`/`intra_block_mode_info`（インターフレーム内のイントラブロック）/
+  `read_ref_frames`（`comp_mode`/`comp_ref`/`single_ref_p1`/`single_ref_p2` の文脈導出、
+  仕様 9.3.2 節を含む）/`inter_block_mode_info`/`assign_mv`/`read_mv`/`read_mv_component`
+  （仕様 6.4.16〜6.4.20 節）を実装。動きベクトル予測（仕様 6.5 節）は `find_mv_refs`/
+  `find_best_ref_mvs`/`append_sub8x8_mvs`/`is_inside`/`get_block_mv`/
+  `if_same_ref_frame_add_mv`/`if_diff_ref_frame_add_mv` として実装し、純粋な補助計算
+  （クランプ・符号反転・しきい値判定）は新設の `src/mv.rs` に切り出した。`UsePrevFrameMvs`
+  （仕様 7.2.6 節）にも対応しており、前フレームの `MiGrid`（`Mvs`/`RefFrames` 相当）を
+  `TileDecoder::new_with_prev()` 経由で受け取れる。`residual()` は `is_inter` 分岐
+  （`predict_inter` の呼び出し位置、`TxType` 決定、`coef_probs` の `is_inter` 添字）と
+  `EobTotal`（仕様 6.4.4 節、`is_inter && subsize >= BLOCK_8X8 && EobTotal == 0` で `skip`
+  を事後的に 1 にする処理）に対応した。`read_partition` は仕様 9.3.2 節の既知の誤記を修正した
+  解釈のまま、`FrameIsIntra` に応じて `KF_PARTITION_PROBS`/`partition_probs` を切り替える。
+- `src/predict.rs` : `predict_inter_stub()`（仕様 8.5.2 節のプレースホルダー）を追加。
+  動き補償・サブピクセル補間は未実装で、呼び出しても何もしない。仕様 7.4.15 節 NOTE の
+  とおり `predict_inter` はシンタックス復号に一切影響しないため、ビットストリームの読了には
+  影響しない。
+- `src/loop_filter.rs` : `MiInfo` に `ref_frame`/`y_mode`（インター値含む）が揃ったことで、
+  `is_intra`/`modeType` の決め打ちを解消し、仕様 8.8.4 節どおり `RefFrames[..][0]`/`YModes`
+  の実値を参照するよう修正。**既存のキーフレーム MD5 コンフォーマンステストは引き続き
+  全通過を確認済み**（`isIntra`/`modeType` はキーフレームでは従来どおり常に `true`/`0` に
+  評価されるため、出力は不変）。
+- `src/lib.rs` : フレーム間状態（参照フレームスロットサイズ・フレームコンテキスト 4 スロット・
+  `UsePrevFrameMvs` 用の前フレーム `MiGrid`・直近の `color_config`）を保持する `Decoder`
+  を新設し、`Decoder::decode_frame()` で 1 フレームずつ順にデコードできるようにした。
+  既存の `decode_keyframe()`（第 1 引数がキーフレームであることを検証したうえで、使い捨ての
+  `Decoder` を介して `decode_frame()` を呼ぶ）はそのまま維持しており、後方互換。
+
+### 既知の制約（M3 後半への引き継ぎ）
+
+- **動き補償・サブピクセル補間フィルタ（仕様 8.5.2 節）は未実装**。`predict_inter_stub()` は
+  何もしないため、`Decoder::decode_frame()`/`DecodeOutcome::Decoded` が返すインター
+  フレームのピクセル値は不正（`is_inter` ブロックは予測されず、残差のみが加算された値になる）。
+  参照フレームの実ピクセルデータ（DPB 相当）も保持していない（動き補償が無いため不要だった）。
+- **確率適応（仕様 8.4 節）は未実装**。`adapt_coef_probs`/`adapt_noncoef_probs`（出現頻度に
+  基づく backward adaptation）を実装しておらず、`counts_*` 系のカウンタも収集していない。
+  `FrameContextStore` は `compressed_header()` の forward update（`diff_update_prob`）適用後の
+  値をそのまま保存する。これは `frame_parallel_decoding_mode == 1`（adaptation 無効）の
+  フレームでは仕様どおり正確だが、`== 0` のフレームでは次フレーム以降の確率値が仕様上の
+  期待値からずれ得る（**ずれても bit 単位の同期は保たれる**: `diff_update_prob` 自身は
+  固定確率 `B(252)`/`L(n)` で読むため、開始確率の値がどうであれ `compressed_header()` の
+  消費バイト数は変わらない。ただし `decode_tiles()` 側の `read_bool` はそのフレームの
+  確率テーブル値に直接依存するため、そのフレーム以降の読み取り結果自体は確率適応の有無で
+  変わり得る。手元の 2 テストベクタは全フレーム読了を確認済みなので、少なくともこれらの
+  ベクタでは実害が出るほどの分岐（ズレによる別確率選択）は発生していない）。
+- **ループフィルタのフレーム間デルタ引き継ぎ未実装**: `loop_filter_ref_deltas`/
+  `loop_filter_mode_deltas` は仕様上フレーム間で持続する状態（`setup_past_independence()`
+  時のみリセット）だが、本実装は毎フレーム `parse_loop_filter_params()` 内でデフォルト値
+  から起動する。ループフィルタの出力画素にのみ影響し、ビットストリーム読了には影響しない。
+- **セグメンテーション未対応は継続**（M1 からの既知の制約）。`inter_frame_mode_info` も
+  `segmentation_enabled == true` の場合は `TileError::SegmentationNotSupported` を返す。
+- `reset_frame_context == 2`（該当フレームコンテキストのみリセット）は未実装で、
+  `FrameIsIntra || error_resilient_mode` の場合は常に全 4 スロットをリセットする簡略化を
+  行っている（`frame_context_idx` はこの場合いずれも 0 に固定されるため、ビットストリーム
+  読み取りには影響しない）。
+- `show_existing_frame` フレームは `DecodeOutcome::ShowExisting` を返すのみで、実際に
+  該当フレームを表示（過去にデコードしたピクセルを返す）する仕組みは未実装（DPB 非搭載のため）。
+
+### M3 後半でやること
+
+1. `src/predict.rs` に `predict_inter()`（仕様 8.5.2 節、8 タップ/バイリニアのサブピクセル
+   補間フィルタ、`interp_filter`/`mv` を使った動き補償）を実装し、`predict_inter_stub()` の
+   呼び出し箇所を置き換える。
+2. 参照フレームの実ピクセルデータ（DPB、8 スロット）を `Decoder` に持たせ、`refresh_frame_flags`
+   に応じて更新する（仕様 8.10 節 "Reference frame update process"）。
+3. 確率適応（仕様 8.4 節）: `counts_*` の収集（`src/tile.rs` の各シンタックス要素読み取り箇所）、
+   `merge_prob`/`merge_probs`、`adapt_coef_probs`/`adapt_noncoef_probs` を実装し、
+   `FrameContextStore::save` の前に適用する。
+4. ループフィルタのフレーム間デルタ引き継ぎ、`reset_frame_context == 2` の部分リセットなど、
+   上記「既知の制約」を順次解消する。
+5. 全フレーム MD5 コンフォーマンス検証（`tests/conformance_test.rs` を拡張し、`.ivf.md5` の
+   全行と比較する）。
 
 ## テスト
 
@@ -159,9 +243,15 @@ IVF パーサとヘッダパーサを検証する。`tests/compressed_header_tes
 `tests/conformance_test.rs`（M2b で追加）は、`decode_keyframe()` の最初のキーフレーム出力
 （Y→U→V 連結の I420 バイト列）の MD5 が libvpx 公式配布の `.ivf.md5` と完全一致することを
 検証する（ループフィルタ・クロップ・プレーン連結順がすべて正しくないと一致しないビット完全
-検証）。テストベクタ・MD5 ファイルはリポジトリに含めていない（`.gitignore` 対象）ため、
-以下の手順で事前にダウンロードしておく必要がある。ダウンロードしていない場合、該当テストは
-早期 return + `eprintln!` でスキップされ、テストスイート全体は失敗しない。
+検証）。`tests/inter_frame_test.rs`（M3 前半で追加）は `Decoder::decode_frame()` を使い、
+各テストベクタの**全 IVF フレーム**（キーフレーム・インターフレーム・`vp90-2-12-droppable_1`
+の droppable フレームを含む）を順にデコードし、`uncompressed_header`＋`compressed_header`＋
+全タイルのモード情報・MV・残差トークンをパニックなく最後まで読み切れることを検証する
+（`vp90-2-09-subpixel-00` は 20 フレーム、`vp90-2-12-droppable_1` は 99 フレームすべてを
+確認済み）。画素の正しさまでは検証しない（動き補償が `predict_inter_stub()` のスタブのため。
+「M3 前半」節参照）。テストベクタ・MD5 ファイルはリポジトリに含めていない（`.gitignore` 対象）
+ため、以下の手順で事前にダウンロードしておく必要がある。ダウンロードしていない場合、該当
+テストは早期 return + `eprintln!` でスキップされ、テストスイート全体は失敗しない。
 
 ```sh
 mkdir -p tests/vectors
