@@ -117,6 +117,34 @@ impl<'a> BoolDecoder<'a> {
         x
     }
 
+    /// 木符号化されたシンタックス要素の復号処理（仕様 9.3.3 節 "Tree decoding process"）。
+    ///
+    /// `tree` は仕様の木配列そのもの（葉は非正の値 `-value`、内部ノードは次のインデックスを
+    /// 指す非負の値）。`prob_of(node)` はノード番号（`n >> 1`）から確率選択処理（仕様 9.3.2 節）
+    /// で得られる確率を返すクロージャで、呼び出し側が構築する。
+    ///
+    /// ```text
+    /// do {
+    ///     n = T[ n + read_bool( P( n >> 1 ) ) ]
+    /// } while ( n > 0 )
+    /// return -n
+    /// ```
+    pub fn read_tree<F>(&mut self, tree: &[i32], mut prob_of: F) -> i32
+    where
+        F: FnMut(usize) -> u8,
+    {
+        let mut n: i32 = 0;
+        loop {
+            let node = (n as usize) >> 1;
+            let bit = self.read_bool(prob_of(node)) as i32;
+            n = tree[(n + bit) as usize];
+            if n <= 0 {
+                break;
+            }
+        }
+        -n
+    }
+
     /// `exit_bool( )`（仕様 9.2.3 節）。残りのパディングビットを読み捨てて終了する。
     ///
     /// 仕様上パディングは 0 であることが要求されるが、本実装では非準拠ストリームでも
@@ -126,15 +154,15 @@ impl<'a> BoolDecoder<'a> {
     }
 }
 
+/// テスト専用の bool エンコーダ。`compressed_header`/`tile` モジュールの単体テストからも
+/// 再利用するため、`pub(crate)` な独立モジュールとして切り出している
+/// （ライブラリ本体の非テストコードには含めない。VP9 はデコーダのみを実装対象とするため）。
 #[cfg(test)]
-mod tests {
-    use super::*;
-
+pub(crate) mod test_support {
     /// テスト専用の bool エンコーダ。
     ///
-    /// [`BoolDecoder`] の逆演算を行う算術符号器で、ラウンドトリップテストのためだけに
-    /// このテストモジュール内に実装する（ライブラリ本体には含めない。VP9 はデコーダのみを
-    /// 実装対象とするため）。
+    /// [`super::BoolDecoder`] の逆演算を行う算術符号器で、ラウンドトリップテストのためだけに
+    /// 実装する。
     ///
     /// 実装方針: このコーダは「範囲 (BoolRange) は 255 を上限に、128 未満になるたびに
     /// 1 ビットずつ倍加して正規化する」という構造を持つため、エンコーダ側は
@@ -145,7 +173,7 @@ mod tests {
     /// 一括で出力する設計とし、内部状態 `low` を「桁数無制限の 2 進数」として保持することで
     /// キャリー伝搬を厳密な多倍長演算として扱う（近似や特殊なキャリー検出ロジックを
     /// 必要としない）。
-    struct BoolEncoder {
+    pub(crate) struct BoolEncoder {
         /// `low` の 2 進数表現。`bits[0]` が最上位ビット（最初に確定したビット）、
         /// `bits.last()` が最下位ビット（直近に正規化でシフトインされたビット）。
         /// 先頭 8 ビットは BoolValue が格納される 1 バイト目に対応するプレースホルダーとして
@@ -157,7 +185,7 @@ mod tests {
     }
 
     impl BoolEncoder {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let mut enc = Self {
                 low_bits: vec![0u8; 8], // BoolValue 用の 1 バイト目のプレースホルダー
                 range: 255,
@@ -183,7 +211,7 @@ mod tests {
             }
         }
 
-        fn write_bool(&mut self, bit: bool, p: u8) {
+        pub(crate) fn write_bool(&mut self, bit: bool, p: u8) {
             let split = 1 + (((self.range - 1) * p as u32) >> 8);
             if bit {
                 self.add_split(split);
@@ -197,7 +225,7 @@ mod tests {
             }
         }
 
-        fn write_literal(&mut self, value: u32, n: u32) {
+        pub(crate) fn write_literal(&mut self, value: u32, n: u32) {
             for i in (0..n).rev() {
                 let bit = (value >> i) & 1 == 1;
                 self.write_bool(bit, 128);
@@ -206,7 +234,7 @@ mod tests {
 
         /// エンコードを終了し、バイト列を返す（`exit_bool` に相当するバイト境界までの
         /// 0 パディングを行う）。
-        fn finish(mut self) -> Vec<u8> {
+        pub(crate) fn finish(mut self) -> Vec<u8> {
             while !self.low_bits.len().is_multiple_of(8) {
                 self.low_bits.push(0);
             }
@@ -216,6 +244,12 @@ mod tests {
                 .collect()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::BoolEncoder;
+    use super::*;
 
     /// テスト専用の単純な線形合同法（LCG）による疑似乱数生成器。
     struct Lcg {
@@ -343,6 +377,35 @@ mod tests {
         let mut dec = BoolDecoder::new(&buf).expect("valid bitstream");
         for (&b, &p) in bits.iter().zip(probs.iter()) {
             assert_eq!(dec.read_bool(p), b);
+        }
+    }
+
+    #[test]
+    fn read_tree_decodes_all_leaves() {
+        // PARTITION_TYPES 相当の 4 値木: [ -0, 2, -1, 4, -2, -3 ]
+        let tree: [i32; 6] = [0, 2, -1, 4, -2, -3];
+        let probs = [100u8, 150u8, 200u8];
+
+        // 値 0 -> bit列 [0]
+        // 値 1 -> bit列 [1, 0]
+        // 値 2 -> bit列 [1, 1, 0]
+        // 値 3 -> bit列 [1, 1, 1]
+        let mut enc = BoolEncoder::new();
+        enc.write_bool(false, probs[0]); // 0
+        enc.write_bool(true, probs[0]);
+        enc.write_bool(false, probs[1]); // 1
+        enc.write_bool(true, probs[0]);
+        enc.write_bool(true, probs[1]);
+        enc.write_bool(false, probs[2]); // 2
+        enc.write_bool(true, probs[0]);
+        enc.write_bool(true, probs[1]);
+        enc.write_bool(true, probs[2]); // 3
+        let buf = enc.finish();
+
+        let mut dec = BoolDecoder::new(&buf).expect("valid bitstream");
+        for expected in [0i32, 1, 2, 3] {
+            let got = dec.read_tree(&tree, |node| probs[node]);
+            assert_eq!(got, expected);
         }
     }
 
