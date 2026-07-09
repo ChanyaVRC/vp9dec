@@ -1,27 +1,34 @@
-//! タイル・スーパーブロック・モード情報の復号（仕様 6.4 節 "Decode tiles syntax"）。
+//! タイル・スーパーブロック・モード情報・係数（トークン）の復号
+//! （仕様 6.4 節 "Decode tiles syntax"）。
 //!
 //! M2 の対象はキーフレーム（`FrameIsIntra == 1`）のイントラ復号のみである。そのため
 //! `mode_info()` は `intra_frame_mode_info()` のみを実装し、`inter_frame_mode_info()` は
 //! 実装しない（M3 で追加する）。
 //!
-//! 係数（トークン）の復号（仕様 6.4.24〜6.4.26 節）は別タスクで実装するため、本ファイルでは
-//! [`read_residual`](TileDecoder::read_residual) をスタブとして置いている。仕様 6.4.21 節
-//! `residual()` は `skip == 1` の場合ビットストリームから何も読まない
-//! （`if ( !skip ) { nonzero = tokens( ... ) ... }`）ため、`skip == 1` のブロックは正しく
-//! 処理できる。`skip == 0` のブロックでトークン位置に到達した場合は
-//! [`TileError::ResidualNotImplemented`] を返す。
+//! [`TileDecoder::residual`] が仕様 6.4.21 節 `residual()` の実装であり、プレーンごとに
+//! イントラ予測（[`crate::predict::predict_intra`]）→ トークン復号
+//! （[`TileDecoder::tokens_and_reconstruct`]、仕様 6.4.24〜6.4.26 節）→ 逆量子化・逆変換・
+//! 再構成（仕様 8.6.2 節）を行い、結果を [`TileDecoder::planes`] のフレームバッファに書き込む。
+//! ループフィルタ（仕様 8.8 節）は M2b で実装予定のため未適用（ブロックノイズが残り得る）。
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
 use crate::compressed_header::{CompressedHeader, CompressedHeaderProbs};
+use crate::framebuffer::Plane;
 use crate::header::{self, NewFrameHeader};
+use crate::predict::predict_intra as predict_intra_block;
 use crate::prob_tables::{
-    BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID, B_HEIGHT_LOG2_LOOKUP, B_WIDTH_LOG2_LOOKUP, DC_PRED,
-    INTRA_MODE_TREE, KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, MAX_TXSIZE_LOOKUP,
-    MI_WIDTH_LOG2_LOOKUP, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
-    NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_HORZ, PARTITION_NONE,
-    PARTITION_SPLIT, PARTITION_TREE, PARTITION_VERT, SUBSIZE_LOOKUP, TX_16X16, TX_32X32, TX_4X4,
-    TX_MODE_SELECT, TX_MODE_TO_BIGGEST_TX_SIZE, TX_SIZE_16_TREE, TX_SIZE_32_TREE, TX_SIZE_8_TREE,
+    coefband_8x8plus, mode2txfm_map, pareto, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID,
+    B_HEIGHT_LOG2_LOOKUP, B_WIDTH_LOG2_LOOKUP, CAT_PROBS, COEFBAND_4X4, DCT_VAL_CATEGORY6, DC_PRED,
+    ENERGY_CLASS, EXTRA_BITS, INTRA_MODE_TREE, KF_PARTITION_PROBS, KF_UV_MODE_PROBS,
+    KF_Y_MODE_PROBS, MAX_TXSIZE_LOOKUP, MI_WIDTH_LOG2_LOOKUP, NUM_4X4_BLOCKS_HIGH_LOOKUP,
+    NUM_4X4_BLOCKS_WIDE_LOOKUP, NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP,
+    PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_TREE, PARTITION_VERT,
+    SS_SIZE_LOOKUP, SUBSIZE_LOOKUP, TX_16X16, TX_32X32, TX_4X4, TX_8X8, TX_MODE_SELECT,
+    TX_MODE_TO_BIGGEST_TX_SIZE, TX_SIZE_16_TREE, TX_SIZE_32_TREE, TX_SIZE_8_TREE, ZERO_TOKEN,
 };
+use crate::quant::{get_ac_quant, get_dc_quant};
+use crate::scan::{get_scan, TxSize};
+use crate::transform::{inverse_transform_block, TxType};
 
 /// タイル・パーティション復号時に発生し得るエラー。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,8 +43,6 @@ pub enum TileError {
     /// （`segmentation_update_map` 等）は `src/header.rs` がまだ保持していないため、
     /// 現時点ではキーフレームのセグメンテーションはサポート対象外。
     SegmentationNotSupported,
-    /// 係数（トークン）復号に到達した。トークン復号は別タスクで実装する。
-    ResidualNotImplemented,
 }
 
 /// 1 つの 8x8 mode info 単位が保持する情報（仕様 2.37 節 "Mode info"）。
@@ -141,14 +146,65 @@ pub struct TileDecoder {
     mi_col_end: u32,
     mi_row_start: u32,
     mi_row_end: u32,
+
+    // --- 係数復号・再構成に必要な追加状態（仕様 6.4.21〜6.4.26 節、8.5〜8.6 節）。---
+    bit_depth: u8,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    lossless: bool,
+    base_q_idx: u8,
+    delta_q_y_dc: i32,
+    delta_q_uv_dc: i32,
+    delta_q_uv_ac: i32,
+    /// `CurrFrame[ plane ]`。インデックス 0=Y, 1=U, 2=V。
+    planes: [Plane; 3],
+    /// `AboveNonzeroContext[ plane ]`。4x4 単位でフレーム幅全体を持続する
+    /// （フレーム毎に一度だけクリア）。
+    above_nonzero_context: [Vec<u8>; 3],
+    /// `LeftNonzeroContext[ plane ]`。スーパーブロック行ごとにクリアされ、常にそのスーパー
+    /// ブロック行内の相対位置（絶対 4x4 行番号 mod 16）でしかアクセスされないため、
+    /// 16 要素の配列として保持する（64 画素 / 4 = 16）。
+    left_nonzero_context: [[u8; 16]; 3],
 }
 
 impl TileDecoder {
     /// 非圧縮ヘッダと圧縮ヘッダから `TileDecoder` を構築する。
+    ///
+    /// # Panics
+    /// `header.color_config.bit_depth != 8` の場合にパニックする。8bit 以外
+    /// （10bit/12bit）のフレームバッファは [`Plane`] が `u8` 固定であるため表現できない。
+    /// 呼び出し側（[`crate::decode_keyframe`]）は `TileDecoder::new` を呼ぶ前に
+    /// `bit_depth` を検査すること。
     pub fn new(header: &NewFrameHeader, compressed: &CompressedHeader) -> Self {
+        assert_eq!(
+            header.color_config.bit_depth, 8,
+            "TileDecoder は 8bit フレームのみサポートする"
+        );
         let image_size = header::compute_image_size(header.width, header.height);
         let grid_cols = (image_size.sb64_cols * 8) as usize;
         let grid_rows = (image_size.sb64_rows * 8) as usize;
+        let subsampling_x = header.color_config.subsampling_x as u32;
+        let subsampling_y = header.color_config.subsampling_y as u32;
+
+        // フレームバッファはスーパーブロック境界（Sb64Cols*64 / Sb64Rows*64）まで
+        // 切り上げて確保する（src/framebuffer.rs のドキュメント参照）。
+        let y_w = (image_size.sb64_cols * 64) as usize;
+        let y_h = (image_size.sb64_rows * 64) as usize;
+        let uv_w = y_w >> subsampling_x;
+        let uv_h = y_h >> subsampling_y;
+        let planes = [
+            Plane::new(y_w, y_h),
+            Plane::new(uv_w, uv_h),
+            Plane::new(uv_w, uv_h),
+        ];
+        // AboveNonzeroContext は 4x4 単位（8x8 mi 単位の 2 倍）でフレーム幅全体を持続する。
+        let above_nz_len = grid_cols * 2;
+        let above_nonzero_context = [
+            vec![0u8; above_nz_len],
+            vec![0u8; above_nz_len],
+            vec![0u8; above_nz_len],
+        ];
+
         Self {
             tx_mode: compressed.tx_mode,
             probs: compressed.probs.clone(),
@@ -164,6 +220,17 @@ impl TileDecoder {
             mi_col_end: image_size.mi_cols,
             mi_row_start: 0,
             mi_row_end: image_size.mi_rows,
+            bit_depth: header.color_config.bit_depth,
+            subsampling_x,
+            subsampling_y,
+            lossless: header.quantization.lossless,
+            base_q_idx: header.quantization.base_q_idx,
+            delta_q_y_dc: header.quantization.delta_q_y_dc,
+            delta_q_uv_dc: header.quantization.delta_q_uv_dc,
+            delta_q_uv_ac: header.quantization.delta_q_uv_ac,
+            planes,
+            above_nonzero_context,
+            left_nonzero_context: [[0u8; 16]; 3],
         }
     }
 
@@ -171,12 +238,24 @@ impl TileDecoder {
         &self.mi_grid
     }
 
+    /// デコード済みのプレーンバッファ（`CurrFrame`）への参照を返す。
+    /// インデックス 0=Y, 1=U, 2=V。バッファはスーパーブロック境界まで切り上げたサイズを
+    /// 持つため、呼び出し側で表示サイズにクロップする必要がある
+    /// （[`crate::decode_keyframe`] が行う）。
+    pub fn planes(&self) -> &[Plane; 3] {
+        &self.planes
+    }
+
     fn clear_above_context(&mut self) {
         self.above_partition_context.iter_mut().for_each(|v| *v = 0);
+        for plane_ctx in self.above_nonzero_context.iter_mut() {
+            plane_ctx.iter_mut().for_each(|v| *v = 0);
+        }
     }
 
     fn clear_left_context(&mut self) {
         self.left_partition_context = [0u8; 8];
+        self.left_nonzero_context = [[0u8; 16]; 3];
     }
 
     /// `decode_tiles( sz )`（仕様 6.4 節）。`data` は非圧縮ヘッダ直後、
@@ -352,7 +431,7 @@ impl TileDecoder {
         let avail_l = col > self.mi_col_start;
 
         let info = self.intra_frame_mode_info(r, row, col, subsize, avail_u, avail_l)?;
-        self.read_residual(info.skip)?;
+        self.residual(r, row, col, &info, avail_u, avail_l);
 
         let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize] as u32;
         let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[subsize as usize] as u32;
@@ -364,19 +443,326 @@ impl TileDecoder {
         Ok(())
     }
 
-    /// `residual( )`（仕様 6.4.21 節）のスタブ。
-    ///
-    /// `skip == 1` の場合、仕様上ビットストリームからは何も読まれない
-    /// （`AboveNonzeroContext`/`LeftNonzeroContext` を 0 に更新するのみ。これらは
-    /// トークン復号のコンテキスト計算にのみ使うため、トークン復号自体を実装する次タスクで
-    /// 併せて追加する）。`skip == 0` の場合はトークン復号 (`tokens()`) が必要になるため、
-    /// 未実装であることを示すエラーを返す。
-    fn read_residual(&mut self, skip: bool) -> Result<(), TileError> {
-        if skip {
-            Ok(())
-        } else {
-            Err(TileError::ResidualNotImplemented)
+    /// `get_uv_tx_size( )`（仕様 6.4.22 節）。
+    fn get_uv_tx_size(&self, mi_size: u8, tx_size: u8) -> u8 {
+        if mi_size < BLOCK_8X8 {
+            return TX_4X4;
         }
+        let plane_sz = self.get_plane_block_size(mi_size, 1);
+        tx_size.min(MAX_TXSIZE_LOOKUP[plane_sz as usize])
+    }
+
+    /// `get_plane_block_size( subsize, plane )`（仕様 6.4.23 節）。
+    fn get_plane_block_size(&self, subsize: u8, plane: usize) -> u8 {
+        let subx = if plane > 0 { self.subsampling_x } else { 0 } as usize;
+        let suby = if plane > 0 { self.subsampling_y } else { 0 } as usize;
+        SS_SIZE_LOOKUP[subsize as usize][subx][suby]
+    }
+
+    /// `residual( )`（仕様 6.4.21 節）。`is_inter` は常に偽（M2 はキーフレームのみ対象）。
+    fn residual(
+        &mut self,
+        r: &mut BoolDecoder,
+        row: u32,
+        col: u32,
+        info: &MiInfo,
+        avail_u: bool,
+        avail_l: bool,
+    ) {
+        let bsize = if info.mi_size < BLOCK_8X8 {
+            BLOCK_8X8
+        } else {
+            info.mi_size
+        };
+
+        for plane in 0..3usize {
+            let tx_sz = if plane > 0 {
+                self.get_uv_tx_size(info.mi_size, info.tx_size)
+            } else {
+                info.tx_size
+            };
+            let step = 1u32 << tx_sz;
+            let plane_sz = self.get_plane_block_size(bsize, plane);
+            let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[plane_sz as usize] as u32;
+            let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[plane_sz as usize] as u32;
+            let sub_x = if plane > 0 { self.subsampling_x } else { 0 };
+            let sub_y = if plane > 0 { self.subsampling_y } else { 0 };
+            let base_x = (col * 8) >> sub_x;
+            let base_y = (row * 8) >> sub_y;
+            let maxx = (self.mi_cols * 8) >> sub_x;
+            let maxy = (self.mi_rows * 8) >> sub_y;
+            // predict_intra に渡す maxX/maxY（仕様 8.5.1 節）はプレーン全体の座標での
+            // クリップ境界であり、maxx/maxy(上記, residual のブロック内クリップ用) とは
+            // 意味が異なる点に注意。
+            let pred_max_x = ((self.mi_cols * 8) >> sub_x).saturating_sub(1) as usize;
+            let pred_max_y = ((self.mi_rows * 8) >> sub_y).saturating_sub(1) as usize;
+
+            let mut block_idx = 0u32;
+            let mut y = 0u32;
+            while y < num4x4h {
+                let mut x = 0u32;
+                while x < num4x4w {
+                    let start_x = base_x + 4 * x;
+                    let start_y = base_y + 4 * y;
+                    let mut nonzero = false;
+
+                    if start_x < maxx && start_y < maxy {
+                        let mode = if plane > 0 {
+                            info.uv_mode
+                        } else if info.mi_size >= BLOCK_8X8 {
+                            info.y_mode
+                        } else {
+                            info.sub_modes[block_idx as usize]
+                        };
+                        let have_left = avail_l || x > 0;
+                        let have_above = avail_u || y > 0;
+                        let not_on_right = x + step < num4x4w;
+                        predict_intra_block(
+                            &mut self.planes[plane],
+                            start_x as usize,
+                            start_y as usize,
+                            have_left,
+                            have_above,
+                            not_on_right,
+                            tx_sz,
+                            mode,
+                            pred_max_x,
+                            pred_max_y,
+                            self.bit_depth,
+                        );
+
+                        if !info.skip {
+                            let tx_type = self.compute_tx_type(
+                                plane,
+                                tx_sz,
+                                info.mi_size,
+                                info.y_mode,
+                                &info.sub_modes,
+                                block_idx as usize,
+                            );
+                            nonzero = self.tokens_and_reconstruct(
+                                r,
+                                plane,
+                                start_x as usize,
+                                start_y as usize,
+                                tx_sz,
+                                tx_type,
+                            );
+                        }
+                    }
+
+                    for i in 0..step {
+                        self.above_nonzero_context[plane][((start_x >> 2) + i) as usize] =
+                            nonzero as u8;
+                        let left_idx = (((start_y >> 2) + i) % 16) as usize;
+                        self.left_nonzero_context[plane][left_idx] = nonzero as u8;
+                    }
+                    block_idx += 1;
+                    x += step;
+                }
+                y += step;
+            }
+        }
+    }
+
+    /// `get_scan( )`（仕様 6.4.25 節）のうち `TxType` を決定する部分。
+    fn compute_tx_type(
+        &self,
+        plane: usize,
+        tx_sz: u8,
+        mi_size: u8,
+        y_mode: u8,
+        sub_modes: &[u8; 4],
+        block_idx: usize,
+    ) -> TxType {
+        if plane > 0 || tx_sz == TX_32X32 {
+            TxType::DctDct
+        } else if tx_sz == TX_4X4 {
+            if self.lossless {
+                // is_inter は M2 では常に false なので Lossless のみで判定する。
+                TxType::DctDct
+            } else {
+                let mode = if mi_size < BLOCK_8X8 {
+                    sub_modes[block_idx]
+                } else {
+                    y_mode
+                };
+                mode2txfm_map(mode)
+            }
+        } else {
+            mode2txfm_map(y_mode)
+        }
+    }
+
+    fn tx_sz_to_scan_size(tx_sz: u8) -> TxSize {
+        match tx_sz {
+            TX_4X4 => TxSize::Tx4x4,
+            TX_8X8 => TxSize::Tx8x8,
+            TX_16X16 => TxSize::Tx16x16,
+            _ => TxSize::Tx32x32,
+        }
+    }
+
+    /// `tokens( )`（仕様 6.4.24 節）+ `reconstruct( )`（仕様 8.6.2 節）。
+    /// 戻り値は `nonzero`（仕様 6.4.24 節の `nonzero = c > 0`）。
+    fn tokens_and_reconstruct(
+        &mut self,
+        r: &mut BoolDecoder,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: u8,
+        tx_type: TxType,
+    ) -> bool {
+        let n = (tx_sz as u32) + 2;
+        let n0 = 1usize << n;
+        let seg_eob = n0 * n0;
+        let scan = get_scan(Self::tx_sz_to_scan_size(tx_sz), tx_type);
+
+        let plane_type = if plane > 0 { 1usize } else { 0usize };
+        let sub_x = if plane > 0 { self.subsampling_x } else { 0 };
+        let sub_y = if plane > 0 { self.subsampling_y } else { 0 };
+        let max_x_ctx = (2 * self.mi_cols) >> sub_x;
+        let max_y_ctx = (2 * self.mi_rows) >> sub_y;
+        let numpts = 1u32 << tx_sz;
+        let x4 = (start_x >> 2) as u32;
+        let y4 = (start_y >> 2) as u32;
+
+        let mut tokens = vec![0i32; seg_eob];
+        let mut token_cache = [0u8; 1024];
+        let mut check_eob = true;
+        let mut c = 0usize;
+
+        while c < seg_eob {
+            let pos = scan[c] as usize;
+            let band = if tx_sz == TX_4X4 {
+                COEFBAND_4X4[c] as usize
+            } else {
+                coefband_8x8plus(c) as usize
+            };
+
+            // ctx の導出（仕様 9.3.2 節、more_coefs/token 共通）。
+            let ctx = if c == 0 {
+                let mut above = 0u32;
+                let mut left = 0u32;
+                for i in 0..numpts {
+                    if x4 + i < max_x_ctx {
+                        above |= self.above_nonzero_context[plane][(x4 + i) as usize] as u32;
+                    }
+                    if y4 + i < max_y_ctx {
+                        left |= self.left_nonzero_context[plane][((y4 + i) % 16) as usize] as u32;
+                    }
+                }
+                (above + left) as usize
+            } else {
+                let nn = 4usize << tx_sz;
+                let i = pos / nn;
+                let j = pos % nn;
+                let (nb0, nb1) = if i > 0 && j > 0 {
+                    let a = (i - 1) * nn + j;
+                    let a2 = i * nn + j - 1;
+                    match tx_type {
+                        TxType::DctAdst => (a, a),
+                        TxType::AdstDct => (a2, a2),
+                        _ => (a, a2),
+                    }
+                } else if i > 0 {
+                    let a = (i - 1) * nn + j;
+                    (a, a)
+                } else {
+                    let a = i * nn + j - 1;
+                    (a, a)
+                };
+                ((1 + token_cache[nb0] as u32 + token_cache[nb1] as u32) >> 1) as usize
+            };
+
+            let probs = &self.probs.coef_probs[tx_sz as usize][plane_type][0][band][ctx];
+
+            if check_eob {
+                let more_coefs = r.read_bool(probs[0]);
+                if !more_coefs {
+                    break;
+                }
+            }
+
+            let token = r.read_tree(&crate::prob_tables::TOKEN_TREE, |node| {
+                if node == 0 {
+                    probs[1]
+                } else if node == 1 {
+                    probs[2]
+                } else {
+                    pareto(node, probs[2])
+                }
+            }) as u8;
+            token_cache[pos] = ENERGY_CLASS[token as usize];
+
+            if token == ZERO_TOKEN {
+                tokens[pos] = 0;
+                check_eob = false;
+            } else {
+                let coef = self.read_coef(r, token);
+                let sign = r.read_literal(1) == 1;
+                tokens[pos] = if sign { -coef } else { coef };
+                check_eob = true;
+            }
+
+            c += 1;
+        }
+
+        let nonzero = c > 0;
+
+        // 逆量子化 + 逆変換 + 再構成（仕様 8.6.2 節）。
+        let dq_denom: i64 = if tx_sz == TX_32X32 { 2 } else { 1 };
+        let qindex = self.base_q_idx;
+        let ac_quant = get_ac_quant(self.bit_depth, qindex, plane, self.delta_q_uv_ac) as i64;
+        let dc_quant = get_dc_quant(
+            self.bit_depth,
+            qindex,
+            plane,
+            self.delta_q_y_dc,
+            self.delta_q_uv_dc,
+        ) as i64;
+        let mut dequant = vec![0i64; n0 * n0];
+        for (idx, &t) in tokens.iter().enumerate() {
+            dequant[idx] = (t as i64 * ac_quant) / dq_denom;
+        }
+        dequant[0] = (tokens[0] as i64 * dc_quant) / dq_denom;
+        inverse_transform_block(&mut dequant, n, tx_type, self.lossless);
+
+        let max_val = (1i64 << self.bit_depth) - 1;
+        for i in 0..n0 {
+            for j in 0..n0 {
+                let old = self.planes[plane].get(start_x + j, start_y + i) as i64;
+                let new_val = (old + dequant[i * n0 + j]).clamp(0, max_val);
+                self.planes[plane].set(start_x + j, start_y + i, new_val as u8);
+            }
+        }
+
+        nonzero
+    }
+
+    /// `read_coef( token )`（仕様 6.4.26 節）。
+    fn read_coef(&self, r: &mut BoolDecoder, token: u8) -> i32 {
+        let row = &EXTRA_BITS[token as usize];
+        let cat = row[0] as usize;
+        let num_extra = row[1] as u32;
+        let mut coef = row[2] as i32;
+
+        if token == DCT_VAL_CATEGORY6 {
+            // BitDepth == 8 の場合、このループは 0 回実行される
+            // （`for e in 0..(BitDepth-8)`）。10bit/12bit は M2 の対象外。
+            for e in 0..(self.bit_depth.saturating_sub(8) as u32) {
+                let high_bit = r.read_bool(255) as i32;
+                coef += high_bit << (5 + self.bit_depth as u32 - e);
+            }
+        }
+
+        for e in 0..num_extra {
+            let coef_bit = r.read_bool(CAT_PROBS[cat][e as usize]) as i32;
+            coef += coef_bit << (num_extra - 1 - e);
+        }
+
+        coef
     }
 
     /// `intra_segment_id( )`（仕様 6.4.7 節）。
@@ -664,7 +1050,11 @@ mod tests {
     }
 
     #[test]
-    fn non_skip_block_returns_residual_not_implemented() {
+    fn non_skip_block_with_all_zero_tokens_decodes_successfully() {
+        // 8x8 (1 MI) の非 skip ブロック。lossless なので tx_size は常に TX_4X4 で、
+        // Y プレーンは 2x2=4 個、U/V プレーンは 1 個ずつの 4x4 変換ブロックを持つ。
+        // 各ブロックで最初の more_coefs を false にする（係数なし）ことで、
+        // トークン復号・逆量子化・逆変換・再構成の一連の処理を最小構成で検証する。
         let header = minimal_header(8, 8);
         let compressed = default_compressed_header();
         let mut decoder = TileDecoder::new(&header, &compressed);
@@ -677,10 +1067,26 @@ mod tests {
             KF_Y_MODE_PROBS[DC_PRED as usize][DC_PRED as usize][0],
         ); // DC_PRED
         enc.write_bool(false, KF_UV_MODE_PROBS[DC_PRED as usize][0]); // DC_PRED
+
+        // DEFAULT_COEF_PROBS[TX_4X4][plane>0][is_inter=0][band=0][ctx=0][0]
+        let y_more_coefs_prob = CompressedHeaderProbs::default().coef_probs[0][0][0][0][0][0];
+        let uv_more_coefs_prob = CompressedHeaderProbs::default().coef_probs[0][1][0][0][0][0];
+        for _ in 0..4 {
+            enc.write_bool(false, y_more_coefs_prob); // Y の 4 個の 4x4 ブロック: more_coefs=0
+        }
+        enc.write_bool(false, uv_more_coefs_prob); // U
+        enc.write_bool(false, uv_more_coefs_prob); // V
         let buf = enc.finish();
 
-        let err = decoder.decode_tiles(&buf).unwrap_err();
-        assert_eq!(err, TileError::ResidualNotImplemented);
+        decoder
+            .decode_tiles(&buf)
+            .expect("all-zero residual block should decode without error");
+
+        let info = decoder.mi_grid().get(0, 0);
+        assert!(!info.skip);
+        // 全係数ゼロなので、再構成後のピクセル値は予測値（DC_PRED, 参照不可なので
+        // bit_depth の中間値 128）のままのはず。
+        assert_eq!(decoder.planes()[0].get(0, 0), 128);
     }
 
     #[test]
