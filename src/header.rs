@@ -303,15 +303,32 @@ fn parse_interpolation_filter(r: &mut BitReader) -> u8 {
     }
 }
 
+/// `setup_past_independence()` によるループフィルタデルタの初期値（仕様 7.2 節）。
+pub const DEFAULT_LOOP_FILTER_REF_DELTAS: [i8; 4] = [1, 0, -1, -1];
+pub const DEFAULT_LOOP_FILTER_MODE_DELTAS: [i8; 2] = [0, 0];
+
 /// `loop_filter_params()`（仕様 6.2.8 節）。
-fn parse_loop_filter_params(r: &mut BitReader) -> LoopFilterParams {
+///
+/// `ref_deltas`/`mode_deltas` は仕様上フレーム間で持続する状態（`setup_past_independence()`
+/// が呼ばれた場合のみデフォルト値にリセットされる）。呼び出し側（[`parse_uncompressed_header`]）
+/// が `reset` フラグ（`FrameIsIntra || error_resilient_mode`）と直前フレームの値を渡す。
+fn parse_loop_filter_params(
+    r: &mut BitReader,
+    reset: bool,
+    prev_deltas: ([i8; 4], [i8; 2]),
+) -> LoopFilterParams {
     let level = r.f(6) as u8;
     let sharpness = r.f(3) as u8;
     let delta_enabled = r.flag();
 
-    // setup_past_independence() によるキーフレームでの初期値（仕様 7.2 節）。
-    let mut ref_deltas: [i8; 4] = [1, 0, -1, -1];
-    let mut mode_deltas: [i8; 2] = [0, 0];
+    let (mut ref_deltas, mut mode_deltas) = if reset {
+        (
+            DEFAULT_LOOP_FILTER_REF_DELTAS,
+            DEFAULT_LOOP_FILTER_MODE_DELTAS,
+        )
+    } else {
+        prev_deltas
+    };
 
     if delta_enabled {
         let delta_update = r.flag();
@@ -440,6 +457,7 @@ fn parse_tile_info(r: &mut BitReader, sb64_cols: u32) -> (u32, u32) {
 pub fn parse_uncompressed_header(
     data: &[u8],
     ref_frame_sizes: &[(u32, u32); NUM_REF_FRAMES],
+    prev_loop_filter_deltas: ([i8; 4], [i8; 2]),
 ) -> Result<(FrameHeader, usize), HeaderError> {
     let mut r = BitReader::new(data);
 
@@ -576,7 +594,10 @@ pub fn parse_uncompressed_header(
         frame_context_idx_raw
     };
 
-    let loop_filter = parse_loop_filter_params(&mut r);
+    // setup_past_independence(): FrameIsIntra || error_resilient_mode でループフィルタ
+    // デルタもデフォルト値にリセットされる（frame_context のリセット条件と同じ）。
+    let lf_reset = frame_is_intra || error_resilient_mode;
+    let loop_filter = parse_loop_filter_params(&mut r, lf_reset, prev_loop_filter_deltas);
     let quantization = parse_quantization_params(&mut r);
     let segmentation_enabled = parse_segmentation_params(&mut r);
 
@@ -725,12 +746,16 @@ mod tests {
 
     /// テストで参照フレームサイズが不要な場合に使うダミー値。
     const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
+    const NO_LF_DELTAS: ([i8; 4], [i8; 2]) = (
+        DEFAULT_LOOP_FILTER_REF_DELTAS,
+        DEFAULT_LOOP_FILTER_MODE_DELTAS,
+    );
 
     #[test]
     fn parses_minimal_keyframe_header() {
         let data = build_minimal_keyframe_header();
         let (header, _consumed) =
-            parse_uncompressed_header(&data, &NO_REF_SIZES).expect("should parse");
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert_eq!(f.profile, 0);
@@ -764,7 +789,7 @@ mod tests {
         w.push_bits(0, 30);
         let data = w.finish();
         assert_eq!(
-            parse_uncompressed_header(&data, &NO_REF_SIZES),
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS),
             Err(HeaderError::InvalidFrameMarker)
         );
     }
@@ -784,7 +809,7 @@ mod tests {
         w.push_bits(0x00, 8);
         let data = w.finish();
         assert_eq!(
-            parse_uncompressed_header(&data, &NO_REF_SIZES),
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS),
             Err(HeaderError::InvalidSyncCode)
         );
     }
@@ -847,7 +872,7 @@ mod tests {
         let mut ref_sizes = NO_REF_SIZES;
         ref_sizes[0] = (8, 8);
         let (header, _consumed) =
-            parse_uncompressed_header(&data, &ref_sizes).expect("should parse");
+            parse_uncompressed_header(&data, &ref_sizes, NO_LF_DELTAS).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert_eq!(f.frame_type, FrameType::NonKeyFrame);
@@ -880,7 +905,7 @@ mod tests {
         let data = w.finish();
 
         let (header, consumed) =
-            parse_uncompressed_header(&data, &NO_REF_SIZES).expect("should parse");
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS).expect("should parse");
         assert_eq!(
             header,
             FrameHeader::ShowExistingFrame {
@@ -938,7 +963,8 @@ mod tests {
         w.push_bits(42, 16); // header_size_in_bytes
 
         let data = w.finish();
-        let (header, _) = parse_uncompressed_header(&data, &NO_REF_SIZES).expect("should parse");
+        let (header, _) =
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert!(f.error_resilient_mode);

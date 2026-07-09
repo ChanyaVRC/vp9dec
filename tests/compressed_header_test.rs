@@ -22,6 +22,7 @@ use vp9dec::ivf::IvfReader;
 use vp9dec::tile::TileDecoder;
 
 const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
+const NO_LF_DELTAS: ([i8; 4], [i8; 2]) = ([1, 0, -1, -1], [0, 0]);
 
 fn check_vector(relative_path: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -49,13 +50,15 @@ fn check_vector(relative_path: &str) {
         .unwrap_or_else(|| panic!("{} contains no frames", path.display()))
         .unwrap_or_else(|e| panic!("failed to read first frame of {}: {e:?}", path.display()));
 
-    let (parsed, consumed) = parse_uncompressed_header(first_frame.data, &NO_REF_SIZES)
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to parse uncompressed header of first frame in {}: {e:?}",
-                path.display()
-            )
-        });
+    let (parsed, consumed) =
+        parse_uncompressed_header(first_frame.data, &NO_REF_SIZES, NO_LF_DELTAS).unwrap_or_else(
+            |e| {
+                panic!(
+                    "failed to parse uncompressed header of first frame in {}: {e:?}",
+                    path.display()
+                )
+            },
+        );
 
     let header = match parsed {
         FrameHeader::New(h) => h,
