@@ -19,4 +19,5 @@ pub mod ivf;
 pub mod prob_tables;
 pub mod quant;
 pub mod scan;
+pub mod tile;
 pub mod transform;
