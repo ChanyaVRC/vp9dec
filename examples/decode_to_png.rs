@@ -1,5 +1,5 @@
-//! `tests/vectors/` にある各 `.ivf` の第 1 フレーム（キーフレーム）をデコードし、
-//! BT.601 で YUV -> RGB 変換したうえで PNG として `target/dump/<ベクタ名>.png` に書き出す。
+//! `tests/vectors/` にある `.ivf` をデコードし、BT.601 で YUV -> RGB 変換したうえで PNG として
+//! `target/dump/` に書き出す（目視検収用）。
 //!
 //! 依存クレートを一切使わない方針（`Cargo.toml` に dependencies を追加しない）に合わせ、
 //! PNG エンコードも自前で実装する。zlib の圧縮アルゴリズム（deflate の LZ77 + Huffman）は
@@ -9,14 +9,20 @@
 //!
 //! 実行方法:
 //! ```sh
+//! # 引数なし: 両ベクタの第 1 フレーム（キーフレーム）を target/dump/<stem>.png に出力する。
 //! cargo run --example decode_to_png
+//!
+//! # 引数あり: 指定ベクタの指定 IVF フレーム番号（0 始まり、デコード順）以降で最初に表示される
+//! # フレームを target/dump/<stem>_frame<N>.png に出力する（動き補償ありの中間フレームの
+//! # 目視検収用。M3 後半で追加）。
+//! cargo run --example decode_to_png -- vp90-2-12-droppable_1 50
 //! ```
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use vp9dec::ivf::IvfReader;
-use vp9dec::{decode_keyframe, Frame};
+use vp9dec::{decode_keyframe, Decoder, Frame};
 
 fn main() {
     let vectors_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -25,10 +31,24 @@ fn main() {
     let out_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("dump");
+    fs::create_dir_all(&out_dir).expect("failed to create target/dump");
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(stem) = args.first() {
+        let target_index: usize = args
+            .get(1)
+            .map(|s| s.parse().expect("フレーム番号は非負整数で指定すること"))
+            .unwrap_or(0);
+        let path = vectors_dir.join(format!("{stem}.ivf"));
+        if !path.exists() {
+            eprintln!("[error] テストベクタが見つかりません: {}", path.display());
+            std::process::exit(1);
+        }
+        dump_frame_at(&path, &out_dir, target_index);
+        return;
+    }
 
     let vectors = ["vp90-2-12-droppable_1.ivf", "vp90-2-09-subpixel-00.ivf"];
-
-    fs::create_dir_all(&out_dir).expect("failed to create target/dump");
 
     let mut any_done = false;
     for name in vectors {
@@ -41,7 +61,7 @@ fn main() {
             continue;
         }
         any_done = true;
-        decode_one(&path, &out_dir);
+        decode_first_frame(&path, &out_dir);
     }
 
     if !any_done {
@@ -50,7 +70,7 @@ fn main() {
     }
 }
 
-fn decode_one(path: &Path, out_dir: &Path) {
+fn decode_first_frame(path: &Path, out_dir: &Path) {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     let mut reader = IvfReader::new(&bytes)
         .unwrap_or_else(|e| panic!("failed to parse IVF {}: {e:?}", path.display()));
@@ -62,22 +82,72 @@ fn decode_one(path: &Path, out_dir: &Path) {
     let frame = decode_keyframe(first_frame.data)
         .unwrap_or_else(|e| panic!("decode_keyframe failed for {}: {e:?}", path.display()));
 
-    let rgb = yuv_to_rgb_bt601(&frame);
-
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let out_path: PathBuf = out_dir.join(format!("{stem}.png"));
-    let png_bytes = encode_png(frame.width, frame.height, &rgb);
-    fs::write(&out_path, &png_bytes)
-        .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));
+    write_png(&frame, &out_path);
+
+    eprintln!("[ok] {} -> {}", path.display(), out_path.display());
+}
+
+/// `target_index`（IVF フレーム番号、0 始まり、デコード順）以降で最初に表示される
+/// （`show_frame == 1` または `show_existing_frame` で表示される）フレームを 1 枚出力する。
+/// `Decoder::decode_frame` はフレーム間状態を要求するため、0 番目から順番にすべて
+/// デコードする必要がある（`target_index` だけを単独でデコードすることはできない）。
+fn dump_frame_at(path: &Path, out_dir: &Path, target_index: usize) {
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let reader = IvfReader::new(&bytes)
+        .unwrap_or_else(|e| panic!("failed to parse IVF {}: {e:?}", path.display()));
+
+    let mut decoder = Decoder::new();
+    let mut result: Option<(usize, Frame)> = None;
+    for (i, frame) in reader.enumerate() {
+        let frame = frame.unwrap_or_else(|e| {
+            panic!("failed to read IVF frame {i} of {}: {e:?}", path.display())
+        });
+        let outcome = decoder.decode_frame(frame.data).unwrap_or_else(|e| {
+            panic!(
+                "IVF frame {i} of {} failed to decode: {e:?}",
+                path.display()
+            )
+        });
+        if i >= target_index {
+            if let Some(decoded) = outcome {
+                result = Some((i, decoded));
+                break;
+            }
+        }
+    }
+
+    let (actual_index, frame) = result.unwrap_or_else(|| {
+        panic!(
+            "{}: フレーム {target_index} 以降に表示可能なフレームが見つからなかった",
+            path.display()
+        )
+    });
+    if actual_index != target_index {
+        eprintln!(
+            "[note] {}: フレーム {target_index} は非表示（show_frame==0）だったため、\
+             次に表示されるフレーム {actual_index} を出力する。",
+            path.display()
+        );
+    }
+
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let out_path: PathBuf = out_dir.join(format!("{stem}_frame{actual_index}.png"));
+    write_png(&frame, &out_path);
 
     eprintln!(
-        "[ok] {} -> {} ({}x{}, {} bytes)",
+        "[ok] {} (frame {actual_index}) -> {}",
         path.display(),
-        out_path.display(),
-        frame.width,
-        frame.height,
-        png_bytes.len()
+        out_path.display()
     );
+}
+
+fn write_png(frame: &Frame, out_path: &Path) {
+    let rgb = yuv_to_rgb_bt601(frame);
+    let png_bytes = encode_png(frame.width, frame.height, &rgb);
+    fs::write(out_path, &png_bytes)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));
 }
 
 /// BT.601（limited range, `Y' = 1.164*(Y-16)` 系）で YUV420 を RGB へ変換する。

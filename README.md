@@ -21,13 +21,16 @@ https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-
 | M2 | イントラ予測によるキーフレームのデコード（圧縮ヘッダ・タイル・トークン復号・変換・量子化・再構成） | 完了（ループフィルタを除く） |
 | M2b | ループフィルタ（デブロッキングフィルタ、仕様 8.8 節）＋公式コンフォーマンス検証 | 完了 |
 | M3 前半 | インターフレームのビットストリーム復号（ヘッダ・確率テーブル・モード情報・MV・残差トークン。動き補償の手前まで） | 完了 |
-| M3 後半 | 動き補償・サブピクセル補間・参照フレーム管理・確率適応（forward/backward）・全フレーム MD5 コンフォーマンス | 未着手 |
-| M4 | VP9 コンフォーマンステストベクタの完全通過 | 未着手 |
+| M3 後半 | 動き補償・サブピクセル補間・参照フレーム管理・確率適応（forward/backward）・全フレーム MD5 コンフォーマンス | **完了** |
+| M4 | VP9 コンフォーマンステストベクタの完全通過（手元 2 本以外の公式ベクタへの拡大） | 未着手 |
 
 `decode_keyframe()`（`src/lib.rs`）で実際にキーフレームを最後までデコードし、ループフィルタ
-適用済み・表示サイズにクロップ済みの YUV420 `Frame` を得られる。手元の 2 本のテストベクタでは、
-最初のキーフレームのデコード結果（Y→U→V 連結の I420 バイト列）の MD5 が libvpx 公式配布の
-`.ivf.md5` と完全一致することを確認済み（`tests/conformance_test.rs`、詳細は後述）。
+適用済み・表示サイズにクロップ済みの YUV420 `Frame` を得られる。複数フレーム（インター
+フレームを含む）を順にデコードする場合は `Decoder::decode_frame()` を使う（後述の「M3 後半」
+節参照）。手元の 2 本のテストベクタでは、**すべての表示フレーム**のデコード結果（Y→U→V
+連結の I420 バイト列）の MD5 が libvpx 公式配布の `.ivf.md5` と完全一致することを確認済み
+（`tests/conformance_test.rs`、詳細は後述。`vp90-2-12-droppable_1`: 99/99 フレーム一致、
+`vp90-2-09-subpixel-00`: 20/20 フレーム一致）。
 
 ## M1 で実装したもの
 
@@ -179,50 +182,119 @@ https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-
   既存の `decode_keyframe()`（第 1 引数がキーフレームであることを検証したうえで、使い捨ての
   `Decoder` を介して `decode_frame()` を呼ぶ）はそのまま維持しており、後方互換。
 
-### 既知の制約（M3 後半への引き継ぎ）
+M3 前半時点での既知の制約（動き補償未実装・確率適応未実装・ループフィルタデルタ未引き継ぎ等）は
+すべて次節「M3 後半」で解消した。
 
-- **動き補償・サブピクセル補間フィルタ（仕様 8.5.2 節）は未実装**。`predict_inter_stub()` は
-  何もしないため、`Decoder::decode_frame()`/`DecodeOutcome::Decoded` が返すインター
-  フレームのピクセル値は不正（`is_inter` ブロックは予測されず、残差のみが加算された値になる）。
-  参照フレームの実ピクセルデータ（DPB 相当）も保持していない（動き補償が無いため不要だった）。
-- **確率適応（仕様 8.4 節）は未実装**。`adapt_coef_probs`/`adapt_noncoef_probs`（出現頻度に
-  基づく backward adaptation）を実装しておらず、`counts_*` 系のカウンタも収集していない。
-  `FrameContextStore` は `compressed_header()` の forward update（`diff_update_prob`）適用後の
-  値をそのまま保存する。これは `frame_parallel_decoding_mode == 1`（adaptation 無効）の
-  フレームでは仕様どおり正確だが、`== 0` のフレームでは次フレーム以降の確率値が仕様上の
-  期待値からずれ得る（**ずれても bit 単位の同期は保たれる**: `diff_update_prob` 自身は
-  固定確率 `B(252)`/`L(n)` で読むため、開始確率の値がどうであれ `compressed_header()` の
-  消費バイト数は変わらない。ただし `decode_tiles()` 側の `read_bool` はそのフレームの
-  確率テーブル値に直接依存するため、そのフレーム以降の読み取り結果自体は確率適応の有無で
-  変わり得る。手元の 2 テストベクタは全フレーム読了を確認済みなので、少なくともこれらの
-  ベクタでは実害が出るほどの分岐（ズレによる別確率選択）は発生していない）。
-- **ループフィルタのフレーム間デルタ引き継ぎ未実装**: `loop_filter_ref_deltas`/
-  `loop_filter_mode_deltas` は仕様上フレーム間で持続する状態（`setup_past_independence()`
-  時のみリセット）だが、本実装は毎フレーム `parse_loop_filter_params()` 内でデフォルト値
-  から起動する。ループフィルタの出力画素にのみ影響し、ビットストリーム読了には影響しない。
-- **セグメンテーション未対応は継続**（M1 からの既知の制約）。`inter_frame_mode_info` も
-  `segmentation_enabled == true` の場合は `TileError::SegmentationNotSupported` を返す。
-- `reset_frame_context == 2`（該当フレームコンテキストのみリセット）は未実装で、
-  `FrameIsIntra || error_resilient_mode` の場合は常に全 4 スロットをリセットする簡略化を
-  行っている（`frame_context_idx` はこの場合いずれも 0 に固定されるため、ビットストリーム
-  読み取りには影響しない）。
-- `show_existing_frame` フレームは `DecodeOutcome::ShowExisting` を返すのみで、実際に
-  該当フレームを表示（過去にデコードしたピクセルを返す）する仕組みは未実装（DPB 非搭載のため）。
+## M3 後半（動き補償・確率適応・参照フレーム管理・全フレーム MD5 コンフォーマンス）
 
-### M3 後半でやること
+M3 前半の引き継ぎ事項をすべて実装し、**両テストベクタで全表示フレームの公式 MD5 完全一致**
+（`vp90-2-12-droppable_1`: 99/99、`vp90-2-09-subpixel-00`: 20/20）を達成した。以下を実装済み。
 
-1. `src/predict.rs` に `predict_inter()`（仕様 8.5.2 節、8 タップ/バイリニアのサブピクセル
-   補間フィルタ、`interp_filter`/`mv` を使った動き補償）を実装し、`predict_inter_stub()` の
-   呼び出し箇所を置き換える。
-2. 参照フレームの実ピクセルデータ（DPB、8 スロット）を `Decoder` に持たせ、`refresh_frame_flags`
-   に応じて更新する（仕様 8.10 節 "Reference frame update process"）。
-3. 確率適応（仕様 8.4 節）: `counts_*` の収集（`src/tile.rs` の各シンタックス要素読み取り箇所）、
-   `merge_prob`/`merge_probs`、`adapt_coef_probs`/`adapt_noncoef_probs` を実装し、
-   `FrameContextStore::save` の前に適用する。
-4. ループフィルタのフレーム間デルタ引き継ぎ、`reset_frame_context == 2` の部分リセットなど、
-   上記「既知の制約」を順次解消する。
-5. 全フレーム MD5 コンフォーマンス検証（`tests/conformance_test.rs` を拡張し、`.ivf.md5` の
-   全行と比較する）。
+- `src/predict.rs` : `predict_inter()`（仕様 8.5.2 節）。`predict_inter_stub()` を置き換えた。
+  内部で仕様どおりの 4 段階の副処理に分割している。
+  - `select_mv()`（仕様 8.5.2.1 節）: 4x4 サブブロック単位の MV 選択。クロマかつ
+    `MiSize < BLOCK_8X8` の場合は `round_mv_comp_q2`/`round_mv_comp_q4` によるサブサンプリング
+    平均化を行う。
+  - `clamp_mv_for_plane()`（仕様 8.5.2.2 節）: フレーム端でのクランプ（1/16 pel 精度、
+    `INTERP_EXTEND`/`SUBPEL_BITS` を使った境界計算）。
+  - `scale_mv_for_plane()`（仕様 8.5.2.3 節）: 参照フレームと現在フレームのサイズが異なる
+    場合のスケーリング（`xScale`/`yScale`、`REF_SCALE_SHIFT`）。手元のテストベクタでは
+    参照フレームサイズは常に一致していたが、仕様の式をそのまま実装しているため、サイズが
+    異なる場合も理論上動作する（未検証）。
+  - `block_inter_predict()`（仕様 8.5.2.4 節）: 8 タップ（または `BILINEAR`）サブペル補間
+    フィルタによる水平→垂直の 2 パス畳み込み。参照フレーム端の読み出しは
+    `Clip3(0, lastX/lastY, ...)` による**クランプ読み**（エッジ拡張ではない）。
+  - compound 予測（2 参照の平均、`Round2(pred0+pred1, 1)`）にも対応。
+  - フィルタ係数表 `SUBPEL_FILTERS`（`src/prob_tables.rs`）は仕様 8.5.2.4 節の
+    `subpel_filters[4][16][8]` を `pdftotext -raw` 抽出テキストからそのまま転記した
+    （添字 0..3 が `EIGHTTAP`/`EIGHTTAP_SMOOTH`/`EIGHTTAP_SHARP`/`BILINEAR` の値と一致）。
+- `src/dpb.rs`（新規）: `Dpb`/`RefFrameData`。8 スロットの参照フレームバッファ（仕様 8.10 節
+  "Reference frame update process"）。`RefFrameData` は表示サイズ（`RefFrameWidth`/`Height`、
+  クロマはサブサンプリング後）にクロップ済みのピクセルデータを保持する。これにより
+  `predict_inter` のクランプ処理の `lastX`/`lastY` が `Plane::width/height - 1` とそのまま
+  一致する。`Decoder::decode_frame()` がタイル復号・ループフィルタ適用後に
+  `Dpb::update(refresh_frame_flags, ...)` を呼ぶ。`show_existing_frame` は DPB から該当
+  スロットを引いて `Frame` を組み立てて返す（`DecodeError::MissingReferenceFrame` は
+  該当スロットが空の場合のみ発生し、適合ビットストリームでは起こらない）。
+  参照フレームサイズが現在フレームと異なる場合のスケーリング要否は、手元のテストベクタでは
+  常に同一サイズだったため実地では確認できていない（`scale_mv_for_plane` 自体は一般式で
+  実装済み）。
+- `src/counts.rs`（新規）: 確率適応（仕様 8.4 節）。
+  - `Counts`: 仕様 8.3 節 "Clear counts process" が列挙するすべてのカウンタ配列
+    （`counts_partition`/`counts_intra_mode`/`counts_uv_mode`/`counts_skip`/
+    `counts_is_inter`/`counts_comp_mode`/`counts_comp_ref`/`counts_single_ref`/
+    `counts_inter_mode`/`counts_interp_filter`/`counts_tx_size`/`counts_mv_*`/
+    `counts_token`/`counts_more_coefs`）。`src/tile.rs` の各シンタックス要素読み取り箇所
+    （`read_partition`/`read_skip`/`read_tx_size`/`read_is_inter`/`intra_block_mode_info`/
+    `read_ref_frames`/`inter_block_mode_info`/`read_mv`/`read_mv_component`/
+    `tokens_and_reconstruct`）に増分処理を追加した。仕様 9.3 節「T 型シンタックス要素は
+    ビットを読まずに値が確定する場合でもカウント処理は必ず呼ばれる」という一般規則に従い、
+    `partition`（`hasRows`/`hasCols` が両方偽で無条件に `PARTITION_SPLIT` になる場合も含む）
+    はすべての分岐でカウントする。
+  - `merge_prob`/`merge_probs`（仕様 8.4.1〜8.4.2 節）、`adapt_coef_probs`（仕様 8.4.3 節）、
+    `adapt_noncoef_probs`（仕様 8.4.4 節）。
+  - **`more_coefs` の "special case"（仕様 9.3.4 節末尾）についての注記**: 仕様 PDF は
+    「`more_coefs` については本節末尾で説明する特別な扱いがある」と予告しているが、
+    `pdftotext` の `-raw`/`-layout`/デフォルトの 3 モードすべてで該当箇所のテキストが
+    実際には印字されていない（v0.7 ドラフト版の欠落と思われる）。本実装では、9.3 節冒頭の
+    一般規則（T 型要素は読まなくてもカウントされる）から論理的に導かれる唯一整合的な解釈
+    として、`tokens()`（仕様 6.4.24 節）で `checkEob == 0`（直前が `ZERO_TOKEN` だったため
+    `more_coefs` を実際には読まない）の場合でも、`counts_more_coefs[...][1]` を値 1
+    （「続きがある」）として加算する実装を採用した。この解釈は両テストベクタの
+    **全フレーム MD5 完全一致**によって実証的に裏付けられている
+    （`src/tile.rs::tokens_and_reconstruct` のコメント参照）。
+  - `Decoder::decode_frame()` の `refresh_probs()` 相当処理（仕様 6.1.2 節・7.1.2 節）:
+    `load_probs(ctx)` は `tx_probs`/`skip_prob` **を除く**すべてのテーブルを forward update
+    前の値（`starting_probs`）へ戻すことを指す点に注意（`compressed_header()` 側は
+    `tx_probs`/`skip_prob` も含めてすべて forward update するが、`refresh_probs()` の
+    `load_probs` はその 2 つだけ forward update 後の値のまま残す）。`adapt_coef_probs()` は
+    その状態の `coef_probs` に対して適用され、`FrameIsIntra == 0` の場合のみ `load_probs2(ctx)`
+    （`tx_probs`/`skip_prob` も forward update 前へ戻す）→ `adapt_noncoef_probs()` が続く。
+    この「forward update 前の値に戻してから backward adaptation する」という 2 段階の
+    構造を誤解して forward update 後の値に対して adaptation してしまうと、キーフレーム単発
+    では問題が顕在化しない（backward adaptation 自体が発火しないため）が、複数フレームに
+    またがる MD5 コンフォーマンスで確実に失敗する。本実装は `Decoder::decode_frame()` 内で
+    `starting_probs`（forward update 前）を保持しておき、上記の手順どおりに実装している。
+  - `uv_mode_probs` は `compressed_header()` に forward update シンタックスが存在しない
+    （常にビットストリームでは更新されない）が、仕様 8.4.4 節の `adapt_noncoef_probs()` は
+    `uv_mode_probs` も backward adaptation の対象に含めている。M3 前半では
+    `CompressedHeaderProbs` にこのフィールドがなく、インターフレーム内のイントラブロックの
+    `uv_mode` 読み取りは常に `DEFAULT_UV_MODE_PROBS` 固定値を使っていた（誤り）。
+    `CompressedHeaderProbs::uv_mode_probs` フィールドを追加し、`load_probs`/`save_probs`/
+    backward adaptation の対象に含めるよう修正した。
+- `src/header.rs` : ループフィルタの `ref_deltas`/`mode_deltas`（仕様 7.2 節、
+  `setup_past_independence()` 時のみリセットされフレーム間で持続する状態）を
+  `parse_uncompressed_header()`/`parse_loop_filter_params()` の引数として前フレームの値を
+  受け取れるように変更した（`ref_frame_sizes` と同じ設計パターン）。`Decoder` がこの状態を
+  保持し、フレームごとに更新する。
+- `src/lib.rs` : `Decoder` に DPB（`dpb: Dpb`）・ループフィルタデルタ（`loop_filter_deltas`）・
+  `LastFrameType`（`adapt_coef_probs` の `updateFactor` 計算に使う、仕様 8.4.3 節）を追加。
+  **公開 API を変更**した: `Decoder::decode_frame(&mut self, data: &[u8]) -> Result<Option<Frame>, DecodeError>`
+  （`DecodeOutcome` 列挙体は廃止）。`None` は「非表示フレーム」（`show_frame == 0`、いわゆる
+  droppable/altref フレーム）を表す。`show_existing_frame` フレームは DPB から実際に
+  ピクセルデータを引いて `Some(Frame)` を返すようになった（M3 前半では
+  `DecodeOutcome::ShowExisting { frame_to_show_map_idx }` を返すのみで実データを持たなかった）。
+  `decode_keyframe()`（第 1 引数がキーフレームであることを検証したうえで内部的に `Decoder`
+  経由で呼ぶ）は引き続き後方互換の単発 API として残している。
+- `reset_frame_context == 2`（該当フレームコンテキストのみリセット）は引き続き未実装
+  （`FrameIsIntra || error_resilient_mode` の場合は常に全 4 スロットをリセット）。
+  `frame_context_idx` はこの場合いずれも 0 に固定されるため、ビットストリーム読み取りには
+  影響しない（M3 前半からの既知の制約を継続）。
+- セグメンテーション未対応は継続（M1 からの既知の制約）。
+
+### デバッグ時の切り分け経過（参考）
+
+実装は 1 回目の全フレーム MD5 テストで両ベクタとも完全一致したため、大掛かりな切り分けは
+不要だった。ただし実装前に想定していた切り分け方針（不一致が出た場合用）は以下のとおりで、
+今後 M4 で新しいテストベクタを追加する際にも有効なはずなので記録しておく。
+1. 第 2 フレーム（最初のインターフレーム）だけを比較 → 補間フィルタ・DPB・MV 予測など
+   「1 フレーム内で閉じる」バグかどうかを切り分ける。
+2. 確率適応を無効化（`adapt_coef_probs`/`adapt_noncoef_probs` の呼び出しをコメントアウトし、
+   forward update 後の値をそのまま保存する M3 前半相当の挙動に戻す）した場合に何フレーム目
+   まで一致するかを見る → 一致するフレーム数が伸びれば適応ロジックのバグ、変わらなければ
+   動き補償・DPB 側のバグと判断できる。
+3. 予測画素のみ（残差を強制的にゼロにする）で比較 → `predict_inter` 自体の正しさと
+   トークン復号・逆量子化・逆変換の正しさを分離して検証できる。
 
 ## テスト
 
@@ -240,16 +312,24 @@ IVF パーサとヘッダパーサを検証する。`tests/compressed_header_tes
 検証する。`tests/decode_test.rs` は `decode_keyframe()`（公開 API）で最初のキーフレームを
 最後まで完全にデコードし、Y プレーンの統計値（分散が 0 でない・全ピクセル同値でない・
 `min < 50 && max > 200`）で実写系ベクタとして妥当な出力であることを検証する。
-`tests/conformance_test.rs`（M2b で追加）は、`decode_keyframe()` の最初のキーフレーム出力
-（Y→U→V 連結の I420 バイト列）の MD5 が libvpx 公式配布の `.ivf.md5` と完全一致することを
-検証する（ループフィルタ・クロップ・プレーン連結順がすべて正しくないと一致しないビット完全
-検証）。`tests/inter_frame_test.rs`（M3 前半で追加）は `Decoder::decode_frame()` を使い、
+`tests/conformance_test.rs`（M2b で追加、M3 後半で拡張）は 2 種類の検証を行う。
+- `*_first_keyframe_matches_official_md5`（M2b）: `decode_keyframe()` の最初のキーフレーム
+  出力（Y→U→V 連結の I420 バイト列）の MD5 が libvpx 公式配布の `.ivf.md5` の 1 行目と
+  完全一致することを検証する。
+- `*_all_frames_match_official_md5`（M3 後半で追加）: `Decoder::decode_frame()` で
+  **全 IVF フレーム**を順にデコードし、表示される（`Some(Frame)` が返る）フレームすべてに
+  ついて、`.ivf.md5` の対応する行と MD5 が完全一致することを検証する（動き補償・確率適応・
+  DPB・ループフィルタのフレーム間状態がすべて正しくないと通らない）。
+  `vp90-2-12-droppable_1`: 99/99 出力フレーム、`vp90-2-09-subpixel-00`: 20/20 出力フレームで
+  完全一致を確認済み。
+
+`tests/inter_frame_test.rs`（M3 前半で追加）は `Decoder::decode_frame()` を使い、
 各テストベクタの**全 IVF フレーム**（キーフレーム・インターフレーム・`vp90-2-12-droppable_1`
 の droppable フレームを含む）を順にデコードし、`uncompressed_header`＋`compressed_header`＋
 全タイルのモード情報・MV・残差トークンをパニックなく最後まで読み切れることを検証する
 （`vp90-2-09-subpixel-00` は 20 フレーム、`vp90-2-12-droppable_1` は 99 フレームすべてを
-確認済み）。画素の正しさまでは検証しない（動き補償が `predict_inter_stub()` のスタブのため。
-「M3 前半」節参照）。テストベクタ・MD5 ファイルはリポジトリに含めていない（`.gitignore` 対象）
+確認済み）。画素の正しさは `conformance_test.rs` 側で検証するため、ここではビットストリーム
+読了のみを見る。テストベクタ・MD5 ファイルはリポジトリに含めていない（`.gitignore` 対象）
 ため、以下の手順で事前にダウンロードしておく必要がある。ダウンロードしていない場合、該当
 テストは早期 return + `eprintln!` でスキップされ、テストスイート全体は失敗しない。
 
@@ -267,9 +347,10 @@ curl -o tests/vectors/vp90-2-09-subpixel-00.ivf.md5 \
 
 （PowerShell の場合は `Invoke-WebRequest -Uri <URL> -OutFile <path>` を使用する。）
 
-`.ivf.md5` は `md5sum` 互換フォーマット（`<32文字hex>␠␠<ファイル名>`）で、1 行 = 1 出力フレーム
-（Y→U→V 連結の I420 バイト列）の MD5 を記録している。`tests/conformance_test.rs` は 1 行目
-（最初の出力フレーム = 最初のキーフレーム）のみを使用する。
+`.ivf.md5` は `md5sum` 互換フォーマット（`<32文字hex>␠␠<ファイル名>`）で、1 行 = 1 出力
+（表示）フレーム（Y→U→V 連結の I420 バイト列）の MD5 を記録している。`show_frame == 0` の
+非表示フレームは行を持たない。`*_first_keyframe_matches_official_md5` は 1 行目のみ、
+`*_all_frames_match_official_md5` は全行を使用する。
 
 テストベクタの一覧は libvpx リポジトリの
 [`test/test-data.sha1`](https://github.com/webmproject/libvpx/blob/main/test/test-data.sha1) に
@@ -278,14 +359,31 @@ curl -o tests/vectors/vp90-2-09-subpixel-00.ivf.md5 \
 
 ### PNG ダンプ（目視検収用）
 
-`examples/decode_to_png.rs` は `tests/vectors/` の各 `.ivf` の第 1 フレームをデコードし、
-BT.601（limited range）で YUV → RGB 変換したうえで `target/dump/<ベクタ名>.png` に書き出す。
-PNG エンコードも依存クレートを使わず自前実装している（zlib は無圧縮の "stored" ブロックのみ
-使用、CRC-32/Adler-32 も自前実装）。
+`examples/decode_to_png.rs` は `.ivf` をデコードし、BT.601（limited range）で YUV → RGB
+変換したうえで `target/dump/` に PNG として書き出す。PNG エンコードも依存クレートを使わず
+自前実装している（zlib は無圧縮の "stored" ブロックのみ使用、CRC-32/Adler-32 も自前実装）。
+
+引数なしの場合は両ベクタの第 1 フレーム（キーフレーム）を `target/dump/<ベクタ名>.png` に
+書き出す（M2b からの既存動作）。
 
 ```sh
 cargo run --example decode_to_png
 ```
+
+引数でベクタ名（拡張子なし）と IVF フレーム番号（0 始まり、デコード順）を指定すると、
+そのフレーム以降で最初に表示されるフレームを `target/dump/<ベクタ名>_frame<N>.png` に
+書き出す（M3 後半で追加。動き補償ありの中間フレームの目視検収用。`Decoder` はフレーム間状態を
+要求するため、内部では 0 番目から指定フレームまで順にデコードする）。
+
+```sh
+# vp90-2-12-droppable_1 の第 50 フレーム前後をダンプする例
+cargo run --example decode_to_png -- vp90-2-12-droppable_1 50
+```
+
+`vp90-2-12-droppable_1` の第 50 フレーム付近（建設現場の実写映像）で目視検収済み。
+`vp90-2-09-subpixel-00` は仕様上どのフレームも疑似乱数状のノイズパターンになる合成
+テストベクタのため、動き補償後も見た目はノイズのまま変わらない（MD5 一致で正しさは別途
+確認済み。「M2b」節の既存の注記も参照）。
 
 ## ライセンス
 
