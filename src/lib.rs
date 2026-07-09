@@ -14,8 +14,10 @@
 pub mod bit_reader;
 pub mod bool_coder;
 pub mod compressed_header;
+pub mod framebuffer;
 pub mod header;
 pub mod ivf;
+pub mod predict;
 pub mod prob_tables;
 pub mod quant;
 pub mod scan;
