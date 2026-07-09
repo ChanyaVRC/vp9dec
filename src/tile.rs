@@ -246,6 +246,23 @@ impl TileDecoder {
         &self.planes
     }
 
+    /// ループフィルタ（仕様 8.8 節、[`crate::loop_filter`]）をデコード済みの `planes` に
+    /// 適用する。`decode_tiles` の直後、`planes()` で出力を読み出す前に呼ぶこと。
+    ///
+    /// `self.planes`（`&mut`）と `self.mi_grid`（`&`）を別々のフィールドとして直接借用する
+    /// ことで、両方を同時に必要とする `loop_filter_frame` に安全に渡している。
+    pub fn apply_loop_filter(&mut self, lf: &header::LoopFilterParams) {
+        crate::loop_filter::loop_filter_frame(
+            &mut self.planes,
+            &self.mi_grid,
+            self.mi_cols,
+            self.mi_rows,
+            self.subsampling_x,
+            self.subsampling_y,
+            lf,
+        );
+    }
+
     fn clear_above_context(&mut self) {
         self.above_partition_context.iter_mut().for_each(|v| *v = 0);
         for plane_ctx in self.above_nonzero_context.iter_mut() {

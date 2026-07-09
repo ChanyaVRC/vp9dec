@@ -6,6 +6,7 @@
 //! # マイルストーン
 //! - M1: IVF コンテナパーサ、bool デコーダ、非圧縮フレームヘッダのパース
 //! - M2: イントラ予測によるキーフレームのデコード
+//! - M2b: ループフィルタ（デブロッキングフィルタ）
 //! - M3: インター予測（動き補償）
 //! - M4: コンフォーマンステスト完全通過
 //!
@@ -17,6 +18,7 @@ pub mod compressed_header;
 pub mod framebuffer;
 pub mod header;
 pub mod ivf;
+pub mod loop_filter;
 pub mod predict;
 pub mod prob_tables;
 pub mod quant;
@@ -87,8 +89,7 @@ pub struct Frame {
 /// `frame_type != KEY_FRAME` の場合はエラーを返す（M2 はキーフレームのイントラ復号のみを
 /// 対象とするため）。
 ///
-/// ループフィルタ（仕様 8.8 節）は M2b で実装予定のため未適用。ブロックノイズが
-/// 残る場合がある（詳細は README.md を参照）。
+/// タイル復号後、クロップ前にループフィルタ（仕様 8.8 節、[`crate::loop_filter`]）を適用する。
 pub fn decode_keyframe(frame_data: &[u8]) -> Result<Frame, DecodeError> {
     let (parsed, consumed) = parse_uncompressed_header(frame_data)?;
     let header = match parsed {
@@ -118,6 +119,7 @@ pub fn decode_keyframe(frame_data: &[u8]) -> Result<Frame, DecodeError> {
     let tile_data = &frame_data[compressed_end..];
     let mut decoder = TileDecoder::new(&header, &compressed);
     decoder.decode_tiles(tile_data)?;
+    decoder.apply_loop_filter(&header.loop_filter);
 
     let planes = decoder.planes();
     let width = header.width as usize;
