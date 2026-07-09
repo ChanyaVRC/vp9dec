@@ -121,16 +121,29 @@ const MIN_TILE_WIDTH_B64: u32 = 4;
 
 /// タイル分割数計算に必要な、フレームサイズから導出される値
 /// （仕様 6.2.6 節 `compute_image_size`）。
-struct ImageSize {
-    sb64_cols: u32,
+///
+/// `mi_cols`/`mi_rows` は 8x8 単位（mode info 単位）でのフレーム幅・高さ、
+/// `sb64_cols`/`sb64_rows` は 64x64 単位（スーパーブロック単位）でのフレーム幅・高さ。
+/// タイル・スーパーブロック走査（`src/tile.rs`）でも使用するため `pub(crate)` にしている。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImageSize {
+    pub(crate) mi_cols: u32,
+    pub(crate) mi_rows: u32,
+    pub(crate) sb64_cols: u32,
+    pub(crate) sb64_rows: u32,
 }
 
-fn compute_image_size(width: u32, height: u32) -> ImageSize {
+pub(crate) fn compute_image_size(width: u32, height: u32) -> ImageSize {
     let mi_cols = (width + 7) >> 3;
     let mi_rows = (height + 7) >> 3;
     let sb64_cols = (mi_cols + 7) >> 3;
-    let _sb64_rows = (mi_rows + 7) >> 3;
-    ImageSize { sb64_cols }
+    let sb64_rows = (mi_rows + 7) >> 3;
+    ImageSize {
+        mi_cols,
+        mi_rows,
+        sb64_cols,
+        sb64_rows,
+    }
 }
 
 /// `calc_min_log2_tile_cols()`（仕様 6.2.14 節）。
