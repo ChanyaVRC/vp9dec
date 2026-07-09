@@ -64,6 +64,44 @@ pub const D207_PRED: u8 = 7;
 pub const D63_PRED: u8 = 8;
 pub const TM_PRED: u8 = 9;
 
+/// インター予測モード（`y_mode` が取り得るインター側の値、仕様 7.4.11 節）。
+/// イントラモード（0..9）と同じ `y_mode` 名前空間の続きの値として定義される。
+pub const NEARESTMV: u8 = 10;
+pub const NEARMV: u8 = 11;
+pub const ZEROMV: u8 = 12;
+pub const NEWMV: u8 = 13;
+
+/// `ref_frame[ 0 ]`/`ref_frame[ 1 ]` の値（仕様 7.4.12 節）。`ref_frame[ 1 ] == 0` は
+/// `NONE`（単予測またはイントラ）を意味し、`INTRA_FRAME` と数値上一致する
+/// （両者が同時に意味を持つ場面がないため、仕様は同じ 0 を使い回している）。
+pub const INTRA_FRAME: u8 = 0;
+pub const LAST_FRAME: u8 = 1;
+pub const GOLDEN_FRAME: u8 = 2;
+pub const ALTREF_FRAME: u8 = 3;
+/// `ref_frame[ 1 ] == NONE`（単予測）を表す番兵値。`INTRA_FRAME` と同じ 0。
+pub const REF_NONE: u8 = 0;
+
+/// `interpolation_filter`/`interp_filter` の値（仕様 7.2.7 節）。
+pub const EIGHTTAP: u8 = 0;
+pub const EIGHTTAP_SMOOTH: u8 = 1;
+pub const EIGHTTAP_SHARP: u8 = 2;
+pub const BILINEAR: u8 = 3;
+pub const SWITCHABLE: u8 = 4;
+
+/// `reference_mode` の値（仕様 7.3.6 節）。
+pub const SINGLE_REFERENCE: u8 = 0;
+pub const COMPOUND_REFERENCE: u8 = 1;
+pub const REFERENCE_MODE_SELECT: u8 = 2;
+
+/// `mv_joint` の値（仕様 7.4.13 節）。
+pub const MV_JOINT_ZERO: u8 = 0;
+pub const MV_JOINT_HNZVZ: u8 = 1;
+pub const MV_JOINT_HZVNZ: u8 = 2;
+pub const MV_JOINT_HNZVNZ: u8 = 3;
+
+/// 参照フレームスロット数（仕様 7.2 節、`RefFrameWidth`/`RefFrameHeight` 等の添字範囲）。
+pub const NUM_REF_FRAMES: usize = 8;
+
 // ---------------------------------------------------------------------------
 // 変換用ルックアップテーブル（仕様 10.2 節 "Conversion tables"）。
 // ---------------------------------------------------------------------------
@@ -220,6 +258,43 @@ pub const TX_SIZE_32_TREE: [i32; 6] = [
 pub const TX_SIZE_16_TREE: [i32; 4] = [-(TX_4X4 as i32), 2, -(TX_8X8 as i32), -(TX_16X16 as i32)];
 /// `tx_size_8_tree[ 2 ]`。maxTxSize == TX_8X8 の場合に使う（それ以外は tx_size は読まれない）。
 pub const TX_SIZE_8_TREE: [i32; 2] = [-(TX_4X4 as i32), -(TX_8X8 as i32)];
+
+/// `inter_mode_tree[ 6 ]`（仕様 9.3.1 節）。葉の値は `y_mode - NEARESTMV`。
+pub const INTER_MODE_TREE: [i32; 6] = [
+    -((ZEROMV - NEARESTMV) as i32),
+    2,
+    0, // -(NEARESTMV - NEARESTMV) は常に 0（NEARESTMV が基準値のため）。
+    4,
+    -((NEARMV - NEARESTMV) as i32),
+    -((NEWMV - NEARESTMV) as i32),
+];
+
+/// `interp_filter_tree[ 4 ]`（仕様 9.3.1 節）。`BILINEAR` はフレームレベルでのみ選択可能で、
+/// ブロックレベルの `interp_filter` ツリーには現れない。
+pub const INTERP_FILTER_TREE: [i32; 4] = [
+    -(EIGHTTAP as i32),
+    2,
+    -(EIGHTTAP_SMOOTH as i32),
+    -(EIGHTTAP_SHARP as i32),
+];
+
+/// `mv_joint_tree[ 6 ]`（仕様 9.3.1 節）。
+pub const MV_JOINT_TREE: [i32; 6] = [
+    -(MV_JOINT_ZERO as i32),
+    2,
+    -(MV_JOINT_HNZVZ as i32),
+    4,
+    -(MV_JOINT_HZVNZ as i32),
+    -(MV_JOINT_HNZVNZ as i32),
+];
+
+/// `mv_class_tree[ 20 ]`（仕様 9.3.1 節）。`MV_CLASS_0`..`MV_CLASS_10` の 11 値。
+pub const MV_CLASS_TREE: [i32; 20] = [
+    0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
+];
+
+/// `mv_fr_tree[ 6 ]`（仕様 9.3.1 節）。`mv_class0_fr`/`mv_fr` の復号に使う（値 0..3）。
+pub const MV_FR_TREE: [i32; 6] = [0, 2, -1, 4, -2, -3];
 
 // ---------------------------------------------------------------------------
 // 固定確率テーブル（仕様 10.4 節 "Fixed probability tables"）。
@@ -1533,6 +1608,9 @@ pub const CAT_PROBS: [[u8; 14]; 7] = [
 /// `mode2txfm_map`（仕様 6.4.25 節）。イントラ予測モード（`DC_PRED`..`TM_PRED`）から
 /// `TxType` への変換。インター予測モードのエントリ（`NEARESTMV` 等、すべて `DCT_DCT`）は
 /// M2（イントラのみ）では到達しないため転記していない。
+/// `mode2txfm_map[ MB_MODE_COUNT ]`（仕様 6.4.25 節・10.2 節）。イントラモード（0..=9）に加え、
+/// インターモード（[`NEARESTMV`]..[`NEWMV`]、10..=13）も受け付け、すべて `DCT_DCT` を返す
+/// （仕様の `mode2txfm_map` テーブルは `y_mode` がインター値の場合も定義されている）。
 pub fn mode2txfm_map(mode: u8) -> crate::transform::TxType {
     use crate::transform::TxType;
     match mode {
@@ -1546,7 +1624,10 @@ pub fn mode2txfm_map(mode: u8) -> crate::transform::TxType {
         D207_PRED => TxType::DctAdst,
         D63_PRED => TxType::AdstDct,
         TM_PRED => TxType::AdstAdst,
-        _ => unreachable!("mode2txfm_map はイントラ予測モード (0..=9) のみを受け付ける"),
+        NEARESTMV | NEARMV | ZEROMV | NEWMV => TxType::DctDct,
+        _ => unreachable!(
+            "mode2txfm_map は 0..=13 (イントラ 0..=9 + インター 10..=13) のみを受け付ける"
+        ),
     }
 }
 
@@ -1697,6 +1778,278 @@ pub fn pareto(node: usize, prob: u8) -> u8 {
         ((PARETO_TABLE[x][node - 2] as u32 + PARETO_TABLE[x + 1][node - 2] as u32) >> 1) as u8
     }
 }
+
+// ---------------------------------------------------------------------------
+// インターフレーム（M3）で必要となるデフォルト確率テーブル・変換テーブル
+// （仕様 10.2 節・10.5 節から転記）。
+// ---------------------------------------------------------------------------
+
+/// `size_group_lookup[ BLOCK_SIZES ]`（仕様 10.2 節）。非キーフレームの `intra_mode`/
+/// `sub_intra_mode` の確率選択（`y_mode_probs[ctx]`）に使う。
+pub const SIZE_GROUP_LOOKUP: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
+
+/// `default_partition_probs[ PARTITION_CONTEXTS ][ PARTITION_TYPES - 1 ]`（仕様 10.5 節）。
+/// キーフレーム用の [`KF_PARTITION_PROBS`] とは別に、非キーフレームで `compressed_header`
+/// により更新される確率テーブル。
+pub const DEFAULT_PARTITION_PROBS: [[u8; 3]; 16] = [
+    [199, 122, 141],
+    [147, 63, 159],
+    [148, 133, 118],
+    [121, 104, 114],
+    [174, 73, 87],
+    [92, 41, 83],
+    [82, 99, 50],
+    [53, 39, 39],
+    [177, 58, 59],
+    [68, 26, 63],
+    [52, 79, 25],
+    [17, 14, 12],
+    [222, 34, 30],
+    [72, 16, 44],
+    [58, 32, 12],
+    [10, 7, 6],
+];
+
+/// `default_y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]`（仕様 10.5 節）。
+/// 非キーフレームでの `intra_mode`/`sub_intra_mode`（`y_mode_probs`）に使う。
+/// `default_uv_mode_probs` と異なり `compressed_header` の `read_y_mode_probs()` で更新される。
+pub const DEFAULT_Y_MODE_PROBS: [[u8; 9]; 4] = [
+    [65, 32, 18, 144, 162, 194, 41, 51, 98],
+    [132, 68, 18, 165, 217, 196, 45, 40, 78],
+    [173, 80, 19, 176, 240, 193, 64, 35, 46],
+    [221, 135, 38, 194, 248, 121, 96, 85, 29],
+];
+
+/// `default_uv_mode_probs[ INTRA_MODES ][ INTRA_MODES - 1 ]`（仕様 10.5 節）。
+/// `compressed_header` に更新用シンタックスが存在しないため、常にこのデフォルト値が使われる
+/// （仕様 6.3 節の `compressed_header()` を参照。`read_y_mode_probs()` は `y_mode_probs` のみを
+/// 更新し、`uv_mode_probs` を更新するシンタックスは存在しない）。
+pub const DEFAULT_UV_MODE_PROBS: [[u8; 9]; 10] = [
+    [120, 7, 76, 176, 208, 126, 28, 54, 103],
+    [48, 12, 154, 155, 139, 90, 34, 117, 119],
+    [67, 6, 25, 204, 243, 158, 13, 21, 96],
+    [97, 5, 44, 131, 176, 139, 48, 68, 97],
+    [83, 5, 42, 156, 111, 152, 26, 49, 152],
+    [80, 5, 58, 178, 74, 83, 33, 62, 145],
+    [86, 5, 32, 154, 192, 168, 14, 22, 163],
+    [85, 5, 32, 156, 216, 148, 19, 29, 73],
+    [77, 7, 64, 116, 132, 122, 37, 126, 120],
+    [101, 21, 107, 181, 192, 103, 19, 67, 125],
+];
+
+/// `default_is_inter_prob[ IS_INTER_CONTEXTS ]`（仕様 10.5 節）。
+pub const DEFAULT_IS_INTER_PROB: [u8; 4] = [9, 102, 187, 225];
+
+/// `default_comp_mode_prob[ COMP_MODE_CONTEXTS ]`（仕様 10.5 節）。
+pub const DEFAULT_COMP_MODE_PROB: [u8; 5] = [239, 183, 119, 96, 41];
+
+/// `default_comp_ref_prob[ REF_CONTEXTS ]`（仕様 10.5 節）。
+pub const DEFAULT_COMP_REF_PROB: [u8; 5] = [50, 126, 123, 221, 226];
+
+/// `default_single_ref_prob[ REF_CONTEXTS ][ 2 ]`（仕様 10.5 節）。
+pub const DEFAULT_SINGLE_REF_PROB: [[u8; 2]; 5] =
+    [[33, 16], [77, 74], [142, 142], [172, 170], [238, 247]];
+
+/// `default_inter_mode_probs[ INTER_MODE_CONTEXTS ][ INTER_MODES - 1 ]`（仕様 10.5 節）。
+pub const DEFAULT_INTER_MODE_PROBS: [[u8; 3]; 7] = [
+    [2, 173, 34],
+    [7, 145, 85],
+    [7, 166, 63],
+    [7, 94, 66],
+    [8, 64, 46],
+    [17, 81, 31],
+    [25, 29, 30],
+];
+
+/// `default_interp_filter_probs[ INTERP_FILTER_CONTEXTS ][ SWITCHABLE_FILTERS - 1 ]`
+/// （仕様 10.5 節）。
+pub const DEFAULT_INTERP_FILTER_PROBS: [[u8; 2]; 4] = [[235, 162], [36, 255], [34, 3], [149, 144]];
+
+/// `default_mv_joint_probs[ 3 ]`（仕様 10.5 節）。
+pub const DEFAULT_MV_JOINT_PROBS: [u8; 3] = [32, 64, 96];
+
+/// `default_mv_sign_prob[ 2 ]`（仕様 10.5 節）。
+pub const DEFAULT_MV_SIGN_PROB: [u8; 2] = [128, 128];
+
+/// `default_mv_class_probs[ 2 ][ MV_CLASSES - 1 ]`（仕様 10.5 節）。
+pub const DEFAULT_MV_CLASS_PROBS: [[u8; 10]; 2] = [
+    [224, 144, 192, 168, 192, 176, 192, 198, 198, 245],
+    [216, 128, 176, 160, 176, 176, 192, 198, 198, 208],
+];
+
+/// `default_mv_class0_bit_prob[ 2 ]`（仕様 10.5 節）。
+pub const DEFAULT_MV_CLASS0_BIT_PROB: [u8; 2] = [216, 208];
+
+/// `default_mv_bits_prob[ 2 ][ MV_OFFSET_BITS ]`（仕様 10.5 節）。
+pub const DEFAULT_MV_BITS_PROB: [[u8; 10]; 2] = [
+    [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
+    [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
+];
+
+/// `default_mv_class0_fr_probs[ 2 ][ CLASS0_SIZE ][ 3 ]`（仕様 10.5 節）。
+pub const DEFAULT_MV_CLASS0_FR_PROBS: [[[u8; 3]; 2]; 2] = [
+    [[128, 128, 64], [96, 112, 64]],
+    [[128, 128, 64], [96, 112, 64]],
+];
+
+/// `default_mv_fr_probs[ 2 ][ 3 ]`（仕様 10.5 節）。
+pub const DEFAULT_MV_FR_PROBS: [[u8; 3]; 2] = [[64, 96, 64], [64, 96, 64]];
+
+/// `default_mv_class0_hp_prob[ 2 ]`（仕様 10.5 節）。
+pub const DEFAULT_MV_CLASS0_HP_PROB: [u8; 2] = [160, 160];
+
+/// `default_mv_hp_prob[ 2 ]`（仕様 10.5 節）。
+pub const DEFAULT_MV_HP_PROB: [u8; 2] = [128, 128];
+
+// ---------------------------------------------------------------------------
+// 動きベクトル予測（仕様 6.5 節 "Motion vector prediction"）で使う定数テーブル。
+// ---------------------------------------------------------------------------
+
+/// `mv_ref_blocks[ BLOCK_SIZES ][ MVREF_NEIGHBOURS ][ 2 ]`（仕様 6.5.1 節）。
+/// 各要素は `(deltaRow, deltaCol)`。
+pub const MV_REF_BLOCKS: [[(i32, i32); 8]; 13] = [
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
+    [
+        (0, -1),
+        (-1, 0),
+        (1, -1),
+        (-1, -1),
+        (0, -2),
+        (-2, 0),
+        (-2, -1),
+        (-1, -2),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-1, -2),
+        (-2, -1),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 1),
+        (1, -1),
+        (-1, -1),
+        (-3, 0),
+        (0, -3),
+        (-3, -3),
+    ],
+    [
+        (0, -1),
+        (-1, 0),
+        (2, -1),
+        (-1, -1),
+        (-1, 1),
+        (0, -3),
+        (-3, 0),
+        (-3, -3),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 2),
+        (-1, -1),
+        (1, -1),
+        (-3, 0),
+        (0, -3),
+        (-3, -3),
+    ],
+    [
+        (-1, 1),
+        (1, -1),
+        (-1, 2),
+        (2, -1),
+        (-1, -1),
+        (-3, 0),
+        (0, -3),
+        (-3, -3),
+    ],
+    [
+        (0, -1),
+        (-1, 0),
+        (4, -1),
+        (-1, 2),
+        (-1, -1),
+        (0, -3),
+        (-3, 0),
+        (2, -1),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 4),
+        (2, -1),
+        (-1, -1),
+        (-3, 0),
+        (0, -3),
+        (-1, 2),
+    ],
+    [
+        (-1, 3),
+        (3, -1),
+        (-1, 4),
+        (4, -1),
+        (-1, -1),
+        (-1, 0),
+        (0, -1),
+        (-1, 6),
+    ],
+];
+
+/// `mode_2_counter[ MB_MODE_COUNT ]`（仕様 6.5.1 節）。`YModes` の値（イントラ 0..9、
+/// インター [`NEARESTMV`]..[`NEWMV`] 10..13）から `contextCounter` への加算値を求める。
+pub const MODE_2_COUNTER: [u8; 14] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 3, 1];
+
+/// `counter_to_context[ 19 ]`（仕様 6.5.1 節）。`contextCounter`（0..=18）から
+/// `inter_mode_probs` の文脈（0..=6。7 を超える値は `INVALID_CASE` で本来出現しない）への変換。
+pub const COUNTER_TO_CONTEXT: [u8; 19] = [2, 3, 4, 1, 3, 9, 0, 9, 9, 5, 5, 9, 5, 9, 9, 9, 9, 9, 6];
+
+/// `idx_n_column_to_subblock[ 4 ][ 2 ]`（仕様 6.5.11 節）。`get_sub_block_mv` で使う。
+pub const IDX_N_COLUMN_TO_SUBBLOCK: [[u8; 2]; 4] = [[1, 2], [1, 3], [3, 2], [3, 3]];
 
 #[cfg(test)]
 mod token_tables_tests {
