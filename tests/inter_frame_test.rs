@@ -1,19 +1,20 @@
-//! インターフレームのビットストリーム復号（M3 前半）の統合テスト。
+//! Integration tests for inter-frame bitstream decoding (M3 first half).
 //!
-//! `tests/vectors/` にダウンロード済みの `.ivf` ファイルがあれば、ファイル内のすべての
-//! フレーム（キーフレーム・インターフレーム・droppable フレームを含む）を [`Decoder`] で
-//! 順番にデコードし、`uncompressed_header` + `compressed_header` + 全タイルのモード情報/MV/
-//! 残差トークンを最後までパニックなく読み切れることを検証する。
+//! If `.ivf` files have been downloaded into `tests/vectors/`, this decodes every frame in
+//! the file (key frames, inter frames, and droppable frames included) in order via
+//! [`Decoder`], and verifies that `uncompressed_header` + `compressed_header` + mode info/MV/
+//! residual tokens for every tile can be read through to completion without panicking.
 //!
-//! 画素生成（動き補償・サブピクセル補間）は M3 後半で実装予定のためまだスタブであり、ここでは
-//! ピクセル値の正しさは検証しない（`decode_test.rs`/`conformance_test.rs` がキーフレームの
-//! ピクセル正しさを別途検証している）。ビットストリームを最後まで正しく読み切れていることは、
-//! 後続フレームも連続して（bool デコーダの消費位置がずれずに）読めることで担保される
-//! （1 フレームでも消費位置がずれれば、次のフレームの `uncompressed_header` の
-//! `frame_marker`/`frame_sync_code` 等の検証で早期に失敗するはず）。
+//! Pixel generation (motion compensation, subpixel interpolation) is still a stub pending
+//! implementation in M3 second half, so pixel value correctness isn't verified here
+//! (`decode_test.rs`/`conformance_test.rs` separately verify key frame pixel correctness).
+//! Correctly reading the bitstream through to the end is ensured by being able to keep
+//! reading subsequent frames in sequence (i.e. without the bool decoder's consumed position
+//! drifting) — if the consumed position drifted even for a single frame, the next frame's
+//! `uncompressed_header` would fail early on its `frame_marker`/`frame_sync_code` etc. checks.
 //!
-//! テストベクタが存在しない環境では、該当テストは早期 return + `eprintln!` でスキップされる
-//! （取得方法は README.md を参照）。
+//! In environments without test vectors, the corresponding test is skipped via early
+//! return + `eprintln!` (see README.md for how to obtain them).
 
 use std::path::Path;
 
@@ -28,8 +29,8 @@ fn check_vector(relative_path: &str) {
 
     if !path.exists() {
         eprintln!(
-            "[skip] テストベクタが見つからないためスキップします: {}\n\
-             README.md の手順に従って事前にダウンロードしてください。",
+            "[skip] Test vector not found, skipping: {}\n\
+             Please download it beforehand following the instructions in README.md.",
             path.display()
         );
         return;
@@ -51,7 +52,7 @@ fn check_vector(relative_path: &str) {
         match decoder.decode_frame(frame.data) {
             Ok(Some(f)) => {
                 decoded_count += 1;
-                // 最低限の健全性: プレーンサイズが frame.width/height から導出した想定値と一致する。
+                // Minimal sanity check: plane size matches the expected value derived from frame.width/height.
                 assert_eq!(
                     f.y.len(),
                     (f.width * f.height) as usize,
@@ -72,17 +73,17 @@ fn check_vector(relative_path: &str) {
     }
 
     eprintln!(
-        "[ok] {}: {frame_count} IVF フレームすべてを読み切った（表示フレーム {decoded_count} 件、非表示フレーム {hidden_count} 件）",
+        "[ok] {}: read through all {frame_count} IVF frames (shown frames: {decoded_count}, hidden frames: {hidden_count})",
         path.display()
     );
     assert!(
         frame_count > 1,
-        "{}: 単一フレームしかない（インターフレームの検証にならない）",
+        "{}: only a single frame (doesn't exercise inter-frame decoding)",
         path.display()
     );
     assert!(
         decoded_count > 1,
-        "{}: 新規デコードされたフレームが 1 枚以下（インターフレームが含まれていない可能性）",
+        "{}: 1 or fewer newly decoded frames (may not include any inter frames)",
         path.display()
     );
 }

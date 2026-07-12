@@ -1,28 +1,38 @@
-//! WebM 公式テストベクタを使った、圧縮ヘッダ（`compressed_header`）パースの統合テスト。
+//! Integration tests for compressed header (`compressed_header`) parsing, using official
+//! WebM test vectors.
 //!
-//! `tests/vectors/` にダウンロード済みの `.ivf` ファイルがあれば、最初のキーフレームについて
-//! 「uncompressed_header → compressed_header がパニックせず最後まで読める」ことと、
-//! 読み取った tx_mode / skip_prob が妥当な値域に収まることを検証する。
+//! If `.ivf` files have been downloaded into `tests/vectors/`, this verifies, for the first
+//! key frame, that "uncompressed_header -> compressed_header reads through to completion
+//! without panicking" and that the parsed tx_mode / skip_prob fall within valid ranges.
 //!
-//! `decode_tiles` はトークン復号・再構成まで含めて完全に実装済みだが、本テストでは
-//! 引き続き `compressed_header` の読了までを主目的として検証し、`TileDecoder::decode_tiles`
-//! の呼び出しは「パニックしないこと」のみを確認する（成功・失敗どちらの `Result` も許容する）。
-//! 完全なピクセル出力の正しさ（統計的な sanity チェック）は `tests/decode_test.rs` の
-//! `decode_keyframe` 経由のテストで検証している。タイル/パーティション/モード情報の詳細な
-//! 正しさは `src/tile.rs` 内の合成ビットストリームによる単体テストで検証している。
+//! `decode_tiles` is now fully implemented including token decoding and reconstruction, but
+//! this test still primarily verifies that `compressed_header` reads through to completion,
+//! and only confirms that the call to `TileDecoder::decode_tiles` doesn't panic (either an
+//! `Ok` or `Err` result is accepted). Full pixel output correctness (a statistical sanity
+//! check) is verified by the `decode_keyframe`-based tests in `tests/decode_test.rs`.
+//! Detailed correctness of tile/partition/mode info is verified by unit tests using
+//! synthetic bitstreams inside `src/tile.rs`.
 //!
-//! テストベクタが存在しない環境では、該当テストは早期 return + `eprintln!` でスキップされる
-//! （取得方法は README.md を参照）。
+//! In environments without test vectors, the corresponding test is skipped via early
+//! return + `eprintln!` (see README.md for how to obtain them).
 
 use std::path::Path;
 
 use vp9dec::compressed_header::parse_compressed_header;
-use vp9dec::header::{parse_uncompressed_header, FrameHeader, NUM_REF_FRAMES};
+use vp9dec::header::{
+    parse_uncompressed_header, FrameHeader, MAX_SEGMENTS, NUM_REF_FRAMES, SEG_LVL_MAX,
+};
 use vp9dec::ivf::IvfReader;
 use vp9dec::tile::TileDecoder;
 
 const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
 const NO_LF_DELTAS: ([i8; 4], [i8; 2]) = ([1, 0, -1, -1], [0, 0]);
+const NO_SEG_FEATURES: ([[bool; SEG_LVL_MAX]; MAX_SEGMENTS], [[i32; SEG_LVL_MAX]; MAX_SEGMENTS], bool) =
+    (
+        [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+        [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
+        false,
+    );
 
 fn check_vector(relative_path: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -32,8 +42,8 @@ fn check_vector(relative_path: &str) {
 
     if !path.exists() {
         eprintln!(
-            "[skip] テストベクタが見つからないためスキップします: {}\n\
-             README.md の手順に従って事前にダウンロードしてください。",
+            "[skip] Test vector not found, skipping: {}\n\
+             Please download it beforehand following the instructions in README.md.",
             path.display()
         );
         return;
@@ -51,7 +61,8 @@ fn check_vector(relative_path: &str) {
         .unwrap_or_else(|e| panic!("failed to read first frame of {}: {e:?}", path.display()));
 
     let (parsed, consumed) =
-        parse_uncompressed_header(first_frame.data, &NO_REF_SIZES, NO_LF_DELTAS).unwrap_or_else(
+        parse_uncompressed_header(first_frame.data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES)
+            .unwrap_or_else(
             |e| {
                 panic!(
                     "failed to parse uncompressed header of first frame in {}: {e:?}",
@@ -94,14 +105,14 @@ fn check_vector(relative_path: &str) {
             )
         });
 
-    // tx_mode は ONLY_4X4(0) 〜 TX_MODE_SELECT(4) の範囲に収まる。
+    // tx_mode falls within the range ONLY_4X4(0) to TX_MODE_SELECT(4).
     assert!(
         compressed.tx_mode <= 4,
         "{}: tx_mode out of range: {}",
         path.display(),
         compressed.tx_mode
     );
-    // ロスレスの場合は仕様上 tx_mode は必ず ONLY_4X4 (0) になる。
+    // Per spec, for lossless frames tx_mode must always be ONLY_4X4 (0).
     if header.quantization.lossless {
         assert_eq!(
             compressed.tx_mode,
@@ -110,7 +121,8 @@ fn check_vector(relative_path: &str) {
             path.display()
         );
     }
-    // 確率値は仕様上 1..=255 の範囲（read_prob/diff_update_prob の性質上 0 にはならない）。
+    // Per spec, probability values fall within 1..=255 (never 0, due to how
+    // read_prob/diff_update_prob work).
     for &p in compressed.probs.skip_prob.iter() {
         assert!(
             p >= 1,
@@ -126,9 +138,9 @@ fn check_vector(relative_path: &str) {
         compressed.probs.skip_prob
     );
 
-    // タイルデータ（圧縮ヘッダの直後から、フレームデータの末尾まで）で decode_tiles を
-    // 試みる。トークン復号が未実装のため成功するとは限らないが、パニックしないことを
-    // 確認する（Result は Ok/Err のどちらでもよい）。
+    // Attempt decode_tiles on the tile data (from right after the compressed header to the
+    // end of the frame data). This isn't guaranteed to succeed since token decoding isn't
+    // implemented, but we confirm it doesn't panic (either Ok or Err is fine).
     let tile_data = &first_frame.data[compressed_end..];
     let mut tile_decoder = TileDecoder::new(&header, &compressed);
     match tile_decoder.decode_tiles(tile_data) {

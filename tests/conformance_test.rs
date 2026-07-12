@@ -1,18 +1,19 @@
-//! 公式 VP9 コンフォーマンステストベクタによる、ビット完全一致の検証（M2b）。
+//! Bit-exact verification against official VP9 conformance test vectors (M2b).
 //!
-//! libvpx のテストデータ配布 (`https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/`)
-//! には各 `.ivf` に対応する `.ivf.md5` が同梱されており、各出力フレーム（1 行 = 1 フレーム）の
-//! I420（Y 全体 → U 全体 → V 全体を連結したもの）の MD5 が記録されている
-//! （`md5sum` 標準フォーマット: `<32文字hex>  <ファイル名>`）。
+//! The libvpx test data distribution (`https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/`)
+//! ships an `.ivf.md5` alongside each `.ivf`, recording the MD5 of each output frame's I420
+//! data (the full Y plane, then the full U plane, then the full V plane, concatenated) —
+//! one line per frame, in standard `md5sum` format: `<32-char hex>  <filename>`.
 //!
-//! ここでは最初の出力フレーム（= 最初のキーフレーム）について、`decode_keyframe` の出力
-//! （表示サイズにクロップ済みの Y→U→V 連結バイト列）の MD5 が `.ivf.md5` の 1 行目と
-//! 完全一致することを検証する。ループフィルタ・クロップ・プレーン連結順・レンダーサイズの
-//! 解釈のいずれかが誤っていれば、この比較は確実に失敗する。
+//! Here we verify, for the first output frame (= the first key frame), that the MD5 of
+//! `decode_keyframe`'s output (the Y->U->V concatenated byte string, cropped to display size)
+//! exactly matches the first line of `.ivf.md5`. If the loop filter, cropping, plane
+//! concatenation order, or render size interpretation is wrong in any way, this comparison
+//! is guaranteed to fail.
 //!
-//! テストベクタ・MD5 ファイルは `tests/vectors/` にダウンロード済みであることを前提とする
-//! （`.gitignore` 対象。取得手順は README.md 参照）。存在しない場合は早期 return + `eprintln!`
-//! でスキップする。
+//! Assumes the test vectors and MD5 files have already been downloaded into `tests/vectors/`
+//! (excluded via `.gitignore`; see README.md for how to obtain them). If they're missing,
+//! skips via early return + `eprintln!`.
 
 use std::path::Path;
 
@@ -20,20 +21,20 @@ use vp9dec::ivf::IvfReader;
 use vp9dec::md5::{md5, to_hex};
 use vp9dec::{decode_keyframe, Decoder, Frame};
 
-/// `.ivf.md5` の 1 行目から MD5 16進文字列だけを取り出す。
-/// フォーマットは `md5sum` 互換: `<hex>␠␠<filename>`（区切りは 2 スペースまたはタブ）。
+/// Extracts just the MD5 hex string from the first line of an `.ivf.md5`.
+/// The format is `md5sum`-compatible: `<hex>␠␠<filename>` (separator is two spaces or a tab).
 fn first_line_md5(md5_file_contents: &str) -> &str {
     let first_line = md5_file_contents
         .lines()
         .next()
-        .expect(".ivf.md5 ファイルが空");
+        .expect(".ivf.md5 file is empty");
     first_line
         .split_whitespace()
         .next()
-        .expect(".ivf.md5 の1行目に空白区切りのフィールドがない")
+        .expect("first line of .ivf.md5 has no whitespace-separated fields")
 }
 
-/// `Frame` を I420 として Y→U→V の順に連結したバイト列（`.ivf.md5` が期待する並び）を返す。
+/// Returns the `Frame`'s I420 bytes concatenated in Y->U->V order (the layout expected by `.ivf.md5`).
 fn i420_bytes(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::with_capacity(frame.y.len() + frame.u.len() + frame.v.len());
     out.extend_from_slice(&frame.y);
@@ -51,8 +52,8 @@ fn check_vector(ivf_name: &str) {
 
     if !ivf_path.exists() || !md5_path.exists() {
         eprintln!(
-            "[skip] テストベクタまたは .ivf.md5 が見つからないためスキップします: {} / {}\n\
-             README.md の手順に従って事前にダウンロードしてください。",
+            "[skip] Test vector or .ivf.md5 not found, skipping: {} / {}\n\
+             Please download them beforehand following the instructions in README.md.",
             ivf_path.display(),
             md5_path.display()
         );
@@ -94,7 +95,7 @@ fn check_vector(ivf_name: &str) {
     assert_eq!(
         actual,
         expected,
-        "{}: 第1フレーム(キーフレーム)のMD5が公式値と不一致\n  actual:   {}\n  expected: {}\n\
+        "{}: MD5 of frame 1 (key frame) doesn't match the official value\n  actual:   {}\n  expected: {}\n\
          (frame: {}x{}, y.len={}, u.len={}, v.len={})",
         ivf_path.display(),
         actual,
@@ -106,7 +107,7 @@ fn check_vector(ivf_name: &str) {
         frame.v.len(),
     );
     eprintln!(
-        "[ok] {}: 第1フレームのMD5が公式値と完全一致 ({})",
+        "[ok] {}: MD5 of frame 1 exactly matches the official value ({})",
         ivf_path.display(),
         actual
     );
@@ -122,13 +123,15 @@ fn vp90_2_09_subpixel_00_first_keyframe_matches_official_md5() {
     check_vector("vp90-2-09-subpixel-00.ivf");
 }
 
-/// M3 後半: **全表示フレーム**について `.ivf.md5` の該当行と完全一致することを検証する
-/// （動き補償・確率適応・DPB・ループフィルタのフレーム間状態がすべて正しくないと通らない、
-/// キーフレーム単体の検証よりはるかに厳しいテスト）。
+/// M3 second half: verifies that **every displayed frame** exactly matches the corresponding
+/// line in `.ivf.md5` (this won't pass unless motion compensation, probability adaptation,
+/// the DPB, and the loop filter's cross-frame state are all correct — a far stricter test
+/// than verifying a single key frame).
 ///
-/// `.ivf.md5` は「1 行 = 1 出力（表示）フレーム」であり、[`Decoder::decode_frame`] が
-/// `Some(Frame)` を返すたびに 1 行ずつ消費して比較する（`show_frame == 0` の非表示フレームは
-/// `.ivf.md5` に対応する行を持たないため、`None` が返っても行を消費しない）。
+/// `.ivf.md5` has "1 line = 1 output (displayed) frame"; each time [`Decoder::decode_frame`]
+/// returns `Some(Frame)`, one line is consumed and compared (hidden frames with
+/// `show_frame == 0` have no corresponding line in `.ivf.md5`, so a `None` result doesn't
+/// consume a line).
 fn check_all_frames(ivf_name: &str) {
     let vectors_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -138,8 +141,8 @@ fn check_all_frames(ivf_name: &str) {
 
     if !ivf_path.exists() || !md5_path.exists() {
         eprintln!(
-            "[skip] テストベクタまたは .ivf.md5 が見つからないためスキップします: {} / {}\n\
-             README.md の手順に従って事前にダウンロードしてください。",
+            "[skip] Test vector or .ivf.md5 not found, skipping: {} / {}\n\
+             Please download them beforehand following the instructions in README.md.",
             ivf_path.display(),
             md5_path.display()
         );
@@ -155,7 +158,7 @@ fn check_all_frames(ivf_name: &str) {
         .map(|line| {
             line.split_whitespace()
                 .next()
-                .unwrap_or_else(|| panic!("{}: 空行がある", md5_path.display()))
+                .unwrap_or_else(|| panic!("{}: contains a blank line", md5_path.display()))
                 .to_ascii_lowercase()
         })
         .collect();
@@ -189,7 +192,7 @@ fn check_all_frames(ivf_name: &str) {
             let actual = to_hex(&md5(&actual_bytes));
             let expected = expected_lines.get(output_idx).unwrap_or_else(|| {
                 panic!(
-                    "{}: .ivf.md5 の行数({})を超える出力フレームが生成された（output_idx={output_idx}）",
+                    "{}: produced more output frames than .ivf.md5 has lines ({}) (output_idx={output_idx})",
                     ivf_path.display(),
                     expected_lines.len()
                 )
@@ -197,7 +200,7 @@ fn check_all_frames(ivf_name: &str) {
             if &actual != expected {
                 mismatches.push(output_idx);
                 eprintln!(
-                    "[NG] {}: output frame {output_idx} (ivf frame {ivf_frame_idx}) MD5 不一致\n  actual:   {actual}\n  expected: {expected}\n  ({}x{}, y.len={}, u.len={}, v.len={})",
+                    "[NG] {}: output frame {output_idx} (ivf frame {ivf_frame_idx}) MD5 mismatch\n  actual:   {actual}\n  expected: {expected}\n  ({}x{}, y.len={}, u.len={}, v.len={})",
                     ivf_path.display(),
                     decoded.width,
                     decoded.height,
@@ -205,8 +208,8 @@ fn check_all_frames(ivf_name: &str) {
                     decoded.u.len(),
                     decoded.v.len(),
                 );
-                // 最初の不一致だけ詳しく調べれば十分なので、以降は早期終了する
-                // （README「デバッグ指針」参照: まず何フレーム目まで合うかを見る）。
+                // Only the first mismatch needs close investigation, so stop early here
+                // (see README "Debugging notes": first check how many frames match).
                 break;
             }
             output_idx += 1;
@@ -215,7 +218,7 @@ fn check_all_frames(ivf_name: &str) {
 
     assert!(
         mismatches.is_empty(),
-        "{}: {output_idx} フレーム目までは一致、{}番目の出力フレームで不一致（全 {} 出力フレーム中）",
+        "{}: frames up to {output_idx} matched; mismatch at output frame {} (out of {} output frames total)",
         ivf_path.display(),
         mismatches[0],
         expected_lines.len()
@@ -223,11 +226,11 @@ fn check_all_frames(ivf_name: &str) {
     assert_eq!(
         output_idx,
         expected_lines.len(),
-        "{}: 出力フレーム数が .ivf.md5 の行数と一致しない(全フレーム比較できていない可能性)",
+        "{}: number of output frames doesn't match the number of lines in .ivf.md5 (not all frames may have been compared)",
         ivf_path.display()
     );
     eprintln!(
-        "[ok] {}: 全 {output_idx} 出力フレームが公式 MD5 と完全一致",
+        "[ok] {}: all {output_idx} output frames exactly match the official MD5",
         ivf_path.display()
     );
 }

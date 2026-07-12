@@ -1,34 +1,35 @@
-//! 参照フレームバッファ（DPB, Decoded Picture Buffer）管理（仕様 8.10 節
-//! "Reference frame update process" ＋ 8.9 節 "Output process" の `show_existing_frame` 分岐）。
+//! Decoded picture buffer (DPB) management (spec §8.10
+//! "Reference frame update process" + the `show_existing_frame` branch of §8.9 "Output process").
 //!
-//! 仕様の `FrameStore[ i ][ plane ]`/`RefFrameWidth[ i ]`/`RefFrameHeight[ i ]`/
-//! `RefSubsamplingX[ i ]`/`RefSubsamplingY[ i ]`/`RefBitDepth[ i ]` を 8 スロットぶん保持する。
-//! `FrameStore` は表示サイズ（`FrameWidth`/`FrameHeight`、クロマはサブサンプリング後）に
-//! クロップ済みのピクセルデータを保持する（仕様 8.10 節のコピー範囲が `x = 0..FrameWidth-1`
-//! 等になっていることに対応）。これにより、動き補償のクランプ処理（仕様 8.5.2.4 節の
-//! `lastX`/`lastY`）がプレーンの `width - 1`/`height - 1` とそのまま一致する。
+//! Holds 8 slots' worth of the spec's `FrameStore[ i ][ plane ]`/`RefFrameWidth[ i ]`/
+//! `RefFrameHeight[ i ]`/`RefSubsamplingX[ i ]`/`RefSubsamplingY[ i ]`/`RefBitDepth[ i ]`.
+//! `FrameStore` holds pixel data already cropped to the display size (`FrameWidth`/
+//! `FrameHeight`, chroma after subsampling); this matches the spec §8.10 copy range
+//! being `x = 0..FrameWidth-1` and so on. This makes the clamping used in motion
+//! compensation (spec §8.5.2.4's `lastX`/`lastY`) line up directly with the plane's
+//! `width - 1`/`height - 1`.
 
 use crate::framebuffer::Plane;
 use crate::prob_tables::NUM_REF_FRAMES;
 
-/// 1 スロットぶんの参照フレームデータ（仕様の `FrameStore[ i ]` + 付随するサイズ情報）。
+/// One slot's worth of reference frame data (the spec's `FrameStore[ i ]` + accompanying size info).
 #[derive(Debug, Clone)]
 pub struct RefFrameData {
-    /// `RefFrameWidth[ i ]`（輝度基準のフレーム幅）。
+    /// `RefFrameWidth[ i ]` (frame width, in luma terms).
     pub width: u32,
-    /// `RefFrameHeight[ i ]`。
+    /// `RefFrameHeight[ i ]`.
     pub height: u32,
     pub subsampling_x: u32,
     pub subsampling_y: u32,
     pub bit_depth: u8,
-    /// クロップ済み（`width x height`）の輝度プレーン。
+    /// Cropped (`width x height`) luma plane.
     pub y: Plane,
-    /// クロップ済み（`((width+subX)>>subX) x ((height+subY)>>subY)`）の色差プレーン。
+    /// Cropped (`((width+subX)>>subX) x ((height+subY)>>subY)`) chroma plane.
     pub u: Plane,
     pub v: Plane,
 }
 
-/// 8 スロットの DPB。
+/// The DPB, with 8 slots.
 #[derive(Debug, Clone)]
 pub struct Dpb {
     slots: [Option<RefFrameData>; NUM_REF_FRAMES],
@@ -51,8 +52,8 @@ impl Dpb {
         self.slots[idx as usize].as_ref()
     }
 
-    /// `Reference frame update process`（仕様 8.10 節）のステップ 1。
-    /// `refresh_frame_flags` のビットが立っているスロットすべてに `data` の複製を書き込む。
+    /// Step 1 of `Reference frame update process` (spec §8.10).
+    /// Writes a copy of `data` into every slot whose bit is set in `refresh_frame_flags`.
     pub fn update(&mut self, refresh_frame_flags: u8, data: &RefFrameData) {
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             if (refresh_frame_flags >> slot) & 1 == 1 {

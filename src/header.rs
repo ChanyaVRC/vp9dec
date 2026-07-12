@@ -1,18 +1,21 @@
-//! 非圧縮フレームヘッダ（`uncompressed_header`）のパース（仕様 6.2 節・7.2 節）。
+//! Parsing of the uncompressed frame header (`uncompressed_header`) (spec §6.2, §7.2).
 //!
-//! 非圧縮フレームヘッダは bool デコーダではなく、[`crate::bit_reader::BitReader`] による
-//! 素朴な MSB 優先のビット読み出し（`f(n)` / `s(n)` descriptor、仕様 9.1 節）でパースされる。
+//! The uncompressed frame header is not parsed by the bool decoder but by
+//! [`crate::bit_reader::BitReader`]'s plain MSB-first bit reading (`f(n)` /
+//! `s(n)` descriptors, spec §9.1).
 //!
-//! M1/M2 ではキーフレームのみサポートしていたが、M3 でインターフレーム・イントラオンリー
-//! フレームのパースにも対応した（仕様 6.2 節の `uncompressed_header()` 全体）。
-//! `frame_size_with_refs()`（仕様 6.2.5 節）は参照フレームスロットのサイズ
-//! （`RefFrameWidth`/`RefFrameHeight`）を必要とするため、[`parse_uncompressed_header`] は
-//! それを外部から渡してもらう設計にしている（呼び出し側がフレーム間状態を保持する）。
+//! M1/M2 only supported key frames, but M3 added support for parsing inter
+//! frames and intra-only frames as well (the entirety of `uncompressed_header()`
+//! in spec §6.2). Since `frame_size_with_refs()` (spec §6.2.5) requires the
+//! reference frame slot sizes (`RefFrameWidth`/`RefFrameHeight`),
+//! [`parse_uncompressed_header`] is designed to receive them from the caller
+//! (the caller holds the cross-frame state).
 
 use crate::bit_reader::BitReader;
-// `ref_frame`/`interpolation_filter` の値・参照フレームスロット数は複数モジュール
-// （tile.rs の動きベクトル予測・compressed_header.rs の frame_reference_mode など）から
-// 共通して使うため、`prob_tables` に一元定義してある。
+// The values of `ref_frame`/`interpolation_filter` and the number of reference
+// frame slots are shared across multiple modules (motion vector prediction in
+// tile.rs, frame_reference_mode in compressed_header.rs, etc.), so they are
+// defined once in `prob_tables`.
 pub use crate::prob_tables::{
     ALTREF_FRAME, BILINEAR, EIGHTTAP, EIGHTTAP_SHARP, EIGHTTAP_SMOOTH, GOLDEN_FRAME, INTRA_FRAME,
     LAST_FRAME, NUM_REF_FRAMES, SWITCHABLE,
@@ -20,7 +23,7 @@ pub use crate::prob_tables::{
 
 const LITERAL_TO_TYPE: [u8; 4] = [EIGHTTAP_SMOOTH, EIGHTTAP, EIGHTTAP_SHARP, BILINEAR];
 
-/// `frame_type` syntax element の値（仕様 7.2 節）。
+/// Value of the `frame_type` syntax element (spec §7.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
     /// frame_type == 0
@@ -29,7 +32,7 @@ pub enum FrameType {
     NonKeyFrame,
 }
 
-/// `color_space` の既知の値（仕様 7.2.2 節の表）。
+/// Known values of `color_space` (table in spec §7.2.2).
 pub const CS_UNKNOWN: u8 = 0;
 pub const CS_BT_601: u8 = 1;
 pub const CS_BT_709: u8 = 2;
@@ -39,33 +42,33 @@ pub const CS_BT_2020: u8 = 5;
 pub const CS_RESERVED: u8 = 6;
 pub const CS_RGB: u8 = 7;
 
-/// ヘッダパース時に発生し得るエラー。
+/// Errors that can occur while parsing the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderError {
-    /// `frame_marker` が仕様上必須の値 2 ではなかった。
+    /// `frame_marker` was not the spec-mandated value of 2.
     InvalidFrameMarker,
-    /// `frame_sync_code` が仕様上必須の 0x49 0x83 0x42 ではなかった。
+    /// `frame_sync_code` was not the spec-mandated 0x49 0x83 0x42.
     InvalidSyncCode,
-    /// `color_space == CS_RGB` かつ `profile_low_bit == 0`
-    /// （仕様の適合性要件違反。プロファイル 0 と 2 では RGB は使用できない）。
+    /// `color_space == CS_RGB` and `profile_low_bit == 0`
+    /// (violates a spec conformance requirement: RGB is not usable in profiles 0 and 2).
     InvalidColorConfigForProfile,
 }
 
-/// ループフィルタ関連パラメータ（仕様 6.2.8 節 `loop_filter_params`）。
+/// Loop-filter-related parameters (spec §6.2.8 `loop_filter_params`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopFilterParams {
     pub level: u8,
     pub sharpness: u8,
     pub delta_enabled: bool,
-    /// 参照フレーム種別ごとの調整値。インデックスは
-    /// `[INTRA_FRAME, LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME]` の順。
-    /// キーフレームでは `setup_past_independence()` により `[1, 0, -1, -1]` が初期値となる
-    /// （仕様 7.2 節）。
+    /// Adjustment value per reference frame type. Indexed in the order
+    /// `[INTRA_FRAME, LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME]`.
+    /// For key frames, `setup_past_independence()` initializes this to
+    /// `[1, 0, -1, -1]` (spec §7.2).
     pub ref_deltas: [i8; 4],
     pub mode_deltas: [i8; 2],
 }
 
-/// 量子化パラメータ（仕様 6.2.9 節 `quantization_params`）。
+/// Quantization parameters (spec §6.2.9 `quantization_params`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuantizationParams {
     pub base_q_idx: u8,
@@ -76,7 +79,7 @@ pub struct QuantizationParams {
     pub lossless: bool,
 }
 
-/// カラーコンフィグ（仕様 6.2.2 節 `color_config`）。
+/// Color config (spec §6.2.2 `color_config`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColorConfig {
     pub bit_depth: u8,
@@ -86,71 +89,80 @@ pub struct ColorConfig {
     pub subsampling_y: u8,
 }
 
-/// パース済みの非圧縮フレームヘッダ。
+/// A parsed uncompressed frame header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameHeader {
-    /// `show_existing_frame == 1`。新規デコードは行わず、指定インデックスのフレームを表示する。
+    /// `show_existing_frame == 1`. No new decode is performed; the frame at the given index is displayed.
     ShowExistingFrame { frame_to_show_map_idx: u8 },
-    /// 新規にデコードするフレーム（M1 では `frame_type == KEY_FRAME` のみ）。
+    /// A newly decoded frame (only `frame_type == KEY_FRAME` in M1).
     New(NewFrameHeader),
 }
 
-/// 新規デコードフレームの非圧縮ヘッダフィールド一式。
+/// The full set of uncompressed header fields for a newly decoded frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewFrameHeader {
     pub profile: u8,
     pub frame_type: FrameType,
     pub show_frame: bool,
     pub error_resilient_mode: bool,
-    /// `FrameIsIntra`。キーフレームでは常に真。非キーフレームでは `intra_only` と同じ値。
+    /// `FrameIsIntra`. Always true for key frames. For non-key frames, equal to `intra_only`.
     pub frame_is_intra: bool,
-    /// `intra_only`。`frame_type == NonKeyFrame` かつ `show_frame == 0` の場合のみ
-    /// ビットストリームから読まれる（それ以外は 0）。
+    /// `intra_only`. Read from the bitstream only when `frame_type == NonKeyFrame`
+    /// and `show_frame == 0` (otherwise 0).
     pub intra_only: bool,
-    /// `reset_frame_context`（仕様 7.2 節）。`error_resilient_mode == 1` の場合は常に 0。
+    /// `reset_frame_context` (spec §7.2). Always 0 when `error_resilient_mode == 1`.
     pub reset_frame_context: u8,
     pub color_config: ColorConfig,
     pub width: u32,
     pub height: u32,
     pub render_width: u32,
     pub render_height: u32,
-    /// 更新対象となる参照フレームスロットのビットマスク。キーフレームでは常に 0xFF。
+    /// Bitmask of reference frame slots to update. Always 0xFF for key frames.
     pub refresh_frame_flags: u8,
-    /// インター予測で参照するフレームスロット番号（`LAST_FRAME`/`GOLDEN_FRAME`/`ALTREF_FRAME`
-    /// の順）。`FrameIsIntra == 1` の場合は意味を持たない（`[0, 0, 0]`）。
+    /// Frame slot numbers referenced for inter prediction (in the order
+    /// `LAST_FRAME`/`GOLDEN_FRAME`/`ALTREF_FRAME`). Meaningless when
+    /// `FrameIsIntra == 1` (`[0, 0, 0]`).
     pub ref_frame_idx: [u8; 3],
-    /// `ref_frame_sign_bias[ i ]`。添字は `ref_frame` の値（`INTRA_FRAME`..`ALTREF_FRAME`、
-    /// つまり 0..3）と同じ意味論。`FrameIsIntra == 1` では常に `[false; 4]`
-    /// （`setup_past_independence()` による）。
+    /// `ref_frame_sign_bias[ i ]`. The index has the same semantics as the
+    /// `ref_frame` value (`INTRA_FRAME`..`ALTREF_FRAME`, i.e. 0..3). Always
+    /// `[false; 4]` when `FrameIsIntra == 1` (via `setup_past_independence()`).
     pub ref_frame_sign_bias: [bool; 4],
-    /// `allow_high_precision_mv`。`FrameIsIntra == 1` またはイントラオンリーフレームでは
-    /// 意味を持たない（`false`）。
+    /// `allow_high_precision_mv`. Meaningless (`false`) when `FrameIsIntra == 1`
+    /// or for intra-only frames.
     pub allow_high_precision_mv: bool,
-    /// `interpolation_filter`（`EIGHTTAP`..`SWITCHABLE` の値）。
+    /// `interpolation_filter` (a value in `EIGHTTAP`..`SWITCHABLE`).
     pub interpolation_filter: u8,
     pub refresh_frame_context: bool,
     pub frame_parallel_decoding_mode: bool,
+    /// `frame_context_idx` as it is used for `load_probs`/`save_probs` (spec §7.1.2):
+    /// the raw bitstream value, forced to 0 when `FrameIsIntra || error_resilient_mode`
+    /// (`setup_past_independence()`, spec §7.2).
     pub frame_context_idx: u8,
+    /// The raw `frame_context_idx` value as read from the bitstream, i.e. before
+    /// `setup_past_independence()` forces it to 0. Needed because `save_probs`
+    /// (spec §7.2, the `reset_frame_context == 2` case) targets this raw index,
+    /// not the forced one.
+    pub frame_context_idx_raw: u8,
     pub loop_filter: LoopFilterParams,
     pub quantization: QuantizationParams,
-    /// セグメンテーション機能が有効かどうか（詳細パラメータは M2 以降で扱う）。
-    pub segmentation_enabled: bool,
+    pub segmentation: SegmentationParams,
     pub tile_cols_log2: u32,
     pub tile_rows_log2: u32,
-    /// 圧縮ヘッダ（`compressed_header`）のバイト数。この直後から
-    /// `init_bool(header_size_in_bytes)` で bool デコーダを開始する。
+    /// Size in bytes of the compressed header (`compressed_header`). The bool
+    /// decoder starts right after this via `init_bool(header_size_in_bytes)`.
     pub header_size_in_bytes: u16,
 }
 
 const MAX_TILE_WIDTH_B64: u32 = 64;
 const MIN_TILE_WIDTH_B64: u32 = 4;
 
-/// タイル分割数計算に必要な、フレームサイズから導出される値
-/// （仕様 6.2.6 節 `compute_image_size`）。
+/// Values derived from the frame size, needed for computing the tile
+/// partition count (spec §6.2.6 `compute_image_size`).
 ///
-/// `mi_cols`/`mi_rows` は 8x8 単位（mode info 単位）でのフレーム幅・高さ、
-/// `sb64_cols`/`sb64_rows` は 64x64 単位（スーパーブロック単位）でのフレーム幅・高さ。
-/// タイル・スーパーブロック走査（`src/tile.rs`）でも使用するため `pub(crate)` にしている。
+/// `mi_cols`/`mi_rows` are the frame width/height in 8x8 units (mode info
+/// units); `sb64_cols`/`sb64_rows` are the frame width/height in 64x64 units
+/// (superblock units). Made `pub(crate)` since it is also used for tile and
+/// superblock traversal (`src/tile.rs`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ImageSize {
     pub(crate) mi_cols: u32,
@@ -172,7 +184,7 @@ pub(crate) fn compute_image_size(width: u32, height: u32) -> ImageSize {
     }
 }
 
-/// `calc_min_log2_tile_cols()`（仕様 6.2.14 節）。
+/// `calc_min_log2_tile_cols()` (spec §6.2.14).
 fn calc_min_log2_tile_cols(sb64_cols: u32) -> u32 {
     let mut min_log2 = 0u32;
     while (MAX_TILE_WIDTH_B64 << min_log2) < sb64_cols {
@@ -181,7 +193,7 @@ fn calc_min_log2_tile_cols(sb64_cols: u32) -> u32 {
     min_log2
 }
 
-/// `calc_max_log2_tile_cols()`（仕様 6.2.14 節）。
+/// `calc_max_log2_tile_cols()` (spec §6.2.14).
 fn calc_max_log2_tile_cols(sb64_cols: u32) -> u32 {
     let mut max_log2 = 1u32;
     while (sb64_cols >> max_log2) >= MIN_TILE_WIDTH_B64 {
@@ -190,7 +202,7 @@ fn calc_max_log2_tile_cols(sb64_cols: u32) -> u32 {
     max_log2 - 1
 }
 
-/// `read_prob()`（仕様 6.2.12 節）。
+/// `read_prob()` (spec §6.2.12).
 fn read_prob(r: &mut BitReader) -> u8 {
     if r.flag() {
         r.f(8) as u8
@@ -199,7 +211,7 @@ fn read_prob(r: &mut BitReader) -> u8 {
     }
 }
 
-/// `read_delta_q()`（仕様 6.2.10 節）。
+/// `read_delta_q()` (spec §6.2.10).
 fn read_delta_q(r: &mut BitReader) -> i32 {
     if r.flag() {
         r.s(4)
@@ -208,7 +220,7 @@ fn read_delta_q(r: &mut BitReader) -> i32 {
     }
 }
 
-/// `color_config()`（仕様 6.2.2 節）。
+/// `color_config()` (spec §6.2.2).
 fn parse_color_config(r: &mut BitReader, profile: u8) -> Result<ColorConfig, HeaderError> {
     let bit_depth = if profile >= 2 {
         if r.flag() {
@@ -222,7 +234,7 @@ fn parse_color_config(r: &mut BitReader, profile: u8) -> Result<ColorConfig, Hea
 
     let color_space = r.f(3) as u8;
 
-    // 仕様適合性要件: profile_low_bit == 0 (Profile 0 or 2) のとき CS_RGB は使用できない。
+    // Spec conformance requirement: CS_RGB is not usable when profile_low_bit == 0 (Profile 0 or 2).
     if color_space == CS_RGB && profile & 1 == 0 {
         return Err(HeaderError::InvalidColorConfigForProfile);
     }
@@ -254,14 +266,14 @@ fn parse_color_config(r: &mut BitReader, profile: u8) -> Result<ColorConfig, Hea
     })
 }
 
-/// `frame_size()` + `compute_image_size()`（仕様 6.2.3 節・6.2.6 節）。
+/// `frame_size()` + `compute_image_size()` (spec §6.2.3, §6.2.6).
 fn parse_frame_size(r: &mut BitReader) -> (u32, u32) {
     let frame_width_minus_1 = r.f(16);
     let frame_height_minus_1 = r.f(16);
     (frame_width_minus_1 + 1, frame_height_minus_1 + 1)
 }
 
-/// `render_size()`（仕様 6.2.4 節）。
+/// `render_size()` (spec §6.2.4).
 fn parse_render_size(r: &mut BitReader, width: u32, height: u32) -> (u32, u32) {
     if r.flag() {
         let render_width_minus_1 = r.f(16);
@@ -272,10 +284,10 @@ fn parse_render_size(r: &mut BitReader, width: u32, height: u32) -> (u32, u32) {
     }
 }
 
-/// `frame_size_with_refs()`（仕様 6.2.5 節）。`ref_frame_idx` が指すスロットのいずれかで
-/// `found_ref == 1` になれば、そのスロットのサイズ（`ref_frame_sizes` として外部から渡す）を
-/// そのまま `FrameWidth`/`FrameHeight` として採用する。どれも見つからなければ `frame_size()`
-/// を読む。
+/// `frame_size_with_refs()` (spec §6.2.5). If `found_ref == 1` for any of the
+/// slots pointed to by `ref_frame_idx`, that slot's size (passed in externally
+/// as `ref_frame_sizes`) is used directly as `FrameWidth`/`FrameHeight`. If
+/// none is found, `frame_size()` is read instead.
 fn parse_frame_size_with_refs(
     r: &mut BitReader,
     ref_frame_idx: [u8; 3],
@@ -292,7 +304,7 @@ fn parse_frame_size_with_refs(
     found.unwrap_or_else(|| parse_frame_size(r))
 }
 
-/// `read_interpolation_filter()`（仕様 6.2.7 節）。
+/// `read_interpolation_filter()` (spec §6.2.7).
 fn parse_interpolation_filter(r: &mut BitReader) -> u8 {
     let is_filter_switchable = r.flag();
     if is_filter_switchable {
@@ -303,15 +315,16 @@ fn parse_interpolation_filter(r: &mut BitReader) -> u8 {
     }
 }
 
-/// `setup_past_independence()` によるループフィルタデルタの初期値（仕様 7.2 節）。
+/// Initial loop filter delta values set by `setup_past_independence()` (spec §7.2).
 pub const DEFAULT_LOOP_FILTER_REF_DELTAS: [i8; 4] = [1, 0, -1, -1];
 pub const DEFAULT_LOOP_FILTER_MODE_DELTAS: [i8; 2] = [0, 0];
 
-/// `loop_filter_params()`（仕様 6.2.8 節）。
+/// `loop_filter_params()` (spec §6.2.8).
 ///
-/// `ref_deltas`/`mode_deltas` は仕様上フレーム間で持続する状態（`setup_past_independence()`
-/// が呼ばれた場合のみデフォルト値にリセットされる）。呼び出し側（[`parse_uncompressed_header`]）
-/// が `reset` フラグ（`FrameIsIntra || error_resilient_mode`）と直前フレームの値を渡す。
+/// `ref_deltas`/`mode_deltas` are, per the spec, state that persists across
+/// frames (reset to default values only when `setup_past_independence()` is
+/// called). The caller ([`parse_uncompressed_header`]) passes in the `reset`
+/// flag (`FrameIsIntra || error_resilient_mode`) and the previous frame's values.
 fn parse_loop_filter_params(
     r: &mut BitReader,
     reset: bool,
@@ -355,7 +368,7 @@ fn parse_loop_filter_params(
     }
 }
 
-/// `quantization_params()`（仕様 6.2.9 節）。
+/// `quantization_params()` (spec §6.2.9).
 fn parse_quantization_params(r: &mut BitReader) -> QuantizationParams {
     let base_q_idx = r.f(8) as u8;
     let delta_q_y_dc = read_delta_q(r);
@@ -372,59 +385,135 @@ fn parse_quantization_params(r: &mut BitReader) -> QuantizationParams {
     }
 }
 
-const SEG_LVL_MAX: usize = 4;
-const MAX_SEGMENTS: usize = 8;
+/// Segment feature level indices (`SEG_LVL_*`, spec §6.2.11 / §6.4.9 `seg_feature_active`).
+pub const SEG_LVL_ALT_Q: usize = 0;
+pub const SEG_LVL_ALT_L: usize = 1;
+pub const SEG_LVL_REF_FRAME: usize = 2;
+pub const SEG_LVL_SKIP: usize = 3;
+pub const SEG_LVL_MAX: usize = 4;
+pub const MAX_SEGMENTS: usize = 8;
 const SEGMENTATION_FEATURE_BITS: [u32; SEG_LVL_MAX] = [8, 6, 2, 0];
 const SEGMENTATION_FEATURE_SIGNED: [bool; SEG_LVL_MAX] = [true, true, false, false];
 
-/// `segmentation_params()`（仕様 6.2.11 節）。
+/// `FeatureEnabled[8][4]` (bool) / `FeatureData[8][4]` (i32) type aliases, shared
+/// between [`SegmentationParams`] and the `prev_features` state threaded across
+/// frames the same way `prev_loop_filter_deltas` is (see [`parse_uncompressed_header`]).
+pub type SegFeatureEnabled = [[bool; SEG_LVL_MAX]; MAX_SEGMENTS];
+pub type SegFeatureData = [[i32; SEG_LVL_MAX]; MAX_SEGMENTS];
+
+/// Segmentation parameters (spec §6.2.11 `segmentation_params`).
 ///
-/// M1 では `segmentation_enabled` の有無のみを [`NewFrameHeader`] に保持するが、
-/// 後続の `tile_info()` / `header_size_in_bytes` を正しい位置から読むために、
-/// セグメンテーションのペイロード全体をビット単位で正しく読み進める。
-fn parse_segmentation_params(r: &mut BitReader) -> bool {
-    let segmentation_enabled = r.flag();
-    if !segmentation_enabled {
-        return false;
-    }
-
-    let segmentation_update_map = r.flag();
-    if segmentation_update_map {
-        for _ in 0..7 {
-            let _segmentation_tree_prob = read_prob(r);
-        }
-        let segmentation_temporal_update = r.flag();
-        for _ in 0..3 {
-            if segmentation_temporal_update {
-                let _segmentation_pred_prob = read_prob(r);
-            }
-            // temporal_update == 0 の場合、prob = 255 でビットは消費しない。
-        }
-    }
-
-    let segmentation_update_data = r.flag();
-    if segmentation_update_data {
-        let _segmentation_abs_or_delta_update = r.flag();
-        for _segment in 0..MAX_SEGMENTS {
-            for level in 0..SEG_LVL_MAX {
-                let feature_enabled = r.flag();
-                if feature_enabled {
-                    let bits_to_read = SEGMENTATION_FEATURE_BITS[level];
-                    if bits_to_read > 0 {
-                        let _feature_value = r.f(bits_to_read);
-                    }
-                    if SEGMENTATION_FEATURE_SIGNED[level] {
-                        let _feature_sign = r.f(1);
-                    }
-                }
-            }
-        }
-    }
-
-    true
+/// Per spec §7.2.10, `feature_enabled`/`feature_data`/`abs_or_delta_update` are
+/// state that persists across frames when not re-signaled in the bitstream
+/// (`segmentation_update_data == 0`), reset to all-zero/false only by
+/// `setup_past_independence()` (spec §7.2, `FrameIsIntra || error_resilient_mode`) —
+/// the same persistence pattern as `LoopFilterParams::ref_deltas`/`mode_deltas`.
+/// `tree_probs`/`pred_prob` need no such persistence: they are only read (and
+/// only meaningful) within the same frame that has `update_map`/`temporal_update`
+/// set, so they carry no state across frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentationParams {
+    pub enabled: bool,
+    /// `segmentation_update_map`. Only meaningful when `enabled`.
+    pub update_map: bool,
+    /// `segmentation_tree_probs[7]`. Only meaningful when `update_map`.
+    pub tree_probs: [u8; 7],
+    /// `segmentation_pred_prob[3]`. Only meaningful when `update_map && temporal_update`.
+    pub pred_prob: [u8; 3],
+    /// `segmentation_temporal_update`. Only meaningful when `update_map`.
+    pub temporal_update: bool,
+    pub abs_or_delta_update: bool,
+    /// `FeatureEnabled[ segment ][ level ]`, `level` indexed by `SEG_LVL_*`.
+    pub feature_enabled: SegFeatureEnabled,
+    /// `FeatureData[ segment ][ level ]`.
+    pub feature_data: SegFeatureData,
 }
 
-/// `tile_info()`（仕様 6.2.13 節）。戻り値は `(tile_cols_log2, tile_rows_log2)`。
+/// `segmentation_params()` (spec §6.2.11). `reset`/`prev_features` mirror
+/// [`parse_loop_filter_params`]'s `reset`/`prev_deltas`: `reset` is
+/// `FrameIsIntra || error_resilient_mode` (the `setup_past_independence()`
+/// condition, spec §7.2), under which `feature_enabled`/`feature_data`/
+/// `abs_or_delta_update` start from all-zero/false instead of the previous frame's values.
+fn parse_segmentation_params(
+    r: &mut BitReader,
+    reset: bool,
+    prev_features: (SegFeatureEnabled, SegFeatureData, bool),
+) -> SegmentationParams {
+    let enabled = r.flag();
+    let (mut feature_enabled, mut feature_data, mut abs_or_delta_update) = if reset {
+        (
+            [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+            [[0i32; SEG_LVL_MAX]; MAX_SEGMENTS],
+            false,
+        )
+    } else {
+        prev_features
+    };
+
+    if !enabled {
+        return SegmentationParams {
+            enabled: false,
+            update_map: false,
+            tree_probs: [255; 7],
+            pred_prob: [255; 3],
+            temporal_update: false,
+            abs_or_delta_update,
+            feature_enabled,
+            feature_data,
+        };
+    }
+
+    let update_map = r.flag();
+    let mut tree_probs = [255u8; 7];
+    let mut pred_prob = [255u8; 3];
+    let mut temporal_update = false;
+    if update_map {
+        for p in tree_probs.iter_mut() {
+            *p = read_prob(r);
+        }
+        temporal_update = r.flag();
+        for p in pred_prob.iter_mut() {
+            // When temporal_update == 0, prob = 255 and no bit is consumed.
+            *p = if temporal_update { read_prob(r) } else { 255 };
+        }
+    }
+
+    let update_data = r.flag();
+    if update_data {
+        abs_or_delta_update = r.flag();
+        for seg in feature_enabled.iter_mut().zip(feature_data.iter_mut()) {
+            let (seg_enabled, seg_data) = seg;
+            for level in 0..SEG_LVL_MAX {
+                let enabled_bit = r.flag();
+                seg_enabled[level] = enabled_bit;
+                let mut feature_value = 0i32;
+                if enabled_bit {
+                    let bits_to_read = SEGMENTATION_FEATURE_BITS[level];
+                    if bits_to_read > 0 {
+                        feature_value = r.f(bits_to_read) as i32;
+                    }
+                    if SEGMENTATION_FEATURE_SIGNED[level] && r.flag() {
+                        feature_value = -feature_value;
+                    }
+                }
+                seg_data[level] = feature_value;
+            }
+        }
+    }
+
+    SegmentationParams {
+        enabled,
+        update_map,
+        tree_probs,
+        pred_prob,
+        temporal_update,
+        abs_or_delta_update,
+        feature_enabled,
+        feature_data,
+    }
+}
+
+/// `tile_info()` (spec §6.2.13). Returns `(tile_cols_log2, tile_rows_log2)`.
 fn parse_tile_info(r: &mut BitReader, sb64_cols: u32) -> (u32, u32) {
     let min_log2_tile_cols = calc_min_log2_tile_cols(sb64_cols);
     let max_log2_tile_cols = calc_max_log2_tile_cols(sb64_cols);
@@ -447,17 +536,24 @@ fn parse_tile_info(r: &mut BitReader, sb64_cols: u32) -> (u32, u32) {
     (tile_cols_log2, tile_rows_log2)
 }
 
-/// `uncompressed_header()`（仕様 6.2 節）をパースする。
+/// Parses `uncompressed_header()` (spec §6.2).
 ///
-/// `ref_frame_sizes` は `frame_size_with_refs()`（仕様 6.2.5 節）が参照する
-/// `RefFrameWidth`/`RefFrameHeight` 相当のスロット別サイズ表。キーフレーム・イントラオンリー
-/// フレームでは参照されない（呼び出し側はダミー値を渡してよい）。
+/// `ref_frame_sizes` is the per-slot size table equivalent to
+/// `RefFrameWidth`/`RefFrameHeight`, referenced by `frame_size_with_refs()`
+/// (spec §6.2.5). Not referenced for key frames or intra-only frames (the
+/// caller may pass dummy values).
 ///
-/// 戻り値はパース結果と、`trailing_bits()` によるバイト境界揃えまで含めた消費バイト数の組。
+/// Returns a pair of the parse result and the number of bytes consumed,
+/// including byte-boundary alignment via `trailing_bits()`.
+///
+/// `prev_segmentation_features` is the `(FeatureEnabled, FeatureData,
+/// segmentation_abs_or_delta_update)` state that persists across frames per
+/// spec §7.2.10, analogous to `prev_loop_filter_deltas`.
 pub fn parse_uncompressed_header(
     data: &[u8],
     ref_frame_sizes: &[(u32, u32); NUM_REF_FRAMES],
     prev_loop_filter_deltas: ([i8; 4], [i8; 2]),
+    prev_segmentation_features: (SegFeatureEnabled, SegFeatureData, bool),
 ) -> Result<(FrameHeader, usize), HeaderError> {
     let mut r = BitReader::new(data);
 
@@ -516,7 +612,7 @@ pub fn parse_uncompressed_header(
         height = h;
         render_width = rw;
         render_height = rh;
-        // refresh_frame_flags はビットストリームからは読まず、キーフレームでは常に 0xFF。
+        // refresh_frame_flags is not read from the bitstream and is always 0xFF for key frames.
         refresh_frame_flags = 0xFFu8;
         frame_is_intra = true;
     } else {
@@ -566,10 +662,11 @@ pub fn parse_uncompressed_header(
             render_height = rh;
             allow_high_precision_mv = r.flag();
             interpolation_filter = parse_interpolation_filter(&mut r);
-            // プロファイル・ビット深度・カラースペースはインターフレームのビットストリーム
-            // からは読まれない（参照フレームと一致することが要件、仕様 7.2 節）。この
-            // デコーダは複数フレームにまたがるカラーコンフィグの引き継ぎをまだ保持していない
-            // ため、`decode_keyframe`/`Decoder` 側で直前のキーフレームの値を使い回す。
+            // Profile, bit depth, and color space are not read from an inter
+            // frame's bitstream (they are required to match the reference
+            // frame, spec §7.2). This decoder does not yet carry color config
+            // state across frames, so `decode_keyframe`/`Decoder` reuses the
+            // value from the preceding key frame instead.
             color_config = ColorConfig {
                 bit_depth: 8,
                 color_space: CS_UNKNOWN,
@@ -586,20 +683,21 @@ pub fn parse_uncompressed_header(
         (false, true)
     };
     let frame_context_idx_raw = r.f(2) as u8;
-    // FrameIsIntra || error_resilient_mode の場合 setup_past_independence() が呼ばれ、
-    // 仕様上 frame_context_idx はここで 0 にリセットされる。
+    // When FrameIsIntra || error_resilient_mode, setup_past_independence() is
+    // called, and per the spec frame_context_idx is reset to 0 here.
     let frame_context_idx = if frame_is_intra || error_resilient_mode {
         0
     } else {
         frame_context_idx_raw
     };
 
-    // setup_past_independence(): FrameIsIntra || error_resilient_mode でループフィルタ
-    // デルタもデフォルト値にリセットされる（frame_context のリセット条件と同じ）。
+    // setup_past_independence(): when FrameIsIntra || error_resilient_mode, the
+    // loop filter deltas and segmentation feature data are also reset to their
+    // default values (same condition as the frame_context reset).
     let lf_reset = frame_is_intra || error_resilient_mode;
     let loop_filter = parse_loop_filter_params(&mut r, lf_reset, prev_loop_filter_deltas);
     let quantization = parse_quantization_params(&mut r);
-    let segmentation_enabled = parse_segmentation_params(&mut r);
+    let segmentation = parse_segmentation_params(&mut r, lf_reset, prev_segmentation_features);
 
     let image_size = compute_image_size(width, height);
     let (tile_cols_log2, tile_rows_log2) = parse_tile_info(&mut r, image_size.sb64_cols);
@@ -630,9 +728,10 @@ pub fn parse_uncompressed_header(
             refresh_frame_context,
             frame_parallel_decoding_mode,
             frame_context_idx,
+            frame_context_idx_raw,
             loop_filter,
             quantization,
-            segmentation_enabled,
+            segmentation,
             tile_cols_log2,
             tile_rows_log2,
             header_size_in_bytes,
@@ -645,7 +744,7 @@ pub fn parse_uncompressed_header(
 mod tests {
     use super::*;
 
-    /// テスト用の MSB 優先ビットライター。手組みのビットストリームを組み立てるために使う。
+    /// An MSB-first bit writer for tests. Used to hand-build bitstreams.
     struct BitWriter {
         bytes: Vec<u8>,
         cur: u8,
@@ -678,7 +777,7 @@ mod tests {
             self.push_bits(value as u32, 1);
         }
 
-        /// s(n): 絶対値 n ビット + 符号 1 ビット。
+        /// s(n): n bits absolute value + 1 bit sign.
         fn push_signed(&mut self, value: i32, n: u32) {
             self.push_bits(value.unsigned_abs(), n);
             self.push_flag(value < 0);
@@ -698,8 +797,8 @@ mod tests {
         }
     }
 
-    /// 最小構成のキーフレーム非圧縮ヘッダを組み立てる。
-    /// profile=0, 8x8, ロスレス, セグメンテーション無効, タイル分割なし。
+    /// Builds a minimal key frame uncompressed header.
+    /// profile=0, 8x8, lossless, segmentation disabled, no tile split.
     fn build_minimal_keyframe_header() -> Vec<u8> {
         let mut w = BitWriter::new();
         w.push_bits(2, 2); // frame_marker
@@ -712,10 +811,10 @@ mod tests {
         w.push_bits(0x49, 8);
         w.push_bits(0x83, 8);
         w.push_bits(0x42, 8);
-        // color_config (profile 0 -> bit_depth=8 は読まない)
+        // color_config (profile 0 -> bit_depth=8 is not read)
         w.push_bits(CS_UNKNOWN as u32, 3); // color_space
         w.push_flag(false); // color_range
-                            // profile 0 -> subsampling は読まない
+                            // profile 0 -> subsampling is not read
                             // frame_size
         w.push_bits(7, 16); // frame_width_minus_1 -> width=8
         w.push_bits(7, 16); // frame_height_minus_1 -> height=8
@@ -729,14 +828,14 @@ mod tests {
         w.push_bits(0, 6); // loop_filter_level
         w.push_bits(0, 3); // loop_filter_sharpness
         w.push_flag(false); // loop_filter_delta_enabled
-                            // quantization_params (すべて 0 -> lossless)
+                            // quantization_params (all 0 -> lossless)
         w.push_bits(0, 8); // base_q_idx
         w.push_flag(false); // delta_q_y_dc coded?
         w.push_flag(false); // delta_q_uv_dc coded?
         w.push_flag(false); // delta_q_uv_ac coded?
                             // segmentation_params
         w.push_flag(false); // segmentation_enabled
-                            // tile_info: width=8 -> MiCols=1, Sb64Cols=1 -> min_log2=0, max_log2=0 -> ループ回らず
+                            // tile_info: width=8 -> MiCols=1, Sb64Cols=1 -> min_log2=0, max_log2=0 -> loop does not run
         w.push_bits(0, 1); // tile_rows_log2 = 0
                            // header_size_in_bytes
         w.push_bits(1, 16);
@@ -744,18 +843,25 @@ mod tests {
         w.finish()
     }
 
-    /// テストで参照フレームサイズが不要な場合に使うダミー値。
+    /// Dummy value used in tests where a reference frame size is not needed.
     const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
     const NO_LF_DELTAS: ([i8; 4], [i8; 2]) = (
         DEFAULT_LOOP_FILTER_REF_DELTAS,
         DEFAULT_LOOP_FILTER_MODE_DELTAS,
+    );
+    /// Dummy value used in tests: no persisted segmentation feature state (as if
+    /// `setup_past_independence()` had just run).
+    const NO_SEG_FEATURES: (SegFeatureEnabled, SegFeatureData, bool) = (
+        [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+        [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
+        false,
     );
 
     #[test]
     fn parses_minimal_keyframe_header() {
         let data = build_minimal_keyframe_header();
         let (header, _consumed) =
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS).expect("should parse");
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert_eq!(f.profile, 0);
@@ -772,7 +878,7 @@ mod tests {
                 assert_eq!(f.render_height, 8);
                 assert_eq!(f.refresh_frame_flags, 0xFF);
                 assert!(f.quantization.lossless);
-                assert!(!f.segmentation_enabled);
+                assert!(!f.segmentation.enabled);
                 assert_eq!(f.tile_cols_log2, 0);
                 assert_eq!(f.tile_rows_log2, 0);
                 assert_eq!(f.header_size_in_bytes, 1);
@@ -789,7 +895,7 @@ mod tests {
         w.push_bits(0, 30);
         let data = w.finish();
         assert_eq!(
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS),
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES),
             Err(HeaderError::InvalidFrameMarker)
         );
     }
@@ -804,18 +910,18 @@ mod tests {
         w.push_bits(0, 1); // KEY_FRAME
         w.push_flag(true);
         w.push_flag(false);
-        w.push_bits(0x00, 8); // 不正な sync byte
+        w.push_bits(0x00, 8); // invalid sync byte
         w.push_bits(0x00, 8);
         w.push_bits(0x00, 8);
         let data = w.finish();
         assert_eq!(
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS),
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES),
             Err(HeaderError::InvalidSyncCode)
         );
     }
 
-    /// 最小構成のインター（非イントラオンリー）フレーム非圧縮ヘッダを組み立てる。
-    /// profile=0, error_resilient_mode=0, 単一参照, SWITCHABLE でないフィルタ。
+    /// Builds a minimal inter (non-intra-only) frame uncompressed header.
+    /// profile=0, error_resilient_mode=0, single reference, non-SWITCHABLE filter.
     fn build_minimal_inter_frame_header() -> Vec<u8> {
         let mut w = BitWriter::new();
         w.push_bits(2, 2); // frame_marker
@@ -823,9 +929,9 @@ mod tests {
         w.push_bits(0, 1); // profile_high_bit -> profile=0
         w.push_flag(false); // show_existing_frame
         w.push_bits(1, 1); // frame_type = NON_KEY_FRAME
-        w.push_flag(true); // show_frame = 1 -> intra_only は読まれない (0)
+        w.push_flag(true); // show_frame = 1 -> intra_only is not read (0)
         w.push_flag(false); // error_resilient_mode
-                            // reset_frame_context (error_resilient_mode==0 のため f(2) を読む)
+                            // reset_frame_context (f(2) is read since error_resilient_mode==0)
         w.push_bits(0, 2);
         // refresh_frame_flags
         w.push_bits(0x01, 8);
@@ -834,13 +940,13 @@ mod tests {
             w.push_bits(0, 3); // ref_frame_idx = 0
             w.push_flag(false); // sign_bias
         }
-        // frame_size_with_refs: found_ref=1 (最初のスロット) -> ref_frame_sizes[0] を使う
+        // frame_size_with_refs: found_ref=1 (first slot) -> uses ref_frame_sizes[0]
         w.push_flag(true);
         // render_size
         w.push_flag(false);
         // allow_high_precision_mv
         w.push_flag(false);
-        // read_interpolation_filter: is_filter_switchable=0, raw=0(EIGHTTAP_SMOOTH経由)
+        // read_interpolation_filter: is_filter_switchable=0, raw=0 (via EIGHTTAP_SMOOTH)
         w.push_flag(false);
         w.push_bits(0, 2);
         // error_resilient_mode==0 -> refresh_frame_context, frame_parallel_decoding_mode
@@ -858,7 +964,7 @@ mod tests {
         w.push_flag(false);
         // segmentation
         w.push_flag(false);
-        // tile_info: width=8 -> ループなし
+        // tile_info: width=8 -> no loop
         w.push_bits(0, 1);
         // header_size_in_bytes
         w.push_bits(3, 16);
@@ -872,13 +978,13 @@ mod tests {
         let mut ref_sizes = NO_REF_SIZES;
         ref_sizes[0] = (8, 8);
         let (header, _consumed) =
-            parse_uncompressed_header(&data, &ref_sizes, NO_LF_DELTAS).expect("should parse");
+            parse_uncompressed_header(&data, &ref_sizes, NO_LF_DELTAS, NO_SEG_FEATURES).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert_eq!(f.frame_type, FrameType::NonKeyFrame);
                 assert!(!f.frame_is_intra);
                 assert!(!f.intra_only);
-                // frame_size_with_refs で found_ref=1 のスロット 0 のサイズを継承する。
+                // frame_size_with_refs inherits the size of slot 0, where found_ref=1.
                 assert_eq!(f.width, 8);
                 assert_eq!(f.height, 8);
                 assert_eq!(f.refresh_frame_flags, 0x01);
@@ -886,8 +992,8 @@ mod tests {
                 assert!(!f.allow_high_precision_mv);
                 assert_eq!(f.interpolation_filter, EIGHTTAP_SMOOTH);
                 assert_eq!(f.header_size_in_bytes, 3);
-                // 非エラーレジリエント・非イントラなので frame_context_idx はビット
-                // ストリームの生値のまま保持される。
+                // Since this is non-error-resilient and non-intra, frame_context_idx
+                // retains the raw bitstream value.
                 assert_eq!(f.frame_context_idx, 0);
             }
             FrameHeader::ShowExistingFrame { .. } => panic!("unexpected"),
@@ -905,7 +1011,7 @@ mod tests {
         let data = w.finish();
 
         let (header, consumed) =
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS).expect("should parse");
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES).expect("should parse");
         assert_eq!(
             header,
             FrameHeader::ShowExistingFrame {
@@ -933,7 +1039,7 @@ mod tests {
         w.push_bits(15, 16); // width = 16
         w.push_bits(15, 16); // height = 16
         w.push_flag(false); // render_size same as frame
-                            // error_resilient_mode == 1 -> refresh_frame_context/frame_parallel_decoding_mode は読まない
+                            // error_resilient_mode == 1 -> refresh_frame_context/frame_parallel_decoding_mode are not read
         w.push_bits(0, 2); // frame_context_idx
                            // loop_filter_params
         w.push_bits(10, 6); // level
@@ -952,19 +1058,19 @@ mod tests {
         w.push_signed(-1, 6);
         w.push_flag(false);
         // quantization_params
-        w.push_bits(20, 8); // base_q_idx (lossless ではない)
+        w.push_bits(20, 8); // base_q_idx (not lossless)
         w.push_flag(false);
         w.push_flag(false);
         w.push_flag(false);
         // segmentation
         w.push_flag(false);
-        // tile_info: width=16 -> MiCols=2, Sb64Cols=1 -> 同上でループなし
+        // tile_info: width=16 -> MiCols=2, Sb64Cols=1 -> same as above, no loop
         w.push_bits(0, 1);
         w.push_bits(42, 16); // header_size_in_bytes
 
         let data = w.finish();
         let (header, _) =
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS).expect("should parse");
+            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert!(f.error_resilient_mode);
@@ -979,5 +1085,101 @@ mod tests {
             }
             FrameHeader::ShowExistingFrame { .. } => panic!("unexpected"),
         }
+    }
+
+    /// `segmentation_params()` round-trip: `update_map`/`temporal_update`/`update_data` all
+    /// set, with one feature exercised per `SEG_LVL_*` (signed negative, signed positive,
+    /// unsigned, and the zero-bit `SEG_LVL_SKIP` case).
+    #[test]
+    fn segmentation_params_round_trip_reads_full_payload() {
+        let mut w = BitWriter::new();
+        w.push_flag(true); // segmentation_enabled
+        w.push_flag(true); // segmentation_update_map
+        for _ in 0..7 {
+            w.push_flag(true); // read_prob: coded
+            w.push_bits(200, 8); // segmentation_tree_probs[i] = 200
+        }
+        w.push_flag(true); // segmentation_temporal_update
+        for _ in 0..3 {
+            w.push_flag(true);
+            w.push_bits(180, 8); // segmentation_pred_prob[i] = 180
+        }
+        w.push_flag(true); // segmentation_update_data
+        w.push_flag(false); // segmentation_abs_or_delta_update = 0 (delta)
+        for seg in 0..MAX_SEGMENTS {
+            for level in 0..SEG_LVL_MAX {
+                if seg == 2 && level == SEG_LVL_ALT_Q {
+                    w.push_flag(true); // feature_enabled
+                    w.push_bits(50, 8);
+                    w.push_flag(true); // feature_sign: negative -> -50
+                } else if seg == 5 && level == SEG_LVL_ALT_L {
+                    w.push_flag(true);
+                    w.push_bits(30, 6);
+                    w.push_flag(false); // feature_sign: positive -> 30
+                } else if seg == 3 && level == SEG_LVL_REF_FRAME {
+                    w.push_flag(true);
+                    w.push_bits(2, 2); // unsigned, no sign bit
+                } else if seg == 7 && level == SEG_LVL_SKIP {
+                    w.push_flag(true); // 0 bits to read, unsigned -> no value/sign bits
+                } else {
+                    w.push_flag(false);
+                }
+            }
+        }
+        let data = w.finish();
+        let mut r = BitReader::new(&data);
+        let seg = parse_segmentation_params(&mut r, false, NO_SEG_FEATURES);
+
+        assert!(seg.enabled);
+        assert!(seg.update_map);
+        assert_eq!(seg.tree_probs, [200; 7]);
+        assert!(seg.temporal_update);
+        assert_eq!(seg.pred_prob, [180; 3]);
+        assert!(!seg.abs_or_delta_update);
+        assert!(seg.feature_enabled[2][SEG_LVL_ALT_Q]);
+        assert_eq!(seg.feature_data[2][SEG_LVL_ALT_Q], -50);
+        assert!(seg.feature_enabled[5][SEG_LVL_ALT_L]);
+        assert_eq!(seg.feature_data[5][SEG_LVL_ALT_L], 30);
+        assert!(seg.feature_enabled[3][SEG_LVL_REF_FRAME]);
+        assert_eq!(seg.feature_data[3][SEG_LVL_REF_FRAME], 2);
+        assert!(seg.feature_enabled[7][SEG_LVL_SKIP]);
+        assert_eq!(seg.feature_data[7][SEG_LVL_SKIP], 0);
+        // Untouched (segment, level) pairs stay disabled/zero.
+        assert!(!seg.feature_enabled[0][SEG_LVL_ALT_Q]);
+        assert_eq!(seg.feature_data[0][SEG_LVL_ALT_Q], 0);
+    }
+
+    /// When `segmentation_update_data == 0`, `FeatureEnabled`/`FeatureData`/
+    /// `abs_or_delta_update` persist from the previous frame (spec §7.2.10) — unless `reset`
+    /// (`setup_past_independence()`) clears them first.
+    #[test]
+    fn segmentation_params_persists_feature_data_when_not_updated() {
+        let mut prev_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+        let mut prev_data = [[0i32; SEG_LVL_MAX]; MAX_SEGMENTS];
+        prev_enabled[4][SEG_LVL_ALT_Q] = true;
+        prev_data[4][SEG_LVL_ALT_Q] = 77;
+        let prev = (prev_enabled, prev_data, true);
+
+        // segmentation_enabled=1, update_map=0, update_data=0: nothing is re-signaled.
+        let mut w = BitWriter::new();
+        w.push_flag(true);
+        w.push_flag(false);
+        w.push_flag(false);
+        let data = w.finish();
+
+        let mut r = BitReader::new(&data);
+        let seg = parse_segmentation_params(&mut r, false, prev);
+        assert!(seg.enabled);
+        assert!(!seg.update_map);
+        assert!(seg.abs_or_delta_update); // persisted from prev
+        assert!(seg.feature_enabled[4][SEG_LVL_ALT_Q]);
+        assert_eq!(seg.feature_data[4][SEG_LVL_ALT_Q], 77);
+
+        // reset == true (setup_past_independence): clears feature state regardless of prev.
+        let mut r2 = BitReader::new(&data);
+        let seg_reset = parse_segmentation_params(&mut r2, true, prev);
+        assert!(!seg_reset.abs_or_delta_update);
+        assert!(!seg_reset.feature_enabled[4][SEG_LVL_ALT_Q]);
+        assert_eq!(seg_reset.feature_data[4][SEG_LVL_ALT_Q], 0);
     }
 }

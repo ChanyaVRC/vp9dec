@@ -1,14 +1,16 @@
-//! MD5（RFC 1321）の自作実装。
+//! A from-scratch MD5 (RFC 1321) implementation.
 //!
-//! コンフォーマンステスト（`tests/conformance_test.rs`）で、公式テストベクタに同梱される
-//! `.md5` ファイル（デコード結果の I420 フレームデータの MD5 チェックサム）と比較するために
-//! 使用する。依存クレートゼロの方針のため、標準ライブラリのみで実装する。
+//! Used by the conformance test (`tests/conformance_test.rs`) to compare against the
+//! `.md5` files bundled with the official test vectors (MD5 checksums of the decoded
+//! I420 frame data). Implemented using only the standard library, per the zero
+//! dependency crates policy.
 //!
-//! アルゴリズムは RFC 1321 "The MD5 Message-Digest Algorithm" にそのまま従う
-//! （<https://www.ietf.org/rfc/rfc1321.txt>、パブリックな IETF 標準仕様であり、
-//! 本リポジトリのクリーンルーム方針が禁じる「他 OSS 実装のソースコード参照」には該当しない）。
+//! The algorithm follows RFC 1321 "The MD5 Message-Digest Algorithm" directly
+//! (<https://www.ietf.org/rfc/rfc1321.txt>, a public IETF standard specification,
+//! which does not fall under this repository's clean-room policy's prohibition on
+//! "referencing other OSS implementations' source code").
 
-/// 各ラウンドでのシフト量（RFC 1321 3.4 節 "Round 1"〜"Round 4"）。
+/// The shift amount for each round (RFC 1321 §3.4 "Round 1" through "Round 4").
 const SHIFTS: [u32; 64] = [
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, //
     5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, //
@@ -16,9 +18,9 @@ const SHIFTS: [u32; 64] = [
     6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
 ];
 
-/// `K[i] = floor(abs(sin(i + 1)) * 2^32)`（RFC 1321 3.4 節の定数表）。
-/// 標準ライブラリのみで完結させるため、浮動小数点の `sin` は使わず既知の表を埋め込む
-/// （RFC 1321 本文に掲載されている数値そのもの）。
+/// `K[i] = floor(abs(sin(i + 1)) * 2^32)` (the constant table from RFC 1321 §3.4).
+/// To stay within the standard library, this embeds the known table rather than
+/// computing floating-point `sin` (the values are exactly as listed in RFC 1321).
 const K: [u32; 64] = [
     0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
     0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
@@ -30,7 +32,7 @@ const K: [u32; 64] = [
     0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
 ];
 
-/// 1 ブロック（64 バイト）を処理し、`state`（`A,B,C,D`）を更新する（RFC 1321 3.4 節）。
+/// Processes one block (64 bytes) and updates `state` (`A,B,C,D`) (RFC 1321 §3.4).
 fn process_block(state: &mut [u32; 4], block: &[u8; 64]) {
     let mut m = [0u32; 16];
     for (i, chunk) in block.chunks_exact(4).enumerate() {
@@ -59,12 +61,13 @@ fn process_block(state: &mut [u32; 4], block: &[u8; 64]) {
     state[3] = state[3].wrapping_add(d);
 }
 
-/// `data` の MD5 ダイジェスト（16 バイト）を計算する。
+/// Computes the MD5 digest (16 bytes) of `data`.
 pub fn md5(data: &[u8]) -> [u8; 16] {
     let mut state: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
 
-    // パディング: 0x80 の 1 バイト + 0 埋め + 元のビット長（64bit, リトルエンディアン）を
-    // 付加し、全体が 64 バイトの倍数になるようにする（RFC 1321 3.1〜3.2 節）。
+    // Padding: append a single 0x80 byte + zero padding + the original bit length
+    // (64-bit, little-endian) so the total length becomes a multiple of 64 bytes
+    // (RFC 1321 §3.1-§3.2).
     let bit_len = (data.len() as u64).wrapping_mul(8);
     let mut padded = Vec::with_capacity(data.len() + 72);
     padded.extend_from_slice(data);
@@ -87,7 +90,7 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
     out
 }
 
-/// MD5 ダイジェストを小文字 16 進文字列（32 文字）に変換する。
+/// Converts an MD5 digest to a lowercase hex string (32 characters).
 pub fn to_hex(digest: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
     for byte in digest {
@@ -148,12 +151,13 @@ mod tests {
         );
     }
 
-    /// ブロック境界（64 バイト）をまたぐ入力でもパディングが正しく行われることを確認する。
+    /// Confirms padding is applied correctly even for input crossing a block boundary (64 bytes).
     #[test]
     fn exactly_one_block() {
         let data = vec![b'a'; 64];
-        // 既知値との比較ではなく、決定的であること・パニックしないことのみ確認する
-        // （長さちょうど 64 バイトはパディングが 2 ブロック目に丸ごとあふれる境界ケース）。
+        // Rather than comparing against a known value, this only confirms determinism
+        // and the absence of panics (a length of exactly 64 bytes is the boundary case
+        // where padding overflows entirely into a second block).
         let d1 = md5(&data);
         let d2 = md5(&data);
         assert_eq!(d1, d2);

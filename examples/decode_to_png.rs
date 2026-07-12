@@ -1,20 +1,20 @@
-//! `tests/vectors/` にある `.ivf` をデコードし、BT.601 で YUV -> RGB 変換したうえで PNG として
-//! `target/dump/` に書き出す（目視検収用）。
+//! Decodes an `.ivf` in `tests/vectors/`, converts YUV -> RGB using BT.601, and writes the
+//! result as a PNG to `target/dump/` (for visual inspection).
 //!
-//! 依存クレートを一切使わない方針（`Cargo.toml` に dependencies を追加しない）に合わせ、
-//! PNG エンコードも自前で実装する。zlib の圧縮アルゴリズム（deflate の LZ77 + Huffman）は
-//! 実装せず、"stored"（無圧縮）ブロックのみを使う。PNG デコーダはこれでも正しく読める
-//! （zlib ストリームとして完全に規格に適合する。圧縮率が悪いだけで、可逆性・正当性には
-//! 影響しない）。
+//! In keeping with the policy of using zero dependency crates (no dependencies added to
+//! `Cargo.toml`), the PNG encoder is also implemented from scratch. zlib's compression
+//! algorithm (deflate's LZ77 + Huffman) isn't implemented; only "stored" (uncompressed)
+//! blocks are used. PNG decoders can still read this correctly (it's a fully spec-compliant
+//! zlib stream — only the compression ratio suffers, not correctness or losslessness).
 //!
-//! 実行方法:
+//! Usage:
 //! ```sh
-//! # 引数なし: 両ベクタの第 1 フレーム（キーフレーム）を target/dump/<stem>.png に出力する。
+//! # No arguments: outputs frame 1 (the key frame) of both vectors to target/dump/<stem>.png.
 //! cargo run --example decode_to_png
 //!
-//! # 引数あり: 指定ベクタの指定 IVF フレーム番号（0 始まり、デコード順）以降で最初に表示される
-//! # フレームを target/dump/<stem>_frame<N>.png に出力する（動き補償ありの中間フレームの
-//! # 目視検収用。M3 後半で追加）。
+//! # With arguments: outputs the first displayed frame at or after the given IVF frame number
+//! # (0-indexed, in decode order) for the given vector to target/dump/<stem>_frame<N>.png
+//! # (for visually inspecting an inter-frame with motion compensation. Added in M3 second half).
 //! cargo run --example decode_to_png -- vp90-2-12-droppable_1 50
 //! ```
 
@@ -37,11 +37,11 @@ fn main() {
     if let Some(stem) = args.first() {
         let target_index: usize = args
             .get(1)
-            .map(|s| s.parse().expect("フレーム番号は非負整数で指定すること"))
+            .map(|s| s.parse().expect("frame number must be a non-negative integer"))
             .unwrap_or(0);
         let path = vectors_dir.join(format!("{stem}.ivf"));
         if !path.exists() {
-            eprintln!("[error] テストベクタが見つかりません: {}", path.display());
+            eprintln!("[error] Test vector not found: {}", path.display());
             std::process::exit(1);
         }
         dump_frame_at(&path, &out_dir, target_index);
@@ -55,7 +55,7 @@ fn main() {
         let path = vectors_dir.join(name);
         if !path.exists() {
             eprintln!(
-                "[skip] テストベクタが見つかりません: {} (README.md の手順に従って事前にダウンロードしてください)",
+                "[skip] Test vector not found: {} (please download it beforehand following the instructions in README.md)",
                 path.display()
             );
             continue;
@@ -65,7 +65,7 @@ fn main() {
     }
 
     if !any_done {
-        eprintln!("[warn] デコードできたベクタが 1 つもありませんでした。");
+        eprintln!("[warn] No vectors could be decoded.");
         std::process::exit(1);
     }
 }
@@ -89,10 +89,11 @@ fn decode_first_frame(path: &Path, out_dir: &Path) {
     eprintln!("[ok] {} -> {}", path.display(), out_path.display());
 }
 
-/// `target_index`（IVF フレーム番号、0 始まり、デコード順）以降で最初に表示される
-/// （`show_frame == 1` または `show_existing_frame` で表示される）フレームを 1 枚出力する。
-/// `Decoder::decode_frame` はフレーム間状態を要求するため、0 番目から順番にすべて
-/// デコードする必要がある（`target_index` だけを単独でデコードすることはできない）。
+/// Outputs one frame: the first frame at or after `target_index` (IVF frame number,
+/// 0-indexed, in decode order) that gets displayed (either `show_frame == 1` or shown via
+/// `show_existing_frame`). Since `Decoder::decode_frame` requires cross-frame state, all
+/// frames from 0 onward must be decoded in order (`target_index` alone can't be decoded in
+/// isolation).
 fn dump_frame_at(path: &Path, out_dir: &Path, target_index: usize) {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     let reader = IvfReader::new(&bytes)
@@ -120,14 +121,14 @@ fn dump_frame_at(path: &Path, out_dir: &Path, target_index: usize) {
 
     let (actual_index, frame) = result.unwrap_or_else(|| {
         panic!(
-            "{}: フレーム {target_index} 以降に表示可能なフレームが見つからなかった",
+            "{}: no displayable frame found at or after frame {target_index}",
             path.display()
         )
     });
     if actual_index != target_index {
         eprintln!(
-            "[note] {}: フレーム {target_index} は非表示（show_frame==0）だったため、\
-             次に表示されるフレーム {actual_index} を出力する。",
+            "[note] {}: frame {target_index} is hidden (show_frame==0), so outputting \
+             the next displayed frame, {actual_index}, instead.",
             path.display()
         );
     }
@@ -150,8 +151,8 @@ fn write_png(frame: &Frame, out_path: &Path) {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));
 }
 
-/// BT.601（limited range, `Y' = 1.164*(Y-16)` 系）で YUV420 を RGB へ変換する。
-/// 4:2:0 のクロマは最近傍（`x/2, y/2`）でアップサンプリングする。
+/// Converts YUV420 to RGB using BT.601 (limited range, `Y' = 1.164*(Y-16)` family).
+/// 4:2:0 chroma is upsampled using nearest neighbor (`x/2, y/2`).
 fn yuv_to_rgb_bt601(frame: &Frame) -> Vec<u8> {
     let w = frame.width as usize;
     let h = frame.height as usize;
@@ -188,12 +189,12 @@ fn clamp_u8(v: f32) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// 自前 PNG エンコーダ（IHDR/IDAT/IEND のみ、圧縮なし stored ブロック）。
+// Hand-rolled PNG encoder (IHDR/IDAT/IEND only, uncompressed stored blocks).
 // ---------------------------------------------------------------------------
 
 const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
-/// 標準の CRC-32（IEEE 802.3、多項式 0xEDB88320）。PNG チャンクの末尾に付与する。
+/// Standard CRC-32 (IEEE 802.3, polynomial 0xEDB88320). Appended to the end of each PNG chunk.
 fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
@@ -206,7 +207,7 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// zlib (RFC 1950) が要求する Adler-32 チェックサム。
+/// Adler-32 checksum, as required by zlib (RFC 1950).
 fn adler32(data: &[u8]) -> u32 {
     const MOD_ADLER: u32 = 65521;
     let mut a: u32 = 1;
@@ -228,9 +229,9 @@ fn write_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
 }
 
-/// RFC 1951 の "stored"（無圧縮）ブロックのみを使って `data` を deflate 符号化する。
-/// stored ブロックは常にバイト境界で始まる（呼び出し側で保証する）ため、
-/// 3 ビットのブロックヘッダ（BFINAL + BTYPE=00）はそのまま 1 バイトとして書ける。
+/// Deflate-encodes `data` using only RFC 1951 "stored" (uncompressed) blocks.
+/// Since stored blocks always start on a byte boundary (guaranteed by the caller), the
+/// 3-bit block header (BFINAL + BTYPE=00) can simply be written as a whole byte.
 fn deflate_stored(data: &[u8]) -> Vec<u8> {
     const MAX_BLOCK: usize = 65535;
     let mut out = Vec::with_capacity(data.len() + data.len() / MAX_BLOCK * 5 + 5);
@@ -253,28 +254,28 @@ fn deflate_stored(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// zlib ストリーム（RFC 1950）: 2 バイトヘッダ + deflate ペイロード + Adler-32。
+/// zlib stream (RFC 1950): 2-byte header + deflate payload + Adler-32.
 fn zlib_compress_stored(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 16);
     out.push(0x78); // CMF: CM=8 (deflate), CINFO=7 (32K window)
-    out.push(0x01); // FLG: FCHECK が (CMF*256+FLG) % 31 == 0 になるよう選定、FDICT=0
+    out.push(0x01); // FLG: FCHECK chosen so that (CMF*256+FLG) % 31 == 0, FDICT=0
     out.extend_from_slice(&deflate_stored(data));
     out.extend_from_slice(&adler32(data).to_be_bytes());
     out
 }
 
-/// 8bit RGB（truecolor, color type 2）の PNG ファイルを生成する。
-/// `rgb` は `width*height*3` バイトの行優先データ。
+/// Generates an 8-bit RGB (truecolor, color type 2) PNG file.
+/// `rgb` is `width*height*3` bytes of row-major data.
 fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     assert_eq!(
         rgb.len(),
         w * h * 3,
-        "rgb データサイズが width*height*3 と一致しない"
+        "rgb data size doesn't match width*height*3"
     );
 
-    // 各スキャンラインの先頭にフィルタタイプ 0 (None) を付与する。
+    // Prepend filter type 0 (None) to each scanline.
     let mut raw = Vec::with_capacity(h * (1 + w * 3));
     for row in 0..h {
         raw.push(0u8);
@@ -306,13 +307,13 @@ mod tests {
 
     #[test]
     fn crc32_matches_known_vector() {
-        // "123456789" の CRC-32 (IEEE) は 0xCBF43926 であることが広く知られている。
+        // It's well known that the CRC-32 (IEEE) of "123456789" is 0xCBF43926.
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]
     fn adler32_matches_known_vector() {
-        // "Wikipedia" の Adler-32 は 0x11E60398。
+        // The Adler-32 of "Wikipedia" is 0x11E60398.
         assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
     }
 
@@ -329,12 +330,12 @@ mod tests {
         let rgb = vec![255u8, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
         let png = encode_png(2, 2, &rgb);
         assert_eq!(&png[0..8], &PNG_SIGNATURE);
-        // IEND チャンクで終わっていること。
+        // Ends with an IEND chunk.
         assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
     }
 
-    /// テスト専用: stored ブロックのみからなる deflate ストリームを読み戻す
-    /// （zlib ヘッダ・adler32 は含まない、`deflate_stored` の出力専用）。
+    /// Test-only: reads back a deflate stream consisting solely of stored blocks
+    /// (doesn't include the zlib header/adler32; for `deflate_stored`'s output only).
     fn naive_inflate_stored(data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut pos = 0;

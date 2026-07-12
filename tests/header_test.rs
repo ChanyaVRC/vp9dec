@@ -1,25 +1,33 @@
-//! WebM 公式テストベクタ（libvpx コンフォーマンステスト用データ）を使った統合テスト。
+//! Integration tests using official WebM test vectors (libvpx conformance test data).
 //!
-//! `tests/vectors/` にダウンロード済みの `.ivf` ファイルがあれば、以下を検証する:
-//! - IVF コンテナが正しくパースできる
-//! - 第 1 フレームがキーフレームである
-//! - 非圧縮ヘッダの width/height が IVF コンテナヘッダの width/height と一致する
+//! If `.ivf` files have been downloaded into `tests/vectors/`, this verifies:
+//! - The IVF container parses correctly
+//! - The first frame is a key frame
+//! - The uncompressed header's width/height match the IVF container header's width/height
 //!
-//! テストベクタが存在しない環境（例: ネットワークアクセスができない CI）でもテストスイート
-//! 全体が失敗しないよう、ファイルが見つからない場合は早期 return + `eprintln!` でそのテストを
-//! スキップする。取得方法は README.md を参照。
+//! So that the test suite as a whole doesn't fail in environments without test vectors
+//! (e.g. CI without network access), a test is skipped via early return + `eprintln!` when
+//! the file isn't found. See README.md for how to obtain the vectors.
 
 use std::path::Path;
 
-use vp9dec::header::{parse_uncompressed_header, FrameHeader, FrameType, NUM_REF_FRAMES};
+use vp9dec::header::{
+    parse_uncompressed_header, FrameHeader, FrameType, MAX_SEGMENTS, NUM_REF_FRAMES, SEG_LVL_MAX,
+};
 use vp9dec::ivf::IvfReader;
 
 const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
 const NO_LF_DELTAS: ([i8; 4], [i8; 2]) = ([1, 0, -1, -1], [0, 0]);
+const NO_SEG_FEATURES: ([[bool; SEG_LVL_MAX]; MAX_SEGMENTS], [[i32; SEG_LVL_MAX]; MAX_SEGMENTS], bool) =
+    (
+        [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+        [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
+        false,
+    );
 
-/// 指定したテストベクタで「IVF が読める / 第 1 フレームがキーフレーム /
-/// ヘッダの width・height が IVF ヘッダと一致する」ことを検証する。
-/// ファイルが存在しない場合は早期 return する。
+/// Verifies, for the given test vector, that "the IVF can be read / the first frame is a
+/// key frame / the header's width and height match the IVF header".
+/// Returns early if the file doesn't exist.
 fn check_vector(relative_path: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -28,8 +36,8 @@ fn check_vector(relative_path: &str) {
 
     if !path.exists() {
         eprintln!(
-            "[skip] テストベクタが見つからないためスキップします: {}\n\
-             README.md の手順に従って事前にダウンロードしてください。",
+            "[skip] Test vector not found, skipping: {}\n\
+             Please download it beforehand following the instructions in README.md.",
             path.display()
         );
         return;
@@ -50,7 +58,8 @@ fn check_vector(relative_path: &str) {
         .unwrap_or_else(|e| panic!("failed to read first frame of {}: {e:?}", path.display()));
 
     let (parsed, _consumed) =
-        parse_uncompressed_header(first_frame.data, &NO_REF_SIZES, NO_LF_DELTAS).unwrap_or_else(
+        parse_uncompressed_header(first_frame.data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES)
+            .unwrap_or_else(
             |e| {
                 panic!(
                     "failed to parse uncompressed header of first frame in {}: {e:?}",

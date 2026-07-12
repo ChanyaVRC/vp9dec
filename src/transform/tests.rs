@@ -1,17 +1,21 @@
-//! `transform` モジュールのテスト。
+//! Tests for the `transform` module.
 //!
-//! 整数実装の正しさを検証するため、仕様 8.7.1 節の疑似コードから独立に
-//! 浮動小数点版のバタフライネットワークを書き起こし（`cos64`/`sin64` の
-//! 14bit 固定小数点テーブルではなく実際の `cos`/`sin` を用い、各段の
-//! `Round2` による丸めも行わない）、乱数係数に対して整数実装との出力差が
-//! ±1 に収まることを確認する。加えて、線形性・DC 係数単独入力でのフラット
-//! 出力といった、変換方式に依存しない数学的性質もテストする。
+//! To verify the correctness of the integer implementation, an independent
+//! floating-point version of the butterfly network is written from scratch
+//! based on the pseudocode in spec §8.7.1 (using the actual `cos`/`sin`
+//! instead of the 14bit fixed-point `cos64`/`sin64` tables, and without the
+//! `Round2` rounding at each stage), and we confirm that the output
+//! difference from the integer implementation stays within ±1 for random
+//! coefficients. We also test mathematical properties that don't depend on
+//! the transform type, such as linearity and flat output for a lone DC
+//! coefficient input.
 
 use super::*;
 use std::f64::consts::PI;
 
 // ------------------------------------------------------------------------
-// 自前 LCG 乱数生成器（外部クレートを使わないための最小実装）。
+// Homegrown LCG random number generator (minimal implementation to avoid
+// depending on an external crate).
 // ------------------------------------------------------------------------
 
 struct Lcg {
@@ -23,7 +27,7 @@ impl Lcg {
         Lcg { state: seed }
     }
 
-    /// Numerical Recipes 系の定数を用いた 64bit LCG。
+    /// 64bit LCG using constants from Numerical Recipes.
     fn next_u64(&mut self) -> u64 {
         self.state = self
             .state
@@ -32,22 +36,23 @@ impl Lcg {
         self.state
     }
 
-    /// `[-range, range]` の範囲の整数係数を生成する（変換係数を模した値）。
+    /// Generates an integer coefficient in the range `[-range, range]` (modeling a transform coefficient).
     fn next_coef(&mut self, range: i64) -> i64 {
-        let v = (self.next_u64() >> 33) as i64; // 31bit 非負値
+        let v = (self.next_u64() >> 33) as i64; // 31bit non-negative value
         (v % (2 * range + 1)) - range
     }
 }
 
 // ------------------------------------------------------------------------
-// 浮動小数点版バタフライネットワーク（整数実装とは独立に書き起こしたもの）。
+// Floating-point butterfly network (written independently of the integer implementation).
 // ------------------------------------------------------------------------
 //
-// `cos64(angle)/16384 ≈ cos(angle * pi / 64)` の関係を使い、整数実装の
-// 「16384 倍して Round2(.., 14) で戻す」という操作を、浮動小数点では単に
-// 「実数の cos/sin をそのまま掛ける」ことで置き換える。これにより 14bit
-// テーブルの丸め誤差そのものは再現されないが、バタフライネットワークの
-// 配線（インデックス計算）が正しいかどうかは独立に検証できる。
+// Using the relation `cos64(angle)/16384 ≈ cos(angle * pi / 64)`, the integer
+// implementation's "multiply by 16384, then scale back with Round2(.., 14)"
+// operation is replaced, in floating point, by simply "multiplying by the
+// real-valued cos/sin directly". This does not reproduce the rounding error
+// of the 14bit table itself, but it does independently verify whether the
+// butterfly network's wiring (index computation) is correct.
 
 fn cos_f(angle: i32) -> f64 {
     (angle as f64 * PI / 64.0).cos()
@@ -227,15 +232,16 @@ fn adst_output_permute_f(t: &mut [f64], n: u32) {
     }
 }
 
-/// ADST4 は仕様の代数式をそのまま行列として展開したもの（手計算で導出）。
-/// `iadst4_impl` とは別経路で検証するため、係数行列を直接書き下す。
+/// ADST4 is the spec's algebraic formula expanded directly as a matrix
+/// (derived by hand). Verified via a separate path from `iadst4_impl`,
+/// writing out the coefficient matrix explicitly.
 fn iadst4_f(t: &mut [f64]) {
     let k1 = SINPI_1_9 as f64 / 16384.0;
     let k2 = SINPI_2_9 as f64 / 16384.0;
     let k3 = SINPI_3_9 as f64 / 16384.0;
     let k4 = SINPI_4_9 as f64 / 16384.0;
     let (t0, t1, t2, t3) = (t[0], t[1], t[2], t[3]);
-    // 8.7.1.6 の式を o_i = sum_j M[i][j] * t_j の形に展開したもの。
+    // The formula in §8.7.1.6 expanded into the form o_i = sum_j M[i][j] * t_j.
     let o0 = k1 * t0 + k3 * t1 + k4 * t2 + k2 * t3;
     let o1 = k2 * t0 + k3 * t1 - k1 * t2 - k4 * t3;
     let o2 = k3 * t0 - k3 * t2 + k3 * t3;
@@ -328,11 +334,12 @@ fn iadst16_f(t: &mut [f64]) {
 }
 
 // ------------------------------------------------------------------------
-// 逆 DCT: 整数実装 vs 浮動小数点参照実装
+// Inverse DCT: integer implementation vs. floating-point reference implementation
 // ------------------------------------------------------------------------
 
-/// 整数版 `idct` と浮動小数点参照実装 `idct_f` の出力を比較し、
-/// 最大絶対誤差が `tol` 以内であることを確認する。
+/// Compares the output of the integer `idct` against the floating-point
+/// reference implementation `idct_f`, and confirms that the maximum absolute
+/// error is within `tol`.
 fn check_idct(n: u32, trials: usize, coef_range: i64, tol: f64, seed: u64) {
     let n0 = 1usize << n;
     let mut rng = Lcg::new(seed);
@@ -359,15 +366,16 @@ fn check_idct(n: u32, trials: usize, coef_range: i64, tol: f64, seed: u64) {
     }
 }
 
-// 許容誤差はバタフライ段数（≒ log2(n0)）にほぼ比例して大きくなる。
-// これは 1 段ごとに `Round2(x, 14)` による ±0.5 単位（14bit スケール上）の
-// 丸め誤差が生じ、後段の回転を経て伝播・蓄積していくためであり、実際の
-// VP9 デコーダでも起こる正常な挙動である（最終的な誤差は 2 次元変換の
-// 最終シフト適用後には画素単位で ±1〜2 程度に収まる。
-// `inverse_transform_block_matches_float_reference_all_tx_types` を参照）。
-// 下記の許容値は、乱数係数 2000 セット×各要素での実測最大誤差
-// （n=2: 約2.0, n=3: 約4.8, n=4: 約4.7, n=5: 約6.7）に安全マージンを
-// 加えたもの。
+// The tolerance grows roughly proportionally to the number of butterfly
+// stages (≒ log2(n0)). This is because each stage introduces a ±0.5-unit
+// (on the 14bit scale) rounding error from `Round2(x, 14)`, which propagates
+// and accumulates through the later rotations — this is normal behavior that
+// also occurs in a real VP9 decoder (the final error, after the final shift
+// of the 2D transform is applied, stays within about ±1-2 per pixel; see
+// `inverse_transform_block_matches_float_reference_all_tx_types`).
+// The tolerances below were derived from the measured maximum error across
+// 2000 sets of random coefficients x each element (n=2: ~2.0, n=3: ~4.8,
+// n=4: ~4.7, n=5: ~6.7), with a safety margin added.
 
 #[test]
 fn idct4_matches_float_reference() {
@@ -390,7 +398,7 @@ fn idct32_matches_float_reference() {
 }
 
 // ------------------------------------------------------------------------
-// 逆 ADST: 整数実装 vs 浮動小数点参照実装
+// Inverse ADST: integer implementation vs. floating-point reference implementation
 // ------------------------------------------------------------------------
 
 fn check_iadst(n: u32, trials: usize, coef_range: i64, tol: f64, seed: u64) {
@@ -438,12 +446,14 @@ fn iadst16_matches_float_reference() {
 }
 
 // ------------------------------------------------------------------------
-// 変換方式に依存しない数学的性質のテスト
+// Tests for mathematical properties that don't depend on the transform type
 // ------------------------------------------------------------------------
 
-/// DC 係数（先頭要素）のみが非ゼロの場合、逆 DCT の出力はフラット（全要素が
-/// ほぼ同一の値）になる。これは DCT の 0 次基底関数が定数関数であるという、
-/// バタフライネットワークの配線とは独立な数学的事実に基づく検証である。
+/// When only the DC coefficient (the first element) is nonzero, the inverse
+/// DCT's output is flat (all elements are nearly identical). This is a
+/// verification based on the mathematical fact — independent of the
+/// butterfly network's wiring — that the DCT's 0th basis function is a
+/// constant function.
 #[test]
 fn idct_dc_only_is_flat() {
     for &n in &[2u32, 3, 4, 5] {
@@ -464,8 +474,8 @@ fn idct_dc_only_is_flat() {
     }
 }
 
-/// 逆 DCT は線形写像である: `idct(a + b) == idct(a) + idct(b)`（丸め誤差の
-/// 範囲内で）。
+/// The inverse DCT is a linear map: `idct(a + b) == idct(a) + idct(b)`
+/// (within rounding error).
 #[test]
 fn idct_is_linear() {
     let mut rng = Lcg::new(42);
@@ -487,9 +497,11 @@ fn idct_is_linear() {
 
             for k in 0..n0 {
                 let combined = ra[k] + rb[k];
-                // 各バタフライ段の Round2 による丸めが a・b それぞれで独立に
-                // 発生し、加算後の丸めとはずれうるため、段数に応じた誤差を
-                // 許容する（[`check_idct`] と同様の理由）。
+                // The Round2 rounding at each butterfly stage occurs
+                // independently for a and b, and can diverge from the
+                // rounding applied after summation, so we allow an error
+                // proportional to the number of stages (same reasoning as
+                // [`check_idct`]).
                 assert!(
                     (rsum[k] - combined).abs() <= 8,
                     "n={n} k={k}: rsum={} combined={}",
@@ -501,8 +513,9 @@ fn idct_is_linear() {
     }
 }
 
-/// ADST も DC 係数単独では緩やかに変化するが、DCT のような完全フラットには
-/// ならない。代わりに「線形性」のみを軽量に確認する。
+/// ADST also varies gently for a lone DC coefficient, but unlike the DCT it
+/// doesn't become perfectly flat. Instead, we lightly verify only its
+/// "linearity".
 #[test]
 fn iadst_is_linear() {
     let mut rng = Lcg::new(43);
@@ -535,13 +548,14 @@ fn iadst_is_linear() {
 }
 
 // ------------------------------------------------------------------------
-// 逆 Walsh-Hadamard 変換（ロスレス用）: 軽量なテスト
+// Inverse Walsh-Hadamard transform (for lossless): lightweight tests
 // ------------------------------------------------------------------------
 
-/// WHT はほぼ線形だが、内部の `e = (a - d) >> 1` が右シフトによる床除算
-/// （負数では -∞ 方向への丸め）であるため、`a - d` の偶奇によっては
-/// `iwht4(x + y) != iwht4(x) + iwht4(y)` が最大 1 だけずれうる。
-/// 完全な線形性ではなく、そのずれが ±1 に収まることを確認する。
+/// The WHT is nearly linear, but because the internal `e = (a - d) >> 1` is a
+/// floor division via right shift (rounding toward -∞ for negative numbers),
+/// depending on the parity of `a - d`, `iwht4(x + y) != iwht4(x) + iwht4(y)`
+/// can differ by at most 1. We confirm that this deviation stays within ±1,
+/// rather than requiring perfect linearity.
 #[test]
 fn iwht4_is_approximately_linear() {
     let mut rng = Lcg::new(7);
@@ -581,8 +595,8 @@ fn iwht4_is_approximately_linear() {
     }
 }
 
-/// DC 係数のみの場合、WHT も他の変換と同様に出力がフラットになることを
-/// 軽く確認する（`shift == 0` の場合）。
+/// For a lone DC coefficient, lightly confirm that the WHT's output is also
+/// flat like the other transforms (when `shift == 0`).
 #[test]
 fn iwht4_dc_only_is_flat() {
     let mut t = [400i64, 0, 0, 0];
@@ -594,11 +608,11 @@ fn iwht4_dc_only_is_flat() {
 }
 
 // ------------------------------------------------------------------------
-// 2 次元変換の組み立て（inverse_transform_block）
+// Assembly of the 2D transform (inverse_transform_block)
 // ------------------------------------------------------------------------
 
-/// DC 係数（`Dequant[0][0]`）のみが非ゼロの場合、`DCT_DCT` の 2 次元逆変換の
-/// 出力はブロック全体でほぼフラットになる。
+/// When only the DC coefficient (`Dequant[0][0]`) is nonzero, the output of
+/// the `DCT_DCT` 2D inverse transform is nearly flat across the entire block.
 #[test]
 fn inverse_transform_block_dc_only_is_flat_dct() {
     for &n in &[2u32, 3, 4, 5] {
@@ -616,8 +630,8 @@ fn inverse_transform_block_dc_only_is_flat_dct() {
     }
 }
 
-/// 4x4 ロスレス（WHT）経路が破綻なく動作し、DC 係数単独でフラットな出力を
-/// 返すことを確認する（軽量テスト）。
+/// Confirms that the 4x4 lossless (WHT) path runs without breaking and
+/// returns a flat output for a lone DC coefficient (lightweight test).
 #[test]
 fn inverse_transform_block_lossless_wht_smoke() {
     let mut d = vec![0i64; 16];
@@ -629,9 +643,9 @@ fn inverse_transform_block_lossless_wht_smoke() {
     }
 }
 
-/// 2 次元変換（行 DCT・列 ADST など 4 パターンすべて）が浮動小数点参照実装
-/// （行変換 → 列変換 → 最終シフトを float で再現）と ±2 の誤差に収まること
-/// を確認する。
+/// Confirms that the 2D transform (all 4 combinations, e.g. row DCT / column
+/// ADST) stays within ±2 of a floating-point reference implementation
+/// (row transform -> column transform -> final shift, reproduced in float).
 #[test]
 fn inverse_transform_block_matches_float_reference_all_tx_types() {
     let tx_types = [
@@ -666,8 +680,8 @@ fn inverse_transform_block_matches_float_reference_all_tx_types() {
     }
 }
 
-/// [`inverse_transform_block`] の浮動小数点参照実装（行 → 列 → 最終シフト相当
-/// のスケーリング）。
+/// Floating-point reference implementation of [`inverse_transform_block`]
+/// (row -> column -> equivalent scaling for the final shift).
 fn float_2d_reference(coeffs: &[i64], n: u32, tx_type: TxType) -> Vec<f64> {
     let n0 = 1usize << n;
     let mut d: Vec<f64> = coeffs.iter().map(|&x| x as f64).collect();

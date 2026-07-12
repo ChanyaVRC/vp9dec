@@ -1,16 +1,16 @@
-//! 逆量子化（Dequantization）モジュール。
+//! Dequantization module.
 //!
-//! 参照仕様: VP9 Bitstream & Decoding Process Specification v0.7, 8.6.1 節
-//! "Dequantization functions"。
+//! Reference spec: VP9 Bitstream & Decoding Process Specification v0.7, §8.6.1
+//! "Dequantization functions".
 //!
-//! `dc_qlookup` / `ac_qlookup` は BitDepth ごと（8bit / 10bit / 12bit）に 256
-//! エントリを持つルックアップテーブルであり、量子化インデックス `b`（0..=255）
-//! から実際の量子化ステップ値を求めるために使う。本モジュールは 3 プロファイル分
-//! すべてを仕様の記載どおりに転記しているが、本デコーダが対象とする M2 時点では
-//! 8bit（`bit_depth == 8`）のみを利用する想定である。
+//! `dc_qlookup` / `ac_qlookup` are 256-entry lookup tables per BitDepth
+//! (8bit / 10bit / 12bit), used to derive the actual quantization step value
+//! from a quantization index `b` (0..=255). This module transcribes all 3
+//! profiles exactly as listed in the spec, but as of the M2 milestone this
+//! decoder targets, only 8bit (`bit_depth == 8`) is expected to be used.
 
-/// 仕様 8.6.1 節 `dc_qlookup[ 3 ][ 256 ]`。
-/// 行インデックスは `(BitDepth - 8) >> 1`（8bit→0, 10bit→1, 12bit→2）。
+/// Spec §8.6.1 `dc_qlookup[ 3 ][ 256 ]`.
+/// The row index is `(BitDepth - 8) >> 1` (8bit->0, 10bit->1, 12bit->2).
 #[rustfmt::skip]
 pub const DC_QLOOKUP: [[i32; 256]; 3] = [
     [
@@ -87,7 +87,7 @@ pub const DC_QLOOKUP: [[i32; 256]; 3] = [
     ],
 ];
 
-/// 仕様 8.6.1 節 `ac_qlookup[ 3 ][ 256 ]`。行インデックスの意味は [`DC_QLOOKUP`] と同じ。
+/// Spec §8.6.1 `ac_qlookup[ 3 ][ 256 ]`. The row index has the same meaning as [`DC_QLOOKUP`].
 #[rustfmt::skip]
 pub const AC_QLOOKUP: [[i32; 256]; 3] = [
     [
@@ -164,7 +164,7 @@ pub const AC_QLOOKUP: [[i32; 256]; 3] = [
     ],
 ];
 
-/// 仕様 4.6 節 `Clip3(x, y, z)`。
+/// Spec §4.6 `Clip3(x, y, z)`.
 fn clip3(low: i32, high: i32, v: i32) -> i32 {
     if v < low {
         low
@@ -175,34 +175,36 @@ fn clip3(low: i32, high: i32, v: i32) -> i32 {
     }
 }
 
-/// 仕様 8.6.1 節 `dc_q( b )` = `dc_qlookup[ (BitDepth-8) >> 1 ][ Clip3( 0, 255, b ) ]`。
+/// Spec §8.6.1 `dc_q( b )` = `dc_qlookup[ (BitDepth-8) >> 1 ][ Clip3( 0, 255, b ) ]`.
 pub fn dc_q(bit_depth: u8, b: i32) -> i32 {
     let row = ((bit_depth - 8) >> 1) as usize;
     DC_QLOOKUP[row][clip3(0, 255, b) as usize]
 }
 
-/// 仕様 8.6.1 節 `ac_q( b )` = `ac_qlookup[ (BitDepth-8) >> 1 ][ Clip3( 0, 255, b ) ]`。
+/// Spec §8.6.1 `ac_q( b )` = `ac_qlookup[ (BitDepth-8) >> 1 ][ Clip3( 0, 255, b ) ]`.
 pub fn ac_q(bit_depth: u8, b: i32) -> i32 {
     let row = ((bit_depth - 8) >> 1) as usize;
     AC_QLOOKUP[row][clip3(0, 255, b) as usize]
 }
 
-/// セグメント単位の `SEG_LVL_ALT_Q` 上書き（仕様 8.6.1 節 `get_qindex()` の
-/// `seg_feature_active( SEG_LVL_ALT_Q )` 分岐に相当）。
+/// Per-segment `SEG_LVL_ALT_Q` override (equivalent to the
+/// `seg_feature_active( SEG_LVL_ALT_Q )` branch in spec §8.6.1 `get_qindex()`).
 ///
-/// 本デコーダの M2 時点ではセグメンテーションの詳細パラメータ（`FeatureData` 等）は
-/// まだフレームヘッダのパース対象に含まれていないため、量子化モジュール単体で
-/// テスト・利用できるよう呼び出し側から明示的に渡す形にしている。
+/// Built by the caller (`src/tile.rs`) from `SegmentationParams::feature_data`/
+/// `abs_or_delta_update` (spec §6.2.11) when the feature is active for the
+/// current block's segment; kept as its own small struct (rather than taking
+/// `SegmentationParams` + `segment_id` directly) so this module stays testable
+/// standalone, decoupled from `header::SegmentationParams`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegQIndexOverride {
-    /// `FeatureData[ segment_id ][ SEG_LVL_ALT_Q ]`。
+    /// `FeatureData[ segment_id ][ SEG_LVL_ALT_Q ]`.
     pub data: i32,
-    /// `segmentation_abs_or_delta_update`。true なら絶対値、false なら base_q_idx
-    /// からの差分として `data` を解釈する。
+    /// `segmentation_abs_or_delta_update`. If true, `data` is interpreted as
+    /// an absolute value; if false, as a delta from base_q_idx.
     pub abs_or_delta_update: bool,
 }
 
-/// 仕様 8.6.1 節 `get_qindex()`。
+/// Spec §8.6.1 `get_qindex()`.
 pub fn get_qindex(base_q_idx: u8, seg: Option<SegQIndexOverride>) -> u8 {
     match seg {
         Some(s) => {
@@ -217,11 +219,11 @@ pub fn get_qindex(base_q_idx: u8, seg: Option<SegQIndexOverride>) -> u8 {
     }
 }
 
-/// 仕様 8.6.1 節 `get_dc_quant( plane )`。
+/// Spec §8.6.1 `get_dc_quant( plane )`.
 ///
-/// `qindex` は [`get_qindex`] の戻り値、`delta_q_y_dc` / `delta_q_uv_dc` は
-/// `quantization_params()`（仕様 6.2.9 節）でパースされる値（`header::QuantizationParams`
-/// のフィールドと同名）を渡す。
+/// `qindex` is the return value of [`get_qindex`]; `delta_q_y_dc` /
+/// `delta_q_uv_dc` are the values parsed by `quantization_params()` (spec
+/// §6.2.9) (same field names as in `header::QuantizationParams`).
 pub fn get_dc_quant(
     bit_depth: u8,
     qindex: u8,
@@ -236,7 +238,7 @@ pub fn get_dc_quant(
     }
 }
 
-/// 仕様 8.6.1 節 `get_ac_quant( plane )`。
+/// Spec §8.6.1 `get_ac_quant( plane )`.
 pub fn get_ac_quant(bit_depth: u8, qindex: u8, plane: usize, delta_q_uv_ac: i32) -> i32 {
     if plane == 0 {
         ac_q(bit_depth, qindex as i32)
@@ -249,7 +251,7 @@ pub fn get_ac_quant(bit_depth: u8, qindex: u8, plane: usize, delta_q_uv_ac: i32)
 mod tests {
     use super::*;
 
-    /// 各テーブルの要素数・行数が仕様どおり `[3][256]` であること。
+    /// Confirms that each table's element/row count matches the spec's `[3][256]`.
     #[test]
     fn table_shapes() {
         assert_eq!(DC_QLOOKUP.len(), 3);
@@ -262,7 +264,7 @@ mod tests {
         }
     }
 
-    /// 仕様に記載された境界値（各行の先頭・末尾）をピンポイントで確認する。
+    /// Spot-checks the boundary values listed in the spec (first/last entry of each row).
     #[test]
     fn spot_check_known_values() {
         // 8bit
@@ -278,11 +280,11 @@ mod tests {
         assert_eq!(dc_q(12, 0), 4);
         assert_eq!(dc_q(12, 255), 21387);
         assert_eq!(ac_q(12, 255), 29247);
-        // 仕様の中間値（8bit dc, index 100）も転記ミスがないか確認する。
+        // Also confirm a mid-table value from the spec (8bit dc, index 100) wasn't mistranscribed.
         assert_eq!(dc_q(8, 100), 93);
     }
 
-    /// `Clip3` によって範囲外の量子化インデックスが丸められること。
+    /// Out-of-range quantization indices are clamped via `Clip3`.
     #[test]
     fn out_of_range_index_is_clipped() {
         assert_eq!(dc_q(8, -10), dc_q(8, 0));
@@ -291,13 +293,13 @@ mod tests {
         assert_eq!(ac_q(8, 300), ac_q(8, 255));
     }
 
-    /// セグメンテーションが無効な場合、`get_qindex` は `base_q_idx` をそのまま返す。
+    /// When segmentation is disabled, `get_qindex` returns `base_q_idx` unchanged.
     #[test]
     fn qindex_without_segmentation() {
         assert_eq!(get_qindex(120, None), 120);
     }
 
-    /// `segmentation_abs_or_delta_update == 1`（絶対値指定）の場合。
+    /// The case `segmentation_abs_or_delta_update == 1` (absolute value specified).
     #[test]
     fn qindex_absolute_override() {
         let seg = SegQIndexOverride {
@@ -305,7 +307,7 @@ mod tests {
             abs_or_delta_update: true,
         };
         assert_eq!(get_qindex(120, Some(seg)), 50);
-        // 範囲外は Clip3 される。
+        // Out-of-range values are clamped via Clip3.
         let seg_over = SegQIndexOverride {
             data: 400,
             abs_or_delta_update: true,
@@ -318,7 +320,7 @@ mod tests {
         assert_eq!(get_qindex(120, Some(seg_under)), 0);
     }
 
-    /// `segmentation_abs_or_delta_update == 0`（差分指定）の場合。
+    /// The case `segmentation_abs_or_delta_update == 0` (delta specified).
     #[test]
     fn qindex_delta_override() {
         let seg = SegQIndexOverride {
@@ -333,14 +335,14 @@ mod tests {
         assert_eq!(get_qindex(100, Some(seg_neg)), 0);
     }
 
-    /// `get_dc_quant` / `get_ac_quant` の plane によるデルタ適用の切り替え。
+    /// `get_dc_quant` / `get_ac_quant` switching which delta is applied based on plane.
     #[test]
     fn dc_ac_quant_plane_selection() {
         let qindex = 100u8;
-        // plane 0 (Y) は delta_q_y_dc のみを使い、AC は常にデルタなし。
+        // plane 0 (Y) only uses delta_q_y_dc; AC never has a delta.
         assert_eq!(get_dc_quant(8, qindex, 0, 5, -5), dc_q(8, 105));
         assert_eq!(get_ac_quant(8, qindex, 0, -7), ac_q(8, 100));
-        // plane 1/2 (U/V) は delta_q_uv_dc / delta_q_uv_ac を使う。
+        // plane 1/2 (U/V) use delta_q_uv_dc / delta_q_uv_ac.
         assert_eq!(get_dc_quant(8, qindex, 1, 5, -5), dc_q(8, 95));
         assert_eq!(get_dc_quant(8, qindex, 2, 5, -5), dc_q(8, 95));
         assert_eq!(get_ac_quant(8, qindex, 1, -7), ac_q(8, 93));

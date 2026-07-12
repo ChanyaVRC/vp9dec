@@ -1,97 +1,99 @@
-//! IVF コンテナパーサ。
+//! IVF container parser.
 //!
-//! IVF は libvpx (VP8/VP9) のテストや配布でよく使われる、非常に単純な生ストリーム用コンテナである。
-//! VP9 の仕様書自体にはコンテナフォーマットの定義は含まれないため、ここでは一般に公開されている
-//! IVF フォーマットの仕様（32 バイトのファイルヘッダ + フレームごとの 12 バイトヘッダ）に基づいて
-//! パーサを実装する。すべての多バイト整数値はリトルエンディアンである。
+//! IVF is a very simple raw-stream container commonly used for libvpx (VP8/VP9)
+//! testing and distribution. The VP9 spec itself does not define a container
+//! format, so this parser is implemented based on the publicly documented IVF
+//! format spec (a 32-byte file header + a 12-byte header per frame). All
+//! multi-byte integer values are little-endian.
 //!
-//! ファイルヘッダのレイアウト（32 バイト）:
+//! File header layout (32 bytes):
 //!
-//! | オフセット | サイズ | 内容 |
+//! | Offset | Size | Contents |
 //! | --- | --- | --- |
-//! | 0  | 4 | シグネチャ `"DKIF"` |
-//! | 4  | 2 | バージョン（0 であるべき） |
-//! | 6  | 2 | ヘッダ長（バイト、通常 32） |
-//! | 8  | 4 | コーデック FourCC（VP9 の場合 `"VP90"`） |
-//! | 12 | 2 | 幅（ピクセル） |
-//! | 14 | 2 | 高さ（ピクセル） |
-//! | 16 | 4 | タイムベース分母 |
-//! | 20 | 4 | タイムベース分子 |
-//! | 24 | 4 | フレーム数 |
-//! | 28 | 4 | 未使用 |
+//! | 0  | 4 | Signature `"DKIF"` |
+//! | 4  | 2 | Version (should be 0) |
+//! | 6  | 2 | Header length (bytes, usually 32) |
+//! | 8  | 4 | Codec FourCC (`"VP90"` for VP9) |
+//! | 12 | 2 | Width (pixels) |
+//! | 14 | 2 | Height (pixels) |
+//! | 16 | 4 | Timebase denominator |
+//! | 20 | 4 | Timebase numerator |
+//! | 24 | 4 | Frame count |
+//! | 28 | 4 | Unused |
 //!
-//! フレームヘッダのレイアウト（12 バイト、フレームデータが後続する）:
+//! Frame header layout (12 bytes, followed by frame data):
 //!
-//! | オフセット | サイズ | 内容 |
+//! | Offset | Size | Contents |
 //! | --- | --- | --- |
-//! | 0 | 4 | フレームデータのサイズ（このヘッダを含まない） |
-//! | 4 | 8 | 64 ビットのプレゼンテーションタイムスタンプ |
+//! | 0 | 4 | Size of the frame data (excluding this header) |
+//! | 4 | 8 | 64-bit presentation timestamp |
 
-/// IVF ファイルヘッダのサイズ（バイト）。
+/// Size of the IVF file header (bytes).
 const IVF_FILE_HEADER_SIZE: usize = 32;
-/// IVF フレームヘッダのサイズ（バイト）。
+/// Size of the IVF frame header (bytes).
 const IVF_FRAME_HEADER_SIZE: usize = 12;
-/// IVF ファイルの先頭シグネチャ。
+/// The signature at the start of an IVF file.
 const IVF_SIGNATURE: &[u8; 4] = b"DKIF";
 
-/// IVF パース時に発生し得るエラー。
+/// Errors that can occur while parsing IVF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IvfError {
-    /// バッファがファイルヘッダより短い。
+    /// The buffer is shorter than the file header.
     TooShortForFileHeader,
-    /// 先頭 4 バイトが `"DKIF"` ではない。
+    /// The first 4 bytes are not `"DKIF"`.
     BadSignature,
-    /// ヘッダに記載された header_length が実際のバッファサイズと矛盾する等、不正な値。
+    /// An invalid value, e.g. the header_length in the header is inconsistent with the actual buffer size.
     InvalidHeaderLength,
-    /// フレームヘッダを読むためのバイト数が足りない。
+    /// Not enough bytes remain to read a frame header.
     TruncatedFrameHeader,
-    /// フレームヘッダが示すデータサイズ分のバイトがバッファに存在しない。
+    /// The buffer does not contain as many bytes as the frame header claims for the data size.
     TruncatedFrameData,
 }
 
-/// IVF ファイルヘッダの内容。
+/// Contents of the IVF file header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IvfHeader {
-    /// フォーマットバージョン（通常 0）。
+    /// Format version (usually 0).
     pub version: u16,
-    /// ヘッダ長（バイト）。通常は 32。
+    /// Header length (bytes). Usually 32.
     pub header_length: u16,
-    /// コーデック FourCC（例: `[b'V', b'P', b'9', b'0']`）。
+    /// Codec FourCC (e.g. `[b'V', b'P', b'9', b'0']`).
     pub fourcc: [u8; 4],
-    /// フレーム幅（ピクセル）。
+    /// Frame width (pixels).
     pub width: u16,
-    /// フレーム高さ（ピクセル）。
+    /// Frame height (pixels).
     pub height: u16,
-    /// タイムベースの分母。
+    /// Timebase denominator.
     pub timebase_denominator: u32,
-    /// タイムベースの分子。
+    /// Timebase numerator.
     pub timebase_numerator: u32,
-    /// ファイルに含まれるフレーム数（エンコーダの自己申告値であり、実際の数と一致しない場合もある）。
+    /// Number of frames contained in the file (self-reported by the encoder; may not match the actual count).
     pub frame_count: u32,
 }
 
-/// 1 フレーム分の IVF データ。
+/// IVF data for a single frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IvfFrame<'a> {
-    /// 64 ビットのプレゼンテーションタイムスタンプ（timebase 単位）。
+    /// 64-bit presentation timestamp (in timebase units).
     pub timestamp: u64,
-    /// フレームの生データ（VP9 の場合、フレームまたはスーパーフレームのバイト列）。
+    /// Raw frame data (for VP9, the byte sequence of a frame or superframe).
     pub data: &'a [u8],
 }
 
-/// IVF ファイルを順にフレームへ分解するリーダー。
+/// A reader that splits an IVF file into frames in order.
 ///
-/// バッファ全体をあらかじめメモリに読み込んでおき、そのスライスを借用する設計とする。
-/// `Iterator` を実装しており、`next()` を呼ぶたびに次のフレームを返す。
+/// Designed around loading the entire buffer into memory up front and
+/// borrowing a slice of it. Implements `Iterator`, returning the next frame
+/// on each call to `next()`.
 #[derive(Debug, Clone)]
 pub struct IvfReader<'a> {
     header: IvfHeader,
-    /// まだ読んでいない残りのバイト列（フレームヘッダ+データの繰り返し）。
+    /// The remaining unread byte sequence (repeated frame header + data).
     remaining: &'a [u8],
 }
 
 impl<'a> IvfReader<'a> {
-    /// バッファの先頭から IVF ファイルヘッダを読み取り、`IvfReader` を構築する。
+    /// Reads the IVF file header from the start of the buffer and constructs an `IvfReader`.
     pub fn new(buf: &'a [u8]) -> Result<Self, IvfError> {
         if buf.len() < IVF_FILE_HEADER_SIZE {
             return Err(IvfError::TooShortForFileHeader);
@@ -108,8 +110,9 @@ impl<'a> IvfReader<'a> {
         let timebase_numerator = read_u32_le(buf, 20);
         let frame_count = read_u32_le(buf, 24);
 
-        // header_length はファイルヘッダの実サイズを示す。32 バイト未満だと後続データの
-        // 開始位置が不定になってしまうため不正値として扱う。
+        // header_length indicates the actual size of the file header. If it is
+        // less than 32 bytes, the start position of the following data would
+        // be indeterminate, so treat it as an invalid value.
         let header_length_usize = header_length as usize;
         if header_length_usize < IVF_FILE_HEADER_SIZE || header_length_usize > buf.len() {
             return Err(IvfError::InvalidHeaderLength);
@@ -130,7 +133,7 @@ impl<'a> IvfReader<'a> {
         })
     }
 
-    /// パース済みの IVF ファイルヘッダを返す。
+    /// Returns the parsed IVF file header.
     pub fn header(&self) -> &IvfHeader {
         &self.header
     }
@@ -144,7 +147,7 @@ impl<'a> Iterator for IvfReader<'a> {
             return None;
         }
         if self.remaining.len() < IVF_FRAME_HEADER_SIZE {
-            // これ以上フレームヘッダを読めない半端なデータが残っている。
+            // What remains is a partial chunk too short to read another frame header from.
             self.remaining = &[];
             return Some(Err(IvfError::TruncatedFrameHeader));
         }
@@ -189,7 +192,7 @@ fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
 mod tests {
     use super::*;
 
-    /// テスト用に、指定したフィールドから IVF ファイルヘッダのバイト列を手組みする。
+    /// Hand-builds the byte sequence of an IVF file header from the given fields, for tests.
     fn build_file_header(
         fourcc: &[u8; 4],
         width: u16,
@@ -213,7 +216,7 @@ mod tests {
         buf
     }
 
-    /// テスト用に、1 フレーム分の 12 バイトヘッダ + データを手組みする。
+    /// Hand-builds the 12-byte header + data for a single frame, for tests.
     fn append_frame(buf: &mut Vec<u8>, timestamp: u64, data: &[u8]) {
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         buf.extend_from_slice(&timestamp.to_le_bytes());
@@ -260,7 +263,7 @@ mod tests {
     #[test]
     fn rejects_bad_signature() {
         let mut buf = build_file_header(b"VP90", 16, 16, 30, 1, 1);
-        buf[0] = b'X'; // シグネチャを壊す
+        buf[0] = b'X'; // Corrupt the signature
         assert_eq!(IvfReader::new(&buf).unwrap_err(), IvfError::BadSignature);
     }
 
@@ -276,7 +279,7 @@ mod tests {
     #[test]
     fn reports_truncated_frame_data() {
         let mut buf = build_file_header(b"VP90", 16, 16, 30, 1, 1);
-        // フレームサイズを 10 と主張するが、実際には 2 バイトしか続かない不正なデータ。
+        // Claims a frame size of 10, but only 2 bytes of data actually follow; invalid.
         buf.extend_from_slice(&10u32.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&[0xAA, 0xBB]);

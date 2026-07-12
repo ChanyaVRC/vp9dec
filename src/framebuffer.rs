@@ -1,16 +1,16 @@
-//! フレームバッファ（`CurrFrame`）のプレーン表現。
+//! Plane representation of the frame buffer (`CurrFrame`).
 //!
-//! 仕様は `CurrFrame[ plane ][ y ][ x ]` という 3 次元配列としてフレームバッファを扱うが、
-//! 本実装ではプレーンごとに 1 次元の `Vec<u8>`（行優先）として保持する。
+//! The spec treats the frame buffer as a 3-dimensional array `CurrFrame[ plane ][ y ][ x ]`,
+//! but this implementation holds each plane as a 1-dimensional `Vec<u8>` (row-major).
 //!
-//! バッファのサイズは表示サイズ（`FrameWidth`/`FrameHeight`）ではなく、スーパーブロック
-//! 境界（`Sb64Cols*64`/`Sb64Rows*64`、色差プレーンはサブサンプリング後）に切り上げたサイズで
-//! 確保する。これは仕様 6.4.21 節 `residual()` のブロック境界処理により、フレーム端の
-//! ブロックが `(MiCols*8, MiRows*8)`（= 表示可能な最終クロップ前のサイズ）をわずかに
-//! 超えて書き込まれる場合があるため（読み出しは `Min(maxX, ...)` で必ずクリップされるが、
-//! 書き込み側の `pred[i][j]`/`Dequant[i][j]` の代入はクリップされない）。
+//! The buffer is allocated not at the display size (`FrameWidth`/`FrameHeight`) but at
+//! the size rounded up to the superblock boundary (`Sb64Cols*64`/`Sb64Rows*64`, chroma
+//! planes after subsampling). This is because the block boundary handling of spec
+//! §6.4.21 `residual()` can cause blocks at the frame edge to write slightly beyond
+//! `(MiCols*8, MiRows*8)` (the size just before the final display crop) (reads are
+//! always clipped via `Min(maxX, ...)`, but writes to `pred[i][j]`/`Dequant[i][j]` are not clipped).
 
-/// 1 プレーン分のバッファ（8bit 固定）。
+/// A single plane's buffer (fixed at 8-bit).
 #[derive(Debug, Clone)]
 pub struct Plane {
     pub width: usize,
@@ -39,9 +39,9 @@ impl Plane {
         self.data[y * self.width + x] = v;
     }
 
-    /// `(x, y)` を `[0, width-1] x [0, height-1]` にクランプしてから読む
-    /// （仕様の `CurrFrame[ plane ][ Min(maxY,...) ][ Min(maxX,...) ]` のような
-    /// 「フレーム端を超えたら端の値を複製する」参照に使う）。
+    /// Reads after clamping `(x, y)` to `[0, width-1] x [0, height-1]`
+    /// (used for references like the spec's `CurrFrame[ plane ][ Min(maxY,...) ][ Min(maxX,...) ]`
+    /// that replicate the edge value past the frame boundary).
     #[inline]
     pub fn get_clamped(&self, x: i64, y: i64) -> u8 {
         let cx = x.clamp(0, self.width as i64 - 1) as usize;
@@ -49,7 +49,7 @@ impl Plane {
         self.get(cx, cy)
     }
 
-    /// 表示サイズ `(crop_width, crop_height)` にクロップした行優先バイト列を返す。
+    /// Returns a row-major byte sequence cropped to the display size `(crop_width, crop_height)`.
     pub fn crop(&self, crop_width: usize, crop_height: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(crop_width * crop_height);
         for y in 0..crop_height {
@@ -59,8 +59,8 @@ impl Plane {
         out
     }
 
-    /// [`Plane::crop`] と同じだが、`Vec<u8>` ではなく新しい [`Plane`] として返す
-    /// （仕様 8.10 節 `FrameStore` への格納・DPB 参照フレームデータ用）。
+    /// Same as [`Plane::crop`] but returns a new [`Plane`] instead of a `Vec<u8>`
+    /// (for storing into `FrameStore` / DPB reference frame data per spec §8.10).
     pub fn crop_to_plane(&self, crop_width: usize, crop_height: usize) -> Plane {
         Plane {
             width: crop_width,

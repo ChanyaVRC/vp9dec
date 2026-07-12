@@ -1,10 +1,11 @@
-//! 確率適応（backward adaptation, 仕様 8.4 節）のためのカウンタ収集・`merge_prob`/
-//! `merge_probs`・`adapt_coef_probs`/`adapt_noncoef_probs`。
+//! Counter collection and `merge_prob`/`merge_probs`/`adapt_coef_probs`/
+//! `adapt_noncoef_probs` for probability adaptation (backward adaptation, spec §8.4).
 //!
-//! カウンタの形状・更新条件は仕様 8.3 節（`clear_counts`、各配列の次元）と
-//! 9.3.4 節（"Syntax element counting process"、どのシンタックス要素がどのカウンタを
-//! 更新するかの対応表）に厳密に従う。`src/tile.rs` の各シンタックス読み取り箇所が
-//! この構造体のフィールドをインクリメントする。
+//! The shape and update conditions of the counters strictly follow spec §8.3
+//! (`clear_counts`, each array's dimensions) and §9.3.4 ("Syntax element
+//! counting process", the table mapping which syntax element updates which
+//! counter). Each syntax-element read site in `src/tile.rs` increments the
+//! fields of this struct.
 
 use crate::compressed_header::CompressedHeaderProbs;
 use crate::prob_tables::{
@@ -13,12 +14,12 @@ use crate::prob_tables::{
     SWITCHABLE, TX_16X16, TX_32X32, TX_8X8, TX_MODE_SELECT,
 };
 
-/// `counts_token[TX_SIZES][BLOCK_TYPES][REF_TYPES][COEF_BANDS][PREV_COEF_CONTEXTS][UNCONSTRAINED_NODES]`。
+/// `counts_token[TX_SIZES][BLOCK_TYPES][REF_TYPES][COEF_BANDS][PREV_COEF_CONTEXTS][UNCONSTRAINED_NODES]`.
 pub type TokenCounts = [[[[[[u32; 3]; 6]; 6]; 2]; 2]; 4];
-/// `counts_more_coefs[TX_SIZES][BLOCK_TYPES][REF_TYPES][COEF_BANDS][PREV_COEF_CONTEXTS][2]`。
+/// `counts_more_coefs[TX_SIZES][BLOCK_TYPES][REF_TYPES][COEF_BANDS][PREV_COEF_CONTEXTS][2]`.
 pub type MoreCoefsCounts = [[[[[[u32; 2]; 6]; 6]; 2]; 2]; 4];
 
-/// 仕様 8.3 節 "Clear counts process" が列挙するすべてのカウンタ配列。
+/// All counter arrays enumerated by the "Clear counts process" in spec §8.3.
 #[derive(Debug, Clone)]
 pub struct Counts {
     pub intra_mode: [[u32; 10]; 4],
@@ -26,11 +27,11 @@ pub struct Counts {
     pub partition: [[u32; 4]; 16],
     pub interp_filter: [[u32; 3]; 4],
     pub inter_mode: [[u32; 4]; 7],
-    /// `counts_tx_size[TX_SIZES][TX_SIZE_CONTEXTS][TX_SIZES]`。`tx_size[maxTxSize][ctx][value]`。
+    /// `counts_tx_size[TX_SIZES][TX_SIZE_CONTEXTS][TX_SIZES]`. `tx_size[maxTxSize][ctx][value]`.
     pub tx_size: [[[u32; 4]; 2]; 4],
     pub is_inter: [[u32; 2]; 4],
     pub comp_mode: [[u32; 2]; 5],
-    /// `counts_single_ref[REF_CONTEXTS][2][2]`。`single_ref[ctx][p1_or_p2][value]`。
+    /// `counts_single_ref[REF_CONTEXTS][2][2]`. `single_ref[ctx][p1_or_p2][value]`.
     pub single_ref: [[[u32; 2]; 2]; 5],
     pub comp_ref: [[u32; 2]; 5],
     pub skip: [[u32; 2]; 3],
@@ -82,7 +83,7 @@ impl Counts {
     }
 }
 
-/// `merge_prob( preProb, ct0, ct1, countSat, maxUpdateFactor )`（仕様 8.4.1 節）。
+/// `merge_prob( preProb, ct0, ct1, countSat, maxUpdateFactor )` (spec §8.4.1).
 fn merge_prob(pre_prob: u8, ct0: u32, ct1: u32, count_sat: u32, max_update_factor: u32) -> u8 {
     let den = ct0 + ct1;
     let prob = if den == 0 {
@@ -96,8 +97,8 @@ fn merge_prob(pre_prob: u8, ct0: u32, ct1: u32, count_sat: u32, max_update_facto
     out as u8
 }
 
-/// `merge_probs( tree, i, probs, counts, countSat, maxUpdateFactor )`（仕様 8.4.2 節）。
-/// 戻り値は `leftCount + rightCount`。
+/// `merge_probs( tree, i, probs, counts, countSat, maxUpdateFactor )` (spec §8.4.2).
+/// Returns `leftCount + rightCount`.
 fn merge_probs(
     tree: &[i32],
     i: usize,
@@ -142,22 +143,24 @@ fn merge_probs(
     left_count + right_count
 }
 
-/// `adapt_probs( tree, probs, counts )`（仕様 8.4.4 節）。
+/// `adapt_probs( tree, probs, counts )` (spec §8.4.4).
 fn adapt_probs(tree: &[i32], probs: &mut [u8], counts: &[u32]) {
     merge_probs(tree, 0, probs, counts, COUNT_SAT, MAX_UPDATE_FACTOR);
 }
 
-/// `adapt_prob( prob, counts )`（仕様 8.4.4 節）。
+/// `adapt_prob( prob, counts )` (spec §8.4.4).
 fn adapt_prob(prob: u8, counts: [u32; 2]) -> u8 {
     merge_prob(prob, counts[0], counts[1], COUNT_SAT, MAX_UPDATE_FACTOR)
 }
 
-/// `adapt_coef_probs( )`（仕様 8.4.3 節）。`update_factor` は呼び出し側
-/// （`FrameIsIntra`/`LastFrameType` に基づく、仕様本文参照）が決定して渡す。
+/// `adapt_coef_probs( )` (spec §8.4.3). `update_factor` is determined by the
+/// caller (based on `FrameIsIntra`/`LastFrameType`; see the spec text) and passed in.
 ///
-/// `t`/`i`/`j`/`k`/`l` は `coef_probs`/`counts.token`/`counts.more_coefs` の 3 つを同時に
-/// 同じ添字で辿るため、`iter_mut().enumerate()` に書き換えると却って読みにくくなる
-/// （仕様の擬似コードの `for` ループ構造をそのまま Rust の添字ループへ転記したもの）。
+/// `t`/`i`/`j`/`k`/`l` walk `coef_probs`/`counts.token`/`counts.more_coefs`
+/// simultaneously with the same indices, so rewriting this with
+/// `iter_mut().enumerate()` would only make it harder to read (this is a
+/// direct transcription of the spec's pseudocode `for`-loop structure into a
+/// Rust indexed loop).
 #[allow(clippy::needless_range_loop)]
 pub fn adapt_coef_probs(coef_probs: &mut CoefProbs, counts: &Counts, update_factor: u32) {
     for t in 0..4 {
@@ -190,7 +193,7 @@ pub fn adapt_coef_probs(coef_probs: &mut CoefProbs, counts: &Counts, update_fact
     }
 }
 
-/// `adapt_noncoef_probs( )`（仕様 8.4.4 節）。
+/// `adapt_noncoef_probs( )` (spec §8.4.4).
 pub fn adapt_noncoef_probs(
     probs: &mut CompressedHeaderProbs,
     counts: &Counts,
@@ -307,14 +310,14 @@ mod tests {
 
     #[test]
     fn merge_prob_with_no_observations_keeps_preprob_untouched_direction() {
-        // den == 0 のとき prob=128、count=0 なので factor=0、out=preProb がそのまま返る。
+        // When den == 0, prob=128 and count=0, so factor=0, and out=preProb is returned as-is.
         assert_eq!(merge_prob(200, 0, 0, 20, 128), 200);
     }
 
     #[test]
     fn merge_prob_saturates_toward_observed_ratio_with_enough_counts() {
-        // ct0=0, ct1=100 (count_sat=20 に達している) -> factor=maxUpdateFactor=128 のとき
-        // outProb = Round2( preProb*128 + 1*128, 8 ) 程度に preProb から離れて 1 に近づく。
+        // ct0=0, ct1=100 (reaches count_sat=20) -> when factor=maxUpdateFactor=128,
+        // outProb moves away from preProb toward 1, roughly Round2( preProb*128 + 1*128, 8 ).
         let out = merge_prob(200, 0, 100, 20, 128);
         assert!(out < 200);
     }
@@ -324,7 +327,7 @@ mod tests {
         let mut probs = [100u8, 0, 0];
         let counts = [10u32, 30u32];
         merge_probs(&BINARY_TREE, 0, &mut probs, &counts, 20, 128);
-        // ct1 (=30) の方が多いので prob は下がる方向に動く。
+        // Since ct1 (=30) is larger, prob moves in the decreasing direction.
         assert!(probs[0] < 100);
     }
 }

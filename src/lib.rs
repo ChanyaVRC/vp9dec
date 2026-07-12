@@ -1,17 +1,17 @@
-//! vp9dec: 完全自作の VP9 動画デコーダ（依存クレートゼロ）。
+//! vp9dec: a from-scratch VP9 video decoder (zero dependency crates).
 //!
-//! 参照仕様: VP9 Bitstream & Decoding Process Specification v0.7
-//! (Google, 2017年2月22日版, <https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf>)
+//! Reference spec: VP9 Bitstream & Decoding Process Specification v0.7
+//! (Google, dated 2017-02-22, <https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf>)
 //!
-//! # マイルストーン
-//! - M1: IVF コンテナパーサ、bool デコーダ、非圧縮フレームヘッダのパース
-//! - M2: イントラ予測によるキーフレームのデコード
-//! - M2b: ループフィルタ（デブロッキングフィルタ）＋公式コンフォーマンス検証
-//! - M3 前半: インターフレームのビットストリーム復号（動き補償の手前まで）
-//! - M3 後半: 動き補償・確率適応・参照フレーム管理＋全フレーム MD5 コンフォーマンス
-//! - M4: コンフォーマンステスト完全通過
+//! # Milestones
+//! - M1: IVF container parser, bool decoder, uncompressed frame header parsing
+//! - M2: keyframe decoding via intra prediction
+//! - M2b: loop filter (deblocking filter) + official conformance verification
+//! - M3 first half: inter frame bitstream decoding (up to but not including motion compensation)
+//! - M3 second half: motion compensation, probability adaptation, reference frame management + full-frame MD5 conformance
+//! - M4: full conformance test pass
 //!
-//! （モジュールは以降のコミットで段階的に追加する。）
+//! (Modules are added incrementally in subsequent commits.)
 
 pub mod bit_reader;
 pub mod bool_coder;
@@ -31,7 +31,9 @@ pub mod scan;
 pub mod tile;
 pub mod transform;
 
-use compressed_header::{parse_compressed_header_ex, CompressedHeaderError, FrameContextStore};
+use compressed_header::{
+    parse_compressed_header_ex, CompressedHeaderError, FrameContext, FrameContextStore,
+};
 use counts::{adapt_coef_probs, adapt_noncoef_probs};
 use dpb::{Dpb, RefFrameData};
 use header::{
@@ -39,25 +41,24 @@ use header::{
 };
 use tile::{MiGrid, TileDecoder, TileError};
 
-/// [`decode_keyframe`]/[`Decoder::decode_frame`] が失敗し得るすべての要因をまとめたエラー型。
+/// Error type covering everything that can cause [`decode_keyframe`]/[`Decoder::decode_frame`] to fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// 非圧縮ヘッダ（`uncompressed_header`）のパースに失敗した。
+    /// Failed to parse the uncompressed header (`uncompressed_header`).
     Header(HeaderError),
-    /// 圧縮ヘッダ（`compressed_header`）のパースに失敗した。
+    /// Failed to parse the compressed header (`compressed_header`).
     CompressedHeader(CompressedHeaderError),
-    /// タイル・モード情報・トークン復号に失敗した。
+    /// Failed to decode tiles, mode info, or tokens.
     Tile(TileError),
-    /// [`decode_keyframe`] にキーフレーム以外（インターフレーム・イントラオンリーフレーム）
-    /// が渡された。
+    /// [`decode_keyframe`] was passed a non-keyframe (inter frame or intra-only frame).
     NotAKeyFrame,
-    /// `header_size_in_bytes` がフレームデータ長を超えるなど、フレームデータが不正。
+    /// Frame data is malformed, e.g. `header_size_in_bytes` exceeds the frame data length.
     TruncatedFrame,
-    /// 8bit（`BitDepth == 8`）以外のフレーム。[`framebuffer::Plane`] が `u8` 固定のため、
-    /// 10bit/12bit フレームは現時点ではサポート対象外。
+    /// A frame that isn't 8-bit (`BitDepth == 8`). [`framebuffer::Plane`] is fixed to `u8`,
+    /// so 10-bit/12-bit frames are currently unsupported.
     UnsupportedBitDepth(u8),
-    /// `show_existing_frame` が指す DPB スロットにフレームが格納されていない
-    /// （通常のコンフォーマンスビットストリームでは発生しない）。
+    /// The DPB slot referenced by `show_existing_frame` has no frame stored
+    /// (does not occur with normal conformance bitstreams).
     MissingReferenceFrame,
 }
 
@@ -79,12 +80,12 @@ impl From<TileError> for DecodeError {
     }
 }
 
-/// デコード結果の 1 フレーム。表示サイズ（`FrameWidth`/`FrameHeight`）にクロップ済みで、
-/// YUV420 の 3 プレーンを行優先（row-major）の `Vec<u8>` として保持する。
+/// One decoded frame. Cropped to the display size (`FrameWidth`/`FrameHeight`),
+/// holding the 3 YUV420 planes as row-major `Vec<u8>`.
 ///
-/// `u`/`v` のサイズは仕様 8.9 節の出力プロセスに従い、
+/// The `u`/`v` sizes follow the output process of spec §8.9, computed as
 /// `((width + subsampling_x) >> subsampling_x) x ((height + subsampling_y) >> subsampling_y)`
-/// で計算される（4:2:0 の場合は `((width+1)/2) x ((height+1)/2)`）。
+/// (for 4:2:0 this is `((width+1)/2) x ((height+1)/2)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub width: u32,
@@ -94,7 +95,7 @@ pub struct Frame {
     pub v: Vec<u8>,
 }
 
-/// フレームバッファ（`planes`）を表示サイズにクロップして [`Frame`] を組み立てる。
+/// Crops the frame buffer (`planes`) to the display size and builds a [`Frame`].
 fn crop_to_frame(
     planes: &[framebuffer::Plane; 3],
     width: u32,
@@ -115,8 +116,8 @@ fn crop_to_frame(
     }
 }
 
-/// [`crop_to_frame`] と同じクロップ計算で、DPB 格納用の [`RefFrameData`] を組み立てる
-/// （仕様 8.10 節 "Reference frame update process" ステップ 1）。
+/// Builds a [`RefFrameData`] for DPB storage using the same crop calculation as
+/// [`crop_to_frame`] (spec §8.10 "Reference frame update process" step 1).
 fn build_ref_frame_data(
     planes: &[framebuffer::Plane; 3],
     width: u32,
@@ -150,27 +151,37 @@ fn ref_frame_data_to_frame(data: &RefFrameData) -> Frame {
     }
 }
 
-/// 1 枚のキーフレームをデコードする。
+/// Decodes a single keyframe.
 ///
-/// `frame_data` は IVF 等のコンテナから取り出した、1 フレーム分の VP9 ビットストリーム
-/// （`uncompressed_header` から始まる生データ）。`show_existing_frame == 1` の場合や
-/// `frame_type != KEY_FRAME` の場合はエラーを返す。
+/// `frame_data` is one frame's worth of VP9 bitstream extracted from an IVF or similar
+/// container (raw data starting at `uncompressed_header`). Returns an error if
+/// `show_existing_frame == 1` or `frame_type != KEY_FRAME`.
 ///
-/// キーフレームは他フレームを参照しない・確率テーブルを常にデフォルトから開始するため、
-/// フレーム間状態（[`Decoder`]）を持たない単発の関数として提供している
-/// （内部的には使い捨ての [`Decoder`] を介して [`Decoder::decode_frame`] を呼ぶ）。
-/// 複数フレーム（インターフレームを含む）を順に読み進める場合は [`Decoder`] を直接使うこと。
+/// A keyframe references no other frames and always starts probability tables from
+/// their defaults, so this is provided as a standalone function that carries no
+/// inter-frame state ([`Decoder`]) (internally it calls [`Decoder::decode_frame`]
+/// via a disposable [`Decoder`]). To read through multiple frames in sequence
+/// (including inter frames), use [`Decoder`] directly.
 ///
-/// タイル復号後、クロップ前にループフィルタ（仕様 8.8 節、[`crate::loop_filter`]）を適用する。
+/// After tile decoding and before cropping, the loop filter (spec §8.8, [`crate::loop_filter`]) is applied.
 pub fn decode_keyframe(frame_data: &[u8]) -> Result<Frame, DecodeError> {
-    // キーフレームであることを事前に確認する（decode_frame は非キーフレームも受け付けるため）。
+    // Confirm up front that this is a keyframe (decode_frame also accepts non-keyframes).
     let dummy_ref_sizes = [(0u32, 0u32); NUM_REF_FRAMES];
     let dummy_lf_deltas = (
         header::DEFAULT_LOOP_FILTER_REF_DELTAS,
         header::DEFAULT_LOOP_FILTER_MODE_DELTAS,
     );
-    let (parsed, _consumed) =
-        parse_uncompressed_header(frame_data, &dummy_ref_sizes, dummy_lf_deltas)?;
+    let dummy_seg_features = (
+        [[false; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
+        [[0i32; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
+        false,
+    );
+    let (parsed, _consumed) = parse_uncompressed_header(
+        frame_data,
+        &dummy_ref_sizes,
+        dummy_lf_deltas,
+        dummy_seg_features,
+    )?;
     match &parsed {
         FrameHeader::New(h) if h.frame_type == FrameType::KeyFrame => {}
         FrameHeader::New(_) => return Err(DecodeError::NotAKeyFrame),
@@ -180,42 +191,57 @@ pub fn decode_keyframe(frame_data: &[u8]) -> Result<Frame, DecodeError> {
     let mut decoder = Decoder::new();
     match decoder.decode_frame(frame_data)? {
         Some(frame) => Ok(frame),
-        None => unreachable!("キーフレームは常に show_frame == 1（frame_is_intra の要件）"),
+        None => unreachable!("a keyframe always has show_frame == 1 (required by frame_is_intra)"),
     }
 }
 
-/// 複数フレームを順にデコードするための状態付きデコーダ。
+/// A stateful decoder for decoding multiple frames in sequence.
 ///
-/// VP9 はフレーム間で以下の状態を引き継ぐため、1 フレームずつ独立に処理できない
-/// （`decode_keyframe` はキーフレーム単体のみを扱うため、この状態を持たない）:
-/// - 参照フレームスロット（`RefFrameWidth`/`RefFrameHeight`、仕様 6.2.5 節
-///   `frame_size_with_refs`）と実ピクセルデータ（[`Dpb`]、仕様 8.10 節）。
-/// - フレームコンテキスト（`frame_context_idx` で選択される確率テーブル 4 スロット、
-///   仕様 7.1.2 節 `load_probs`/`save_probs`）。[`FrameContextStore`] 参照。
-/// - `UsePrevFrameMvs`（仕様 7.2.6 節）が真のとき参照する前フレームの `Mvs`/`RefFrames`
-///   （本実装では前フレームの [`MiGrid`] をまるごと保持する）。
-/// - ループフィルタの `ref_deltas`/`mode_deltas`（仕様 7.2 節、`setup_past_independence()`
-///   でのみリセットされる）。
-/// - `LastFrameType`（仕様 7.2 節。確率適応の `updateFactor` 計算に使う、仕様 8.4.3 節）。
+/// VP9 carries the following state across frames, so frames cannot be processed
+/// independently one by one (`decode_keyframe` handles only standalone keyframes,
+/// so it carries none of this state):
+/// - Reference frame slots (`RefFrameWidth`/`RefFrameHeight`, spec §6.2.5
+///   `frame_size_with_refs`) and the actual pixel data ([`Dpb`], spec §8.10).
+/// - Frame contexts (the 4 probability table slots selected by `frame_context_idx`,
+///   spec §7.1.2 `load_probs`/`save_probs`). See [`FrameContextStore`].
+/// - The previous frame's `Mvs`/`RefFrames`, referenced when `UsePrevFrameMvs`
+///   (spec §7.2.6) is true (this implementation keeps the previous frame's
+///   [`MiGrid`] in its entirety).
+/// - The loop filter's `ref_deltas`/`mode_deltas` (spec §7.2, reset only by
+///   `setup_past_independence()`).
+/// - `LastFrameType` (spec §7.2; used in the `updateFactor` calculation for
+///   probability adaptation, spec §8.4.3).
 pub struct Decoder {
     ref_frame_sizes: [(u32, u32); NUM_REF_FRAMES],
     frame_contexts: FrameContextStore,
-    /// `UsePrevFrameMvs` 計算用（仕様 7.2.6 節）。`show_existing_frame` では更新されない
-    /// （`compute_image_size` が呼ばれないため）。
+    /// Used for computing `UsePrevFrameMvs` (spec §7.2.6). Not updated on
+    /// `show_existing_frame` (because `compute_image_size` isn't called).
     prev_frame_dims: Option<(u32, u32)>,
     prev_show_frame: Option<bool>,
-    /// 前フレームの `Mvs`/`RefFrames`（`PrevMvs`/`PrevRefFrames` 相当）。
+    /// The previous frame's `Mvs`/`RefFrames` (equivalent to `PrevMvs`/`PrevRefFrames`).
     prev_mi_grid: Option<MiGrid>,
-    /// インターフレーム・イントラオンリーフレーム（`Profile == 0`）は `color_config` を
-    /// ビットストリームで再送しないため、直近のキーフレーム/イントラオンリーフレームの
-    /// 値を引き継ぐ（仕様 7.2 節: 参照フレームとビット深度・サブサンプリングが一致することが
-    /// 適合性要件）。
+    /// Inter frames and intra-only frames (`Profile == 0`) don't resend
+    /// `color_config` in the bitstream, so the value is carried over from the
+    /// most recent keyframe/intra-only frame (spec §7.2: it's a conformance
+    /// requirement that bit depth and subsampling match the reference frame).
     last_color_config: Option<ColorConfig>,
-    /// 参照フレームの実ピクセルデータ（仕様 8.10 節 `FrameStore`）。
+    /// The actual pixel data of reference frames (spec §8.10 `FrameStore`).
     dpb: Dpb,
-    /// ループフィルタの `ref_deltas`/`mode_deltas`（仕様 7.2 節で持続する状態）。
+    /// The loop filter's `ref_deltas`/`mode_deltas` (state that persists per spec §7.2).
     loop_filter_deltas: ([i8; 4], [i8; 2]),
-    /// `LastFrameType`（仕様 7.2 節）。`show_existing_frame` フレームでは更新されない。
+    /// The segmentation `FeatureEnabled`/`FeatureData`/`segmentation_abs_or_delta_update`
+    /// state that persists across frames per spec §7.2.10 (reset by `setup_past_independence()`).
+    segmentation_features: (
+        [[bool; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
+        [[i32; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
+        bool,
+    ),
+    /// `PrevSegmentIds` (spec §6.4.14), row-major `MiRows x MiCols` (unpadded).
+    /// Cleared to all-zero on the first frame and whenever the frame size changes
+    /// (spec §7.2.6), updated after decoding only when
+    /// `segmentation_enabled && segmentation_update_map` (spec §8.1 step 3).
+    prev_segment_ids: Vec<u8>,
+    /// `LastFrameType` (spec §7.2). Not updated on `show_existing_frame` frames.
     last_frame_type: Option<FrameType>,
 }
 
@@ -239,21 +265,49 @@ impl Decoder {
                 header::DEFAULT_LOOP_FILTER_REF_DELTAS,
                 header::DEFAULT_LOOP_FILTER_MODE_DELTAS,
             ),
+            segmentation_features: (
+                [[false; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
+                [[0; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
+                false,
+            ),
+            prev_segment_ids: Vec::new(),
             last_frame_type: None,
         }
     }
 
-    /// 1 フレーム分の VP9 ビットストリームをデコードする。呼び出し側は IVF などのコンテナ
-    /// から取り出したフレームを表示順ではなくビットストリーム順（デコード順）に渡すこと。
+    /// Resets `PrevSegmentIds` to all-zero when the spec requires it, before tile decode
+    /// (an error-resilient inter frame reads the map during its own decode):
+    /// - `compute_image_size()` step 1 (spec §7.2.6): first invocation or
+    ///   FrameWidth/FrameHeight changed since the previous invocation (detected via
+    ///   `prev_frame_dims`, read before `decode_frame` overwrites it at the end).
+    /// - `setup_past_independence()` (spec §7.2): `FrameIsIntra || error_resilient_mode`
+    ///   (the caller passes this as `setup_past_independence`).
+    fn clear_prev_segment_ids_if_needed(
+        &mut self,
+        dims: (u32, u32),
+        image_size: &header::ImageSize,
+        setup_past_independence: bool,
+    ) {
+        if setup_past_independence || self.prev_frame_dims != Some(dims) {
+            self.prev_segment_ids = vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize];
+        }
+    }
+
+    /// Decodes one frame's worth of VP9 bitstream. Callers must pass frames extracted
+    /// from an IVF or similar container in bitstream order (decode order), not display order.
     ///
-    /// 戻り値は「表示すべきフレームが得られたか」を表す: `show_existing_frame == 1` または
-    /// `show_frame == 1` の場合は `Some(Frame)`、それ以外（`show_frame == 0` の非表示
-    /// フレーム、いわゆる droppable/altref フレーム）の場合は `None` を返す。内部状態
-    /// （参照フレームバッファ・フレームコンテキスト・前フレームの MV 等）はどちらの場合も
-    /// 正しく更新される。
+    /// The return value indicates whether a displayable frame was produced: `Some(Frame)`
+    /// if `show_existing_frame == 1` or `show_frame == 1`, otherwise (a hidden frame with
+    /// `show_frame == 0`, i.e. a droppable/altref frame) `None`. Internal state
+    /// (reference frame buffers, frame context, previous frame's MVs, etc.) is updated
+    /// correctly in either case.
     pub fn decode_frame(&mut self, frame_data: &[u8]) -> Result<Option<Frame>, DecodeError> {
-        let (parsed, consumed) =
-            parse_uncompressed_header(frame_data, &self.ref_frame_sizes, self.loop_filter_deltas)?;
+        let (parsed, consumed) = parse_uncompressed_header(
+            frame_data,
+            &self.ref_frame_sizes,
+            self.loop_filter_deltas,
+            self.segmentation_features,
+        )?;
         let mut header = match parsed {
             FrameHeader::New(h) => h,
             FrameHeader::ShowExistingFrame {
@@ -270,7 +324,7 @@ impl Decoder {
         if header.frame_is_intra {
             self.last_color_config = Some(header.color_config);
         } else if let Some(cc) = self.last_color_config {
-            // インターフレームは color_config を再送しない（header.rs のコメント参照）。
+            // Inter frames don't resend color_config (see comment in header.rs).
             header.color_config = cc;
         }
 
@@ -290,23 +344,42 @@ impl Decoder {
         }
         let compressed_bytes = &frame_data[compressed_start..compressed_end];
 
-        // UsePrevFrameMvs（仕様 7.2.6 節）。
+        // UsePrevFrameMvs (spec §7.2.6).
         let use_prev_frame_mvs = !header.frame_is_intra
             && !header.error_resilient_mode
             && self.prev_frame_dims == Some((header.width, header.height))
             && self.prev_show_frame == Some(true);
 
-        // setup_past_independence()（仕様 7.2 節）: FrameIsIntra || error_resilient_mode の
-        // 場合、全確率テーブルをデフォルトへリセットしたうえで frame_context_idx は 0 に固定
-        // される（header.rs 側で既に 0 に補正済み）。reset_frame_context による部分リセット
-        // （2: 該当スロットのみ）は未実装だが、後続の load はどのみち header.frame_context_idx
-        // （常に 0）から行われるため、ビットストリーム読み取りの結果には影響しない。
+        let image_size = header::compute_image_size(header.width, header.height);
+        self.clear_prev_segment_ids_if_needed(
+            (header.width, header.height),
+            &image_size,
+            header.frame_is_intra || header.error_resilient_mode,
+        );
+
+        // setup_past_independence() (spec §7.2): called only when FrameIsIntra ||
+        // error_resilient_mode. Its `save_probs` calls reset 0, 1, or all 4 stored
+        // frame context slots to defaults depending on reset_frame_context (see
+        // `frame_context_reset`). frame_context_idx itself is pinned to 0 for the
+        // subsequent load/save (already corrected on the header.rs side).
         if header.frame_is_intra || header.error_resilient_mode {
-            self.frame_contexts.reset_all();
+            match frame_context_reset(
+                header.frame_type,
+                header.error_resilient_mode,
+                header.reset_frame_context,
+                header.frame_context_idx_raw,
+            ) {
+                FrameContextReset::All => self.frame_contexts.reset_all(),
+                FrameContextReset::Slot(idx) => {
+                    self.frame_contexts.save(idx, FrameContext::default())
+                }
+                FrameContextReset::None => {}
+            }
         }
-        // `load_probs`/`load_probs2`（仕様 6.1 節 `frame()` 冒頭）に相当する開始時点の値。
-        // `refresh_probs()`（仕様 6.1.2 節）で forward update 前のこの値へ戻したうえで
-        // backward adaptation を適用するため、compressed_header 呼び出し後も保持しておく。
+        // The starting value equivalent to `load_probs`/`load_probs2` (spec §6.1, start of
+        // `frame()`). Kept around after the compressed_header call because `refresh_probs()`
+        // (spec §6.1.2) restores it to this pre-forward-update value before applying
+        // backward adaptation.
         let starting_probs = self.frame_contexts.load(header.frame_context_idx);
 
         let compressed = parse_compressed_header_ex(
@@ -319,8 +392,8 @@ impl Decoder {
             starting_probs.clone(),
         )?;
 
-        // 動き補償用に、このフレームが参照する DPB スロットのピクセルデータを解決する
-        // （仕様 8.5.2.3〜8.5.2.4 節）。`FrameIsIntra == 1` の場合は参照しない。
+        // Resolve the pixel data of the DPB slots this frame references, for motion
+        // compensation (spec §8.5.2.3-8.5.2.4). Not referenced when `FrameIsIntra == 1`.
         let resolved_refs: [Option<RefFrameData>; 3] = if header.frame_is_intra {
             [None, None, None]
         } else {
@@ -339,21 +412,37 @@ impl Decoder {
             use_prev_frame_mvs,
             prev_grid,
             resolved_refs,
+            self.prev_segment_ids.clone(),
         );
         tile_decoder.decode_tiles(tile_data)?;
         tile_decoder.apply_loop_filter(&header.loop_filter);
 
-        // refresh_probs()（仕様 6.1.2 節）。
+        // spec §8.1 step 3: PrevSegmentIds is refreshed from this frame's SegmentIds only
+        // when segmentation_enabled && segmentation_update_map (not gated by show_frame).
+        // Otherwise it is left as-is (already reset to zero above if the size changed).
+        if header.segmentation.enabled && header.segmentation.update_map {
+            let grid = tile_decoder.mi_grid();
+            let mut new_map = vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize];
+            for row in 0..image_size.mi_rows {
+                for col in 0..image_size.mi_cols {
+                    new_map[(row * image_size.mi_cols + col) as usize] =
+                        grid.get(row, col).segment_id;
+                }
+            }
+            self.prev_segment_ids = new_map;
+        }
+
+        // refresh_probs() (spec §6.1.2).
         let final_probs = if !header.error_resilient_mode && !header.frame_parallel_decoding_mode {
-            // load_probs( frame_context_idx ): tx_probs/skip_prob を除くすべてのテーブルを
-            // forward update 前の値（starting_probs）へ戻す。tx_probs/skip_prob は
-            // compressed_header() の forward update 後の値のまま残す。
+            // load_probs( frame_context_idx ): restore all tables except tx_probs/skip_prob
+            // to their pre-forward-update value (starting_probs). tx_probs/skip_prob are
+            // left at their post-forward-update value from compressed_header().
             let mut working = starting_probs.clone();
             working.tx_probs = compressed.probs.tx_probs;
             working.skip_prob = compressed.probs.skip_prob;
 
             let counts = tile_decoder.counts();
-            // 仕様 8.4.3 節: updateFactor の決定。
+            // Spec §8.4.3: determining updateFactor.
             let update_factor = if header.frame_is_intra {
                 112
             } else if self.last_frame_type == Some(FrameType::KeyFrame) {
@@ -364,8 +453,8 @@ impl Decoder {
             adapt_coef_probs(&mut working.coef_probs, counts, update_factor);
 
             if !header.frame_is_intra {
-                // load_probs2( frame_context_idx ): tx_probs/skip_prob も forward update 前へ
-                // 戻したうえで adapt_noncoef_probs を適用する。
+                // load_probs2( frame_context_idx ): also restore tx_probs/skip_prob to
+                // their pre-forward-update value before applying adapt_noncoef_probs.
                 working.tx_probs = starting_probs.tx_probs;
                 working.skip_prob = starting_probs.skip_prob;
                 adapt_noncoef_probs(
@@ -385,7 +474,7 @@ impl Decoder {
                 .save(header.frame_context_idx, final_probs);
         }
 
-        // Reference frame update process（仕様 8.10 節）。
+        // Reference frame update process (spec §8.10).
         let ref_data = build_ref_frame_data(
             tile_decoder.planes(),
             header.width,
@@ -399,14 +488,19 @@ impl Decoder {
             }
         }
 
-        // compute_image_size は show_existing_frame では呼ばれないため、ここに来た時点で
-        // 常に呼ばれたことになる（仕様 7.2.6 節）。UsePrevFrameMvs 判定用に記録する。
+        // compute_image_size is never called for show_existing_frame, so by the time we
+        // reach here it has always been called (spec §7.2.6). Recorded for UsePrevFrameMvs.
         self.prev_frame_dims = Some((header.width, header.height));
         self.prev_show_frame = Some(header.show_frame);
         self.prev_mi_grid = Some(tile_decoder.mi_grid().clone());
         self.loop_filter_deltas = (
             header.loop_filter.ref_deltas,
             header.loop_filter.mode_deltas,
+        );
+        self.segmentation_features = (
+            header.segmentation.feature_enabled,
+            header.segmentation.feature_data,
+            header.segmentation.abs_or_delta_update,
         );
         self.last_frame_type = Some(header.frame_type);
 
@@ -419,6 +513,194 @@ impl Decoder {
             )))
         } else {
             Ok(None)
+        }
+    }
+}
+
+/// Which stored frame context slot(s) get reset to defaults, per the `save_probs`
+/// calls inside `setup_past_independence()` (spec §7.2). Only meaningful when called
+/// under `FrameIsIntra || error_resilient_mode` (the condition under which
+/// `setup_past_independence()` runs at all; see the call site in `decode_frame`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameContextReset {
+    /// `reset_frame_context` is 0 or 1: no stored context is touched.
+    None,
+    /// `reset_frame_context == 2`: only the slot at this (raw, pre-`setup_past_independence`) index is reset.
+    Slot(u8),
+    /// `frame_type == KEY_FRAME`, `error_resilient_mode`, or `reset_frame_context == 3`: all 4 slots are reset.
+    All,
+}
+
+/// `frame_context_idx` must be the raw bitstream value (`NewFrameHeader::frame_context_idx_raw`),
+/// since `save_probs( frame_context_idx )` runs before `setup_past_independence()` forces it to 0.
+fn frame_context_reset(
+    frame_type: FrameType,
+    error_resilient_mode: bool,
+    reset_frame_context: u8,
+    frame_context_idx: u8,
+) -> FrameContextReset {
+    if frame_type == FrameType::KeyFrame || error_resilient_mode || reset_frame_context == 3 {
+        FrameContextReset::All
+    } else if reset_frame_context == 2 {
+        FrameContextReset::Slot(frame_context_idx)
+    } else {
+        FrameContextReset::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_context_reset_keyframe_always_resets_all() {
+        // frame_type == KEY_FRAME overrides reset_frame_context entirely.
+        for reset_frame_context in 0..=3 {
+            assert_eq!(
+                frame_context_reset(FrameType::KeyFrame, false, reset_frame_context, 2),
+                FrameContextReset::All
+            );
+        }
+    }
+
+    #[test]
+    fn frame_context_reset_error_resilient_always_resets_all() {
+        // error_resilient_mode overrides reset_frame_context entirely.
+        for reset_frame_context in 0..=3 {
+            assert_eq!(
+                frame_context_reset(FrameType::NonKeyFrame, true, reset_frame_context, 2),
+                FrameContextReset::All
+            );
+        }
+    }
+
+    #[test]
+    fn frame_context_reset_intra_only_reset_frame_context_3_resets_all() {
+        assert_eq!(
+            frame_context_reset(FrameType::NonKeyFrame, false, 3, 2),
+            FrameContextReset::All
+        );
+    }
+
+    #[test]
+    fn frame_context_reset_intra_only_reset_frame_context_2_resets_only_that_slot() {
+        assert_eq!(
+            frame_context_reset(FrameType::NonKeyFrame, false, 2, 0),
+            FrameContextReset::Slot(0)
+        );
+        assert_eq!(
+            frame_context_reset(FrameType::NonKeyFrame, false, 2, 3),
+            FrameContextReset::Slot(3)
+        );
+    }
+
+    #[test]
+    fn frame_context_reset_intra_only_reset_frame_context_0_or_1_resets_nothing() {
+        assert_eq!(
+            frame_context_reset(FrameType::NonKeyFrame, false, 0, 1),
+            FrameContextReset::None
+        );
+        assert_eq!(
+            frame_context_reset(FrameType::NonKeyFrame, false, 1, 1),
+            FrameContextReset::None
+        );
+    }
+
+    /// `PrevSegmentIds` reset lifecycle (`clear_prev_segment_ids_if_needed`):
+    /// zeroed by `setup_past_independence()` (spec §7.2) and by the first-frame /
+    /// size-change condition of `compute_image_size()` (spec §7.2.6); retained for a
+    /// same-size non-intra non-error-resilient frame.
+    #[test]
+    fn prev_segment_ids_reset_lifecycle() {
+        // 16x16 -> MiCols = MiRows = 2 (4 entries).
+        let dims = (16u32, 16u32);
+        let image_size = header::compute_image_size(dims.0, dims.1);
+        let seeded = || {
+            let mut d = Decoder::new();
+            d.prev_frame_dims = Some(dims);
+            d.prev_segment_ids = vec![5u8; 4];
+            d
+        };
+
+        // Same size, no setup_past_independence: the map is retained.
+        let mut d = seeded();
+        d.clear_prev_segment_ids_if_needed(dims, &image_size, false);
+        assert_eq!(d.prev_segment_ids, vec![5u8; 4]);
+
+        // setup_past_independence (FrameIsIntra || error_resilient_mode): zeroed even
+        // though the size is unchanged.
+        let mut d = seeded();
+        d.clear_prev_segment_ids_if_needed(dims, &image_size, true);
+        assert_eq!(d.prev_segment_ids, vec![0u8; 4]);
+
+        // Size change (compute_image_size step 1): zeroed (and resized) even without
+        // setup_past_independence.
+        let mut d = seeded();
+        let new_dims = (24u32, 16u32); // MiCols = 3, MiRows = 2 -> 6 entries.
+        let new_image_size = header::compute_image_size(new_dims.0, new_dims.1);
+        d.clear_prev_segment_ids_if_needed(new_dims, &new_image_size, false);
+        assert_eq!(d.prev_segment_ids, vec![0u8; 6]);
+
+        // First invocation (prev_frame_dims == None): zeroed.
+        let mut d = Decoder::new();
+        d.prev_segment_ids = vec![5u8; 4];
+        d.clear_prev_segment_ids_if_needed(dims, &image_size, false);
+        assert_eq!(d.prev_segment_ids, vec![0u8; 4]);
+    }
+
+    /// A `FrameContext` distinguishable from `FrameContext::default()`, standing in for a
+    /// context that has been backward-adapted (spec §8.4) away from its default values.
+    fn adapted_context() -> FrameContext {
+        let mut ctx = FrameContext::default();
+        ctx.mv_hp_prob = [1, 2];
+        ctx
+    }
+
+    /// End-to-end check of `frame_context_reset`'s output against `FrameContextStore`:
+    /// seeds all 4 slots with a non-default context, applies each reset outcome, and
+    /// checks which slots came back to defaults vs. which retained the adapted value.
+    #[test]
+    fn frame_context_store_reset_application() {
+        let seeded = || {
+            let mut store = FrameContextStore::new();
+            for i in 0..4 {
+                store.save(i, adapted_context());
+            }
+            store
+        };
+
+        // None: every slot keeps the adapted context.
+        let store = seeded();
+        for i in 0..4 {
+            assert_eq!(store.load(i), adapted_context());
+        }
+
+        // Slot(2): only slot 2 resets to defaults; the rest keep the adapted context.
+        let mut store = seeded();
+        if let FrameContextReset::Slot(idx) =
+            frame_context_reset(FrameType::NonKeyFrame, false, 2, 2)
+        {
+            store.save(idx, FrameContext::default());
+        } else {
+            unreachable!();
+        }
+        for i in 0..4 {
+            if i == 2 {
+                assert_eq!(store.load(i), FrameContext::default());
+            } else {
+                assert_eq!(store.load(i), adapted_context());
+            }
+        }
+
+        // All: every slot resets to defaults (e.g. keyframe).
+        let mut store = seeded();
+        assert_eq!(
+            frame_context_reset(FrameType::KeyFrame, false, 0, 0),
+            FrameContextReset::All
+        );
+        store.reset_all();
+        for i in 0..4 {
+            assert_eq!(store.load(i), FrameContext::default());
         }
     }
 }

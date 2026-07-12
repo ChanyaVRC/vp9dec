@@ -1,17 +1,18 @@
-//! VP9 の bool デコーダ（算術復号器、仕様 9.2 節 "Parsing process for Boolean decoder"）。
+//! VP9's bool decoder (arithmetic decoder, spec §9.2 "Parsing process for Boolean decoder").
 //!
-//! 非圧縮フレームヘッダを除く VP9 ビットストリームのほぼ全て（圧縮ヘッダ・タイルデータ）は、
-//! この bool コーダによってエントロピー符号化されている。本実装は仕様の疑似コードに忠実に
-//! 実装したものであり、既存 OSS 実装は一切参照していない（クリーンルーム実装）。
+//! Nearly all of the VP9 bitstream except the uncompressed frame header (the
+//! compressed header and tile data) is entropy-coded by this bool coder. This
+//! implementation follows the spec's pseudocode faithfully and does not reference
+//! any existing OSS implementation (clean-room implementation).
 //!
-//! 参照した仕様の記述（9.2.1 - 9.2.4 節）:
+//! Spec text referenced (§9.2.1 - §9.2.4):
 //!
 //! ```text
 //! 9.2.1 Initialization process for Boolean decoder
 //!   BoolValue = f(8)
 //!   BoolRange = 255
 //!   BoolMaxBits = 8 * sz - 8
-//!   read_bool(128) で marker を読み、0 であることを要求する
+//!   read a marker with read_bool(128), requiring it to be 0
 //!
 //! 9.2.2 Boolean decoding process (read_bool(p))
 //!   split = 1 + (((BoolRange - 1) * p) >> 8)
@@ -20,45 +21,45 @@
 //!   else:
 //!       BoolRange -= split; BoolValue -= split; bool = 1
 //!   while BoolRange < 128:
-//!       newBit = (BoolMaxBits > 0) ? f(1) : 0   (読んだ場合 BoolMaxBits -= 1)
+//!       newBit = (BoolMaxBits > 0) ? f(1) : 0   (if read, BoolMaxBits -= 1)
 //!       BoolRange *= 2
 //!       BoolValue = (BoolValue << 1) + newBit
 //!
 //! 9.2.3 Exit process for Boolean decoder (exit_bool())
-//!   残りの BoolMaxBits 分のパディングを読み捨てる（0 であることが期待される）
+//!   discard the remaining BoolMaxBits worth of padding (expected to be 0)
 //!
 //! 9.2.4 Parsing process for read_literal(n)
 //!   x = 0
 //!   for i in 0..n: x = 2 * x + read_bool(128)
 //! ```
 
-/// bool デコーダ初期化時に発生し得るエラー。
+/// Errors that can occur when initializing the bool decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoolCoderError {
-    /// `init_bool(sz)` は sz < 1 で呼び出されてはならない（仕様 9.2.1 節）。
+    /// `init_bool(sz)` must not be called with sz < 1 (spec §9.2.1).
     EmptyBuffer,
-    /// 初期化直後に読むマーカービットは 0 でなければならない（仕様 9.2.1 節）。
+    /// The marker bit read right after initialization must be 0 (spec §9.2.1).
     InvalidMarker,
 }
 
-/// VP9 の算術復号器（bool デコーダ）。
+/// VP9's arithmetic decoder (bool decoder).
 ///
-/// `data` は `init_bool( sz )` の `sz` バイト分のスライス（圧縮ヘッダやタイルデータそのもの）を
-/// そのまま渡すことを想定している。
+/// `data` is expected to be the `sz`-byte slice from `init_bool( sz )` (the
+/// compressed header or tile data itself), passed through as-is.
 #[derive(Debug, Clone)]
 pub struct BoolDecoder<'a> {
     data: &'a [u8],
-    /// 次に読み出す生ビットの絶対位置。`data[0]` は BoolValue の初期値として既に消費済みなので
-    /// 初期値は 8。
+    /// Absolute position of the next raw bit to read. `data[0]` is already
+    /// consumed as the initial value of BoolValue, so the initial value is 8.
     bit_pos: usize,
-    /// BoolValue。
+    /// BoolValue.
     value: u32,
-    /// BoolRange。
+    /// BoolRange.
     range: u32,
 }
 
 impl<'a> BoolDecoder<'a> {
-    /// `init_bool( sz )` に相当する。`data.len()` が仕様の `sz` にあたる。
+    /// Corresponds to `init_bool( sz )`. `data.len()` is the spec's `sz`.
     pub fn new(data: &'a [u8]) -> Result<Self, BoolCoderError> {
         if data.is_empty() {
             return Err(BoolCoderError::EmptyBuffer);
@@ -69,15 +70,15 @@ impl<'a> BoolDecoder<'a> {
             value: data[0] as u32,
             range: 255,
         };
-        // 仕様適合ストリームでは、初期化直後に読まれるマーカービットは常に 0 である。
+        // In a spec-conformant stream, the marker bit read right after initialization is always 0.
         if decoder.read_bool(128) {
             return Err(BoolCoderError::InvalidMarker);
         }
         Ok(decoder)
     }
 
-    /// 生のビットストリームから 1 ビット読む（MSB が先）。範囲外を読もうとした場合は
-    /// 仕様の「BoolMaxBits == 0 の場合は newBit = 0」に対応する挙動として 0 を返す。
+    /// Reads 1 bit from the raw bit stream (MSB first). Reading past the end
+    /// returns 0, matching the spec's "newBit = 0 when BoolMaxBits == 0" behavior.
     fn read_bit_raw(&mut self) -> u32 {
         let total_bits = self.data.len() * 8;
         if self.bit_pos >= total_bits {
@@ -89,7 +90,7 @@ impl<'a> BoolDecoder<'a> {
         ((self.data[byte_index] >> bit_index_from_msb) & 1) as u32
     }
 
-    /// `read_bool( p )`（仕様 9.2.2 節）。確率 p (0..=255, 分母 256) に基づいて 1 bool を復号する。
+    /// `read_bool( p )` (spec §9.2.2). Decodes 1 bool based on probability p (0..=255, denominator 256).
     pub fn read_bool(&mut self, p: u8) -> bool {
         let split = 1 + (((self.range - 1) * p as u32) >> 8);
         let bit = if self.value < split {
@@ -108,7 +109,7 @@ impl<'a> BoolDecoder<'a> {
         bit
     }
 
-    /// `read_literal( n )`（仕様 9.2.4 節）。確率 1/2 (p=128) の n ビットを上位ビットから読む。
+    /// `read_literal( n )` (spec §9.2.4). Reads n bits with probability 1/2 (p=128), high bit first.
     pub fn read_literal(&mut self, n: u32) -> u32 {
         let mut x = 0u32;
         for _ in 0..n {
@@ -117,11 +118,13 @@ impl<'a> BoolDecoder<'a> {
         x
     }
 
-    /// 木符号化されたシンタックス要素の復号処理（仕様 9.3.3 節 "Tree decoding process"）。
+    /// Decoding process for tree-coded syntax elements (spec §9.3.3, "Tree decoding process").
     ///
-    /// `tree` は仕様の木配列そのもの（葉は非正の値 `-value`、内部ノードは次のインデックスを
-    /// 指す非負の値）。`prob_of(node)` はノード番号（`n >> 1`）から確率選択処理（仕様 9.3.2 節）
-    /// で得られる確率を返すクロージャで、呼び出し側が構築する。
+    /// `tree` is the spec's tree array itself (leaves are non-positive values
+    /// `-value`, internal nodes are non-negative values pointing to the next
+    /// index). `prob_of(node)` is a closure, built by the caller, that returns
+    /// the probability obtained from the probability selection process (spec
+    /// §9.3.2) given a node number (`n >> 1`).
     ///
     /// ```text
     /// do {
@@ -145,58 +148,65 @@ impl<'a> BoolDecoder<'a> {
         -n
     }
 
-    /// `exit_bool( )`（仕様 9.2.3 節）。残りのパディングビットを読み捨てて終了する。
+    /// `exit_bool( )` (spec §9.2.3). Discards the remaining padding bits and finishes.
     ///
-    /// 仕様上パディングは 0 であることが要求されるが、本実装では非準拠ストリームでも
-    /// パニックしないよう、値の検証は行わずバッファ終端まで内部位置を進めるだけに留める。
+    /// The spec requires the padding to be 0, but this implementation does not
+    /// validate the value and only advances the internal position to the end
+    /// of the buffer, so it does not panic on non-conformant streams.
     pub fn exit_bool(&mut self) {
         self.bit_pos = self.data.len() * 8;
     }
 }
 
-/// テスト専用の bool エンコーダ。`compressed_header`/`tile` モジュールの単体テストからも
-/// 再利用するため、`pub(crate)` な独立モジュールとして切り出している
-/// （ライブラリ本体の非テストコードには含めない。VP9 はデコーダのみを実装対象とするため）。
+/// A bool encoder for tests only. Factored out into its own `pub(crate)` module
+/// so it can be reused from the `compressed_header`/`tile` module unit tests as
+/// well (kept out of the library's non-test code, since VP9 only implements a
+/// decoder here).
 #[cfg(test)]
 pub(crate) mod test_support {
-    /// テスト専用の bool エンコーダ。
+    /// A bool encoder for tests only.
     ///
-    /// [`super::BoolDecoder`] の逆演算を行う算術符号器で、ラウンドトリップテストのためだけに
-    /// 実装する。
+    /// This is an arithmetic encoder performing the inverse operation of
+    /// [`super::BoolDecoder`], implemented solely for round-trip tests.
     ///
-    /// 実装方針: このコーダは「範囲 (BoolRange) は 255 を上限に、128 未満になるたびに
-    /// 1 ビットずつ倍加して正規化する」という構造を持つため、エンコーダ側は
-    /// 「まだ確定していない下位ビットへの桁上げ (キャリー) が、既に出力したビット列に
-    /// 遡って影響し得る」という古典的な算術符号化の問題を抱える。
+    /// Implementation approach: because this coder has the structure "the
+    /// range (BoolRange) is capped at 255 and renormalized by doubling one
+    /// bit at a time whenever it drops below 128", the encoder side has the
+    /// classic arithmetic-coding problem where a carry into not-yet-finalized
+    /// low bits can retroactively affect bits already emitted.
     ///
-    /// ここではストリーミングを行わず、エンコード対象の bool 列をすべて受け取ってから
-    /// 一括で出力する設計とし、内部状態 `low` を「桁数無制限の 2 進数」として保持することで
-    /// キャリー伝搬を厳密な多倍長演算として扱う（近似や特殊なキャリー検出ロジックを
-    /// 必要としない）。
+    /// This implementation does not stream; instead it receives the entire
+    /// sequence of bools to encode and emits the output all at once, holding
+    /// the internal state `low` as an "arbitrary-precision binary number" so
+    /// that carry propagation is handled as exact bignum arithmetic (no
+    /// approximation or special carry-detection logic needed).
     pub(crate) struct BoolEncoder {
-        /// `low` の 2 進数表現。`bits[0]` が最上位ビット（最初に確定したビット）、
-        /// `bits.last()` が最下位ビット（直近に正規化でシフトインされたビット）。
-        /// 先頭 8 ビットは BoolValue が格納される 1 バイト目に対応するプレースホルダーとして
-        /// 0 で初期化する。
+        /// Binary representation of `low`. `bits[0]` is the most significant
+        /// bit (the first bit finalized), `bits.last()` is the least
+        /// significant bit (the most recently shifted-in bit from
+        /// renormalization). The first 8 bits are initialized to 0 as a
+        /// placeholder for the first byte, where BoolValue is stored.
         low_bits: Vec<u8>,
-        /// BoolRange の符号化側での対応物。デコーダと全く同じ更新式で遷移する
-        /// （BoolRange の遷移は bool 値と確率だけで決まり、出力ビット列には依存しないため）。
+        /// The encoder-side counterpart of BoolRange. It transitions with
+        /// exactly the same update formula as the decoder (BoolRange's
+        /// transition depends only on the bool value and the probability,
+        /// not on the output bit stream).
         range: u32,
     }
 
     impl BoolEncoder {
         pub(crate) fn new() -> Self {
             let mut enc = Self {
-                low_bits: vec![0u8; 8], // BoolValue 用の 1 バイト目のプレースホルダー
+                low_bits: vec![0u8; 8], // Placeholder for the first byte, used for BoolValue
                 range: 255,
             };
-            // init_bool の一部として読まれるマーカービット（常に 0）をエンコードする。
+            // Encode the marker bit (always 0) that is read as part of init_bool.
             enc.write_bool(false, 128);
             enc
         }
 
         fn add_split(&mut self, split: u32) {
-            // low_bits (最下位ビットが末尾) に対して split を加算し、桁上げを上位へ伝搬する。
+            // Add split to low_bits (least significant bit at the end), propagating any carry upward.
             let mut carry = split;
             let mut idx = self.low_bits.len();
             while carry != 0 {
@@ -220,7 +230,7 @@ pub(crate) mod test_support {
                 self.range = split;
             }
             while self.range < 128 {
-                self.low_bits.push(0); // 新しい最下位ビットのプレースホルダー（後で桁上げにより 1 になり得る）
+                self.low_bits.push(0); // Placeholder for the new least significant bit (may later become 1 via a carry)
                 self.range <<= 1;
             }
         }
@@ -232,8 +242,8 @@ pub(crate) mod test_support {
             }
         }
 
-        /// エンコードを終了し、バイト列を返す（`exit_bool` に相当するバイト境界までの
-        /// 0 パディングを行う）。
+        /// Finishes encoding and returns the byte sequence (zero-pads to the
+        /// byte boundary, corresponding to `exit_bool`).
         pub(crate) fn finish(mut self) -> Vec<u8> {
             while !self.low_bits.len().is_multiple_of(8) {
                 self.low_bits.push(0);
@@ -251,7 +261,7 @@ mod tests {
     use super::test_support::BoolEncoder;
     use super::*;
 
-    /// テスト専用の単純な線形合同法（LCG）による疑似乱数生成器。
+    /// A simple linear congruential generator (LCG) pseudo-random number generator, for tests only.
     struct Lcg {
         state: u64,
     }
@@ -264,7 +274,7 @@ mod tests {
         }
 
         fn next_u32(&mut self) -> u32 {
-            // Numerical Recipes の定数を用いた LCG。
+            // LCG using the Numerical Recipes constants.
             self.state = self
                 .state
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -272,7 +282,7 @@ mod tests {
             (self.state >> 32) as u32
         }
 
-        /// 0..=255 の確率値を返す（0 と 255 の境界値も出現しうる）。
+        /// Returns a probability value in 0..=255 (the boundary values 0 and 255 can also occur).
         fn next_prob(&mut self) -> u8 {
             (self.next_u32() % 256) as u8
         }
@@ -293,8 +303,8 @@ mod tests {
 
     #[test]
     fn invalid_marker_is_rejected() {
-        // 先頭バイトが 128 以上だと、BoolRange=255 での split=128 に対し
-        // value(=0xFF) >= split となり marker が 1 と読めてしまうため不正。
+        // If the first byte is 128 or more, then with split=128 at BoolRange=255,
+        // value(=0xFF) >= split, so marker would read as 1, which is invalid.
         let data = [0xFFu8, 0x00];
         assert_eq!(
             BoolDecoder::new(&data).unwrap_err(),
@@ -333,15 +343,15 @@ mod tests {
         assert_eq!(dec.read_literal(4), 0xF);
     }
 
-    /// 乱数列 × 確率列によるラウンドトリップテスト。複数のシードと長さで検証する。
+    /// Round-trip test using random bit sequences x probability sequences. Verified across multiple seeds and lengths.
     #[test]
     fn roundtrip_random_sequences() {
         for seed in [1u64, 2, 42, 1234567, 0xDEAD_BEEF, 999_999_999] {
             for &len in &[0usize, 1, 2, 7, 16, 100, 500, 2000] {
                 let mut lcg = Lcg::new(seed ^ len as u64);
                 let bits: Vec<bool> = (0..len).map(|_| lcg.next_bool()).collect();
-                // 確率 0 は split の式的には 1 として扱われる（1 + ... の下駄がある）ため
-                // 0..=255 全域をそのまま使ってよい。
+                // Probability 0 is treated as 1 in the split formula (there's a "+1" floor),
+                // so the full 0..=255 range can be used as-is.
                 let probs: Vec<u8> = (0..len).map(|_| lcg.next_prob()).collect();
 
                 let mut enc = BoolEncoder::new();
@@ -362,7 +372,7 @@ mod tests {
 
     #[test]
     fn roundtrip_extreme_probabilities() {
-        // 確率の境界値 (0, 1, 254, 255) を混在させたシーケンスでも一致することを確認する。
+        // Verify that a sequence mixing boundary probability values (0, 1, 254, 255) still round-trips correctly.
         let bits = [
             true, true, false, false, true, false, true, false, true, true,
         ];
@@ -382,14 +392,14 @@ mod tests {
 
     #[test]
     fn read_tree_decodes_all_leaves() {
-        // PARTITION_TYPES 相当の 4 値木: [ -0, 2, -1, 4, -2, -3 ]
+        // A 4-value tree equivalent to PARTITION_TYPES: [ -0, 2, -1, 4, -2, -3 ]
         let tree: [i32; 6] = [0, 2, -1, 4, -2, -3];
         let probs = [100u8, 150u8, 200u8];
 
-        // 値 0 -> bit列 [0]
-        // 値 1 -> bit列 [1, 0]
-        // 値 2 -> bit列 [1, 1, 0]
-        // 値 3 -> bit列 [1, 1, 1]
+        // value 0 -> bit sequence [0]
+        // value 1 -> bit sequence [1, 0]
+        // value 2 -> bit sequence [1, 1, 0]
+        // value 3 -> bit sequence [1, 1, 1]
         let mut enc = BoolEncoder::new();
         enc.write_bool(false, probs[0]); // 0
         enc.write_bool(true, probs[0]);

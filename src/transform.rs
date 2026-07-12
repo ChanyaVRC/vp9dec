@@ -1,31 +1,32 @@
-//! 逆変換（Inverse Transform）モジュール。
+//! Inverse Transform module.
 //!
-//! 参照仕様: VP9 Bitstream & Decoding Process Specification v0.7, 8.7 節
-//! "Inverse transform process"。
+//! Reference spec: VP9 Bitstream & Decoding Process Specification v0.7, §8.7
+//! "Inverse transform process".
 //!
-//! 本モジュールは以下を提供する:
-//! - 逆 DCT（4x4 / 8x8 / 16x16 / 32x32）: 仕様 8.7.1.2〜8.7.1.3 節の
-//!   permutation + butterfly ネットワークをそのまま実装した `idct4/8/16/32`。
-//! - 逆 ADST（4x4 / 8x8 / 16x16）: 仕様 8.7.1.4〜8.7.1.9 節の `iadst4/8/16`。
-//! - 逆 Walsh-Hadamard 変換（4x4, ロスレス用）: 仕様 8.7.1.10 節の `iwht4`。
-//! - 2 次元変換の組み立て（行変換 → 列変換 → 最終シフト）: 仕様 8.7.2 節の
-//!   `inverse_transform_block`。
+//! This module provides the following:
+//! - Inverse DCT (4x4 / 8x8 / 16x16 / 32x32): `idct4/8/16/32`, a direct
+//!   implementation of the permutation + butterfly network from spec §8.7.1.2-8.7.1.3.
+//! - Inverse ADST (4x4 / 8x8 / 16x16): `iadst4/8/16` from spec §8.7.1.4-8.7.1.9.
+//! - Inverse Walsh-Hadamard transform (4x4, for lossless): `iwht4` from spec §8.7.1.10.
+//! - Assembly of the 2D transform (row transform -> column transform -> final
+//!   shift): `inverse_transform_block` from spec §8.7.2.
 //!
-//! 変換の中間値は仕様が要求する精度（`8 + BitDepth` bit、ADST の `S` 配列は
-//! `24 + BitDepth` bit）を余裕を持って収められるよう、すべて `i64` で計算する。
+//! All transform intermediates are computed as `i64` with plenty of headroom
+//! to hold the precision the spec requires (`8 + BitDepth` bits; the ADST `S`
+//! array needs `24 + BitDepth` bits).
 
-/// 仕様 4.6 節 `Round2(x, n) = (x + (1 << (n-1))) >> n`。
+/// Spec §4.6 `Round2(x, n) = (x + (1 << (n-1))) >> n`.
 ///
-/// 本モジュール内での呼び出しは常に `n >= 1` である（仕様上 `n == 0` での
-/// 呼び出しは発生しない）。
+/// Calls within this module always use `n >= 1` (the spec never calls this
+/// with `n == 0`).
 #[inline]
 fn round2(x: i64, n: u32) -> i64 {
     debug_assert!(n >= 1);
     (x + (1i64 << (n - 1))) >> n
 }
 
-/// 仕様 8.7.1.1 節 `cos64_lookup[ 33 ]`。
-/// `cos64_lookup[i] == round(16384 * cos(i * pi / 64))`。
+/// Spec §8.7.1.1 `cos64_lookup[ 33 ]`.
+/// `cos64_lookup[i] == round(16384 * cos(i * pi / 64))`.
 #[rustfmt::skip]
 const COS64_LOOKUP: [i64; 33] = [
     16384, 16364, 16305, 16207, 16069, 15893, 15679, 15426,
@@ -35,9 +36,9 @@ const COS64_LOOKUP: [i64; 33] = [
     0,
 ];
 
-/// 仕様 8.7.1.1 節 `cos64( angle )`。
+/// Spec §8.7.1.1 `cos64( angle )`.
 fn cos64(angle: i32) -> i64 {
-    // `angle & 127` は 2 の補数表現において `angle.rem_euclid(128)` と等価。
+    // `angle & 127` is equivalent to `angle.rem_euclid(128)` in two's complement.
     let angle2 = angle.rem_euclid(128);
     match angle2 {
         0..=32 => COS64_LOOKUP[angle2 as usize],
@@ -47,12 +48,12 @@ fn cos64(angle: i32) -> i64 {
     }
 }
 
-/// 仕様 8.7.1.1 節 `sin64( angle ) = cos64( angle - 32 )`。
+/// Spec §8.7.1.1 `sin64( angle ) = cos64( angle - 32 )`.
 fn sin64(angle: i32) -> i64 {
     cos64(angle - 32)
 }
 
-/// 仕様 8.7.1.1 節 `brev(numBits, x)`（ビット反転）。
+/// Spec §8.7.1.1 `brev(numBits, x)` (bit reversal).
 fn brev(num_bits: u32, x: usize) -> usize {
     let mut t = 0usize;
     for i in 0..num_bits {
@@ -62,7 +63,7 @@ fn brev(num_bits: u32, x: usize) -> usize {
     t
 }
 
-/// 仕様 8.7.1.1 節 `B( a, b, angle, flip )` バタフライ回転。
+/// Spec §8.7.1.1 `B( a, b, angle, flip )` butterfly rotation.
 fn b_op(t: &mut [i64], a: usize, b: usize, angle: i32, flip: bool) {
     let ta = t[a];
     let tb = t[b];
@@ -75,7 +76,7 @@ fn b_op(t: &mut [i64], a: usize, b: usize, angle: i32, flip: bool) {
     }
 }
 
-/// 仕様 8.7.1.1 節 `H( a, b, flip )` アダマール回転。
+/// Spec §8.7.1.1 `H( a, b, flip )` Hadamard rotation.
 fn h_op(t: &mut [i64], a: usize, b: usize, flip: bool) {
     let (a, b) = if flip { (b, a) } else { (a, b) };
     let x = t[a];
@@ -84,7 +85,7 @@ fn h_op(t: &mut [i64], a: usize, b: usize, flip: bool) {
     t[b] = x - y;
 }
 
-/// 仕様 8.7.1.1 節 `SB( a, b, angle, flip )`（高精度 `S` 配列への回転）。
+/// Spec §8.7.1.1 `SB( a, b, angle, flip )` (rotation into the high-precision `S` array).
 fn sb_op(s: &mut [i64], t: &[i64], a: usize, b: usize, angle: i32, flip: bool) {
     let ta = t[a];
     let tb = t[b];
@@ -99,13 +100,13 @@ fn sb_op(s: &mut [i64], t: &[i64], a: usize, b: usize, angle: i32, flip: bool) {
     }
 }
 
-/// 仕様 8.7.1.1 節 `SH( a, b )`。
+/// Spec §8.7.1.1 `SH( a, b )`.
 fn sh_op(t: &mut [i64], s: &[i64], a: usize, b: usize) {
     t[a] = round2(s[a] + s[b], 14);
     t[b] = round2(s[a] - s[b], 14);
 }
 
-/// 仕様 8.7.1.2 節: 逆 DCT 用の入力配列並べ替え（ビット反転permutation）。
+/// Spec §8.7.1.2: input array reordering for the inverse DCT (bit-reversal permutation).
 fn idct_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
     let copy_t: Vec<i64> = t[..n0].to_vec();
@@ -114,15 +115,15 @@ fn idct_permute(t: &mut [i64], n: u32) {
     }
 }
 
-/// 仕様 8.7.1.3 節: 逆 DCT バタフライネットワーク本体（`2 <= n <= 5`）。
+/// Spec §8.7.1.3: the inverse DCT butterfly network itself (`2 <= n <= 5`).
 ///
-/// 呼び出し前に [`idct_permute`] 済みであることが前提。
+/// Assumes [`idct_permute`] has already been applied before this is called.
 fn idct(t: &mut [i64], n: u32) {
     let n0 = 1i64 << n;
     let n1 = 1i64 << (n - 1);
     let n2 = 1i64 << (n - 2);
 
-    // 1. n==2 なら直接バタフライ、そうでなければ n-1 で再帰（前半 n1 要素のみを使う）。
+    // 1. If n==2, butterfly directly; otherwise recurse with n-1 (using only the first n1 elements).
     if n == 2 {
         b_op(t, 0, 1, 16, true);
     } else {
@@ -149,7 +150,7 @@ fn idct(t: &mut [i64], n: u32) {
         }
     }
 
-    // 4. n==5 の追加ステージ。
+    // 4. Additional stage for n==5.
     if n == 5 {
         for i in 0..2i64 {
             for j in 0..2i64 {
@@ -169,7 +170,7 @@ fn idct(t: &mut [i64], n: u32) {
         }
     }
 
-    // 5. n>=4 の追加ステージ。
+    // 5. Additional stage for n>=4.
     if n >= 4 {
         let imax_a: i64 = if n == 5 { 1 } else { 0 };
         for i in 0..=imax_a {
@@ -208,7 +209,7 @@ fn idct(t: &mut [i64], n: u32) {
     }
 }
 
-/// 仕様 8.7.1.4 節: 逆 ADST 入力配列並べ替え。
+/// Spec §8.7.1.4: input array reordering for the inverse ADST.
 fn adst_input_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
     let n1 = 1usize << (n - 1);
@@ -219,7 +220,7 @@ fn adst_input_permute(t: &mut [i64], n: u32) {
     }
 }
 
-/// 仕様 8.7.1.5 節: 逆 ADST 出力配列並べ替え（`n` は 3 または 4）。
+/// Spec §8.7.1.5: output array reordering for the inverse ADST (`n` is 3 or 4).
 fn adst_output_permute(t: &mut [i64], n: u32) {
     if n == 4 {
         let copy_t: Vec<i64> = t[..16].to_vec();
@@ -249,13 +250,13 @@ fn adst_output_permute(t: &mut [i64], n: u32) {
     }
 }
 
-/// 仕様 8.7.1.6 節の定数 `SINPI_k_9`。
+/// Spec §8.7.1.6 constants `SINPI_k_9`.
 const SINPI_1_9: i64 = 5283;
 const SINPI_2_9: i64 = 9929;
 const SINPI_3_9: i64 = 13377;
 const SINPI_4_9: i64 = 15212;
 
-/// 仕様 8.7.1.6 節: 逆 ADST4 本体。
+/// Spec §8.7.1.6: inverse ADST4 body.
 fn iadst4_impl(t: &mut [i64]) {
     let s0 = SINPI_1_9 * t[0];
     let s1 = SINPI_2_9 * t[0];
@@ -280,7 +281,7 @@ fn iadst4_impl(t: &mut [i64]) {
     t[3] = round2(o3, 14);
 }
 
-/// 仕様 8.7.1.7 節: 逆 ADST8 本体。
+/// Spec §8.7.1.7: inverse ADST8 body.
 fn iadst8_impl(t: &mut [i64]) {
     adst_input_permute(t, 3);
     let mut s = [0i64; 8];
@@ -311,7 +312,7 @@ fn iadst8_impl(t: &mut [i64]) {
     }
 }
 
-/// 仕様 8.7.1.8 節: 逆 ADST16 本体。
+/// Spec §8.7.1.8: inverse ADST16 body.
 fn iadst16_impl(t: &mut [i64]) {
     adst_input_permute(t, 4);
     let mut s = [0i64; 16];
@@ -369,58 +370,59 @@ fn iadst16_impl(t: &mut [i64]) {
     }
 }
 
-/// 仕様 8.7.1.9 節: `n` に応じて ADST4/8/16 を選択する（内部ディスパッチ用）。
+/// Spec §8.7.1.9: selects ADST4/8/16 based on `n` (for internal dispatch).
 fn iadst(t: &mut [i64], n: u32) {
     match n {
         2 => iadst4_impl(t),
         3 => iadst8_impl(t),
         4 => iadst16_impl(t),
-        _ => unreachable!("iadst は n = 2..=4 のみサポートする"),
+        _ => unreachable!("iadst only supports n = 2..=4"),
     }
 }
 
-/// 仕様 8.7.1.2〜8.7.1.3 節: 逆 DCT（サイズ 4）。
+/// Spec §8.7.1.2-8.7.1.3: inverse DCT (size 4).
 pub fn idct4(t: &mut [i64; 4]) {
     idct_permute(&mut t[..], 2);
     idct(&mut t[..], 2);
 }
 
-/// 仕様 8.7.1.2〜8.7.1.3 節: 逆 DCT（サイズ 8）。
+/// Spec §8.7.1.2-8.7.1.3: inverse DCT (size 8).
 pub fn idct8(t: &mut [i64; 8]) {
     idct_permute(&mut t[..], 3);
     idct(&mut t[..], 3);
 }
 
-/// 仕様 8.7.1.2〜8.7.1.3 節: 逆 DCT（サイズ 16）。
+/// Spec §8.7.1.2-8.7.1.3: inverse DCT (size 16).
 pub fn idct16(t: &mut [i64; 16]) {
     idct_permute(&mut t[..], 4);
     idct(&mut t[..], 4);
 }
 
-/// 仕様 8.7.1.2〜8.7.1.3 節: 逆 DCT（サイズ 32）。
+/// Spec §8.7.1.2-8.7.1.3: inverse DCT (size 32).
 pub fn idct32(t: &mut [i64; 32]) {
     idct_permute(&mut t[..], 5);
     idct(&mut t[..], 5);
 }
 
-/// 仕様 8.7.1.4〜8.7.1.6 節: 逆 ADST（サイズ 4）。
+/// Spec §8.7.1.4-8.7.1.6: inverse ADST (size 4).
 pub fn iadst4(t: &mut [i64; 4]) {
     iadst4_impl(&mut t[..]);
 }
 
-/// 仕様 8.7.1.4〜8.7.1.5、8.7.1.7 節: 逆 ADST（サイズ 8）。
+/// Spec §8.7.1.4-8.7.1.5, 8.7.1.7: inverse ADST (size 8).
 pub fn iadst8(t: &mut [i64; 8]) {
     iadst8_impl(&mut t[..]);
 }
 
-/// 仕様 8.7.1.4〜8.7.1.5、8.7.1.8 節: 逆 ADST（サイズ 16）。
+/// Spec §8.7.1.4-8.7.1.5, 8.7.1.8: inverse ADST (size 16).
 pub fn iadst16(t: &mut [i64; 16]) {
     iadst16_impl(&mut t[..]);
 }
 
-/// 仕様 8.7.1.10 節: 逆 Walsh-Hadamard 変換（ロスレス、4x4 専用）。
+/// Spec §8.7.1.10: inverse Walsh-Hadamard transform (lossless, 4x4 only).
 ///
-/// `shift` は行変換時 2、列変換時 0 を指定する（仕様 8.7.2 節）。
+/// `shift` should be 2 for the row transform and 0 for the column transform
+/// (spec §8.7.2).
 pub fn iwht4(t: &mut [i64; 4], shift: u32) {
     let mut a = t[0] >> shift;
     let mut c = t[1] >> shift;
@@ -439,42 +441,43 @@ pub fn iwht4(t: &mut [i64; 4], shift: u32) {
     t[3] = d;
 }
 
-/// 仕様 8.7.2 節 `TxType`（列方向_行方向の順で命名）。
+/// Spec §8.7.2 `TxType` (named in column_row order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxType {
-    /// 列: DCT / 行: DCT
+    /// Column: DCT / Row: DCT
     DctDct,
-    /// 列: ADST / 行: DCT
+    /// Column: ADST / Row: DCT
     AdstDct,
-    /// 列: DCT / 行: ADST
+    /// Column: DCT / Row: ADST
     DctAdst,
-    /// 列: ADST / 行: ADST
+    /// Column: ADST / Row: ADST
     AdstAdst,
 }
 
-/// 仕様 8.7.2 節: 2 次元逆変換。
+/// Spec §8.7.2: 2D inverse transform.
 ///
-/// `dequant` は行優先（row-major）で格納された `n0 x n0`（`n0 = 1 << n`）の
-/// 逆量子化済み係数配列であり、変換後の結果もこの配列に上書きされる。
-/// `lossless` が真の場合は `tx_type` に関わらず逆 WHT（`n == 2` 専用）を用いる。
+/// `dequant` is a row-major `n0 x n0` (`n0 = 1 << n`) array of dequantized
+/// coefficients; the transformed result overwrites this same array.
+/// If `lossless` is true, the inverse WHT (`n == 2` only) is used regardless
+/// of `tx_type`.
 ///
 /// # Panics
-/// `dequant.len() != (1 << n) * (1 << n)` の場合、または `lossless == true` かつ
-/// `n != 2` の場合にパニックする。
+/// Panics if `dequant.len() != (1 << n) * (1 << n)`, or if `lossless == true`
+/// and `n != 2`.
 pub fn inverse_transform_block(dequant: &mut [i64], n: u32, tx_type: TxType, lossless: bool) {
     let n0 = 1usize << n;
     assert_eq!(
         dequant.len(),
         n0 * n0,
-        "dequant のサイズが n0 x n0 と一致しない"
+        "dequant size does not match n0 x n0"
     );
     if lossless {
-        assert_eq!(n, 2, "ロスレス変換（WHT）は 4x4 のみサポートする");
+        assert_eq!(n, 2, "lossless transform (WHT) only supports 4x4");
     }
 
     let mut t = vec![0i64; n0];
 
-    // 行変換（row transform）: i = 0..(n0-1)。
+    // Row transform: i = 0..(n0-1).
     for i in 0..n0 {
         t[..n0].copy_from_slice(&dequant[i * n0..(i + 1) * n0]);
         if lossless {
@@ -494,7 +497,7 @@ pub fn inverse_transform_block(dequant: &mut [i64], n: u32, tx_type: TxType, los
         dequant[i * n0..(i + 1) * n0].copy_from_slice(&t[..n0]);
     }
 
-    // 列変換（column transform）: j = 0..(n0-1)。
+    // Column transform: j = 0..(n0-1).
     let shift = (n + 2).min(6);
     for j in 0..n0 {
         for i in 0..n0 {

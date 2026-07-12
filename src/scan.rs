@@ -1,10 +1,10 @@
-//! スキャン順（Scan order）テーブル。
+//! Scan order tables.
 //!
-//! 参照仕様: VP9 Bitstream & Decoding Process Specification v0.7, 10.1 節
-//! "Scan tables"。トークン復号（仕様 6.4.24〜6.4.25 節）で係数ブロック内の
-//! 走査順を決めるために使う。各テーブルはジグザグ的な走査順で、値
-//! `scan[i]` は「i 番目に読む係数」の行優先インデックス（`row * n0 + col`）
-//! を表す。
+//! Reference spec: VP9 Bitstream & Decoding Process Specification v0.7, §10.1
+//! "Scan tables". Used by token decoding (spec §6.4.24-6.4.25) to determine
+//! the traversal order within a coefficient block. Each table describes a
+//! zigzag-like traversal order, where the value `scan[i]` is the row-major
+//! index (`row * n0 + col`) of "the i-th coefficient to read".
 
 use crate::transform::TxType;
 
@@ -175,7 +175,7 @@ pub const DEFAULT_SCAN_32X32: [u16; 1024] = [
     924, 956, 925, 988, 957, 926, 1020, 989, 958, 927, 1021, 990, 959, 1022, 991, 1023,
 ];
 
-/// トランスフォームブロックのサイズ（仕様の `TX_4X4`〜`TX_32X32`）。
+/// Transform block size (the spec's `TX_4X4` through `TX_32X32`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxSize {
     Tx4x4,
@@ -184,11 +184,12 @@ pub enum TxSize {
     Tx32x32,
 }
 
-/// 仕様 6.4.25 節 `get_scan()` のうち、`TxType` が確定した後段（走査順テーブル
-/// の選択）を実装したもの。`TxType` を決定する `mode2txfm_map` を用いた分岐
-/// （イントラ予測モードに依存する部分）は M2 のイントラ予測実装と合わせて
-/// 別途扱うため、ここでは「`TxSize` と `TxType` が既知の場合にどの走査順
-/// テーブルを使うか」だけを扱う。
+/// Implements the later stage of spec §6.4.25 `get_scan()` — the scan table
+/// selection — once `TxType` is already known. The branch that determines
+/// `TxType` via `mode2txfm_map` (the part that depends on the intra
+/// prediction mode) is handled separately, together with the M2 intra
+/// prediction implementation; here we only handle "which scan table to use,
+/// given a known `TxSize` and `TxType`".
 pub fn get_scan(tx_size: TxSize, tx_type: TxType) -> &'static [u16] {
     match tx_size {
         TxSize::Tx4x4 => match tx_type {
@@ -214,17 +215,17 @@ pub fn get_scan(tx_size: TxSize, tx_type: TxType) -> &'static [u16] {
 mod tests {
     use super::*;
 
-    /// すべてのスキャンテーブルが、その長さぶんの添字を過不足なく
-    /// 1 回ずつ含む（= 0..N-1 の順列である）ことを確認する。
+    /// Confirms that every scan table contains each index up to its length
+    /// exactly once (i.e. it is a permutation of 0..N-1).
     fn assert_is_permutation(name: &str, table: &[u16]) {
         let mut seen = vec![false; table.len()];
         for &v in table {
             let idx = v as usize;
-            assert!(idx < table.len(), "{name}: 添字 {v} が範囲外");
-            assert!(!seen[idx], "{name}: 添字 {v} が重複");
+            assert!(idx < table.len(), "{name}: index {v} out of range");
+            assert!(!seen[idx], "{name}: index {v} duplicated");
             seen[idx] = true;
         }
-        assert!(seen.iter().all(|&b| b), "{name}: 添字に抜けがある");
+        assert!(seen.iter().all(|&b| b), "{name}: some indices are missing");
     }
 
     #[test]
@@ -241,7 +242,7 @@ mod tests {
         assert_is_permutation("default_scan_32x32", &DEFAULT_SCAN_32X32);
     }
 
-    /// 各スキャン順は必ず添字 0（DC 係数の位置）から始まる。
+    /// Each scan order always starts at index 0 (the DC coefficient position).
     #[test]
     fn all_scan_tables_start_at_dc() {
         assert_eq!(DEFAULT_SCAN_4X4[0], 0);
@@ -269,7 +270,7 @@ mod tests {
         assert_eq!(get_scan(TxSize::Tx16x16, TxType::AdstDct), &ROW_SCAN_16X16);
         assert_eq!(get_scan(TxSize::Tx16x16, TxType::DctAdst), &COL_SCAN_16X16);
 
-        // TX_32X32 は常に default_scan_32x32。
+        // TX_32X32 always uses default_scan_32x32.
         assert_eq!(
             get_scan(TxSize::Tx32x32, TxType::DctDct),
             &DEFAULT_SCAN_32X32

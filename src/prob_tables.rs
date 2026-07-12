@@ -1,21 +1,21 @@
-//! VP9 のシンタックス要素復号に使うツリー定義とデフォルト確率テーブル
-//! （仕様 9.3.1 節 "Tree selection process" 及び 10.2〜10.5 節）。
+//! Tree definitions and default probability tables used to decode VP9 syntax elements
+//! (spec §9.3.1 "Tree selection process" and §§10.2-10.5).
 //!
-//! このファイルの数値はすべて VP9 Bitstream & Decoding Process Specification v0.7 の該当節から
-//! 転記したものであり、既存 OSS 実装は参照していない（クリーンルーム実装）。転記元の節番号は
-//! 各テーブルのドキュメントコメントに記載する。
+//! All values in this file are transcribed from the corresponding sections of the
+//! VP9 Bitstream & Decoding Process Specification v0.7; no existing OSS implementation
+//! was consulted (clean-room implementation). The source section number for each table
+//! is noted in its doc comment.
 //!
-//! M2（キーフレームのイントラ復号）で必要となる範囲のみを転記しており、インター予測関連の
-//! デフォルト確率テーブル（`default_partition_probs` や `default_y_mode_probs`、MV 関連など）は
-//! M3 以降で追加する。
+//! Covers both keyframe intra decoding (M2) and inter prediction (M3): partition/mode
+//! trees and default probabilities, coefficient tables, and the MV-related tables.
 
 // ---------------------------------------------------------------------------
-// シンタックス要素の値（仕様 7.4.3 節・7.3.1 節ほか）。
+// Syntax element values (spec §7.4.3, §7.3.1, and others).
 // ---------------------------------------------------------------------------
 
-/// `BLOCK_SIZES`（仕様 3 節、値 13）。ブロックサイズの enum 値
-/// （仕様 10.2 節 `subsize_lookup` の PARTITION_NONE 行が BLOCK_SIZES の並び順そのものになっている
-/// ことから逆算して確認済み）。
+/// `BLOCK_SIZES` (spec §3, value 13). Block size enum values
+/// (confirmed by back-derivation from the fact that the PARTITION_NONE row of
+/// `subsize_lookup` in spec §10.2 is exactly the BLOCK_SIZES ordering).
 pub const BLOCK_4X4: u8 = 0;
 pub const BLOCK_4X8: u8 = 1;
 pub const BLOCK_8X4: u8 = 2;
@@ -29,30 +29,31 @@ pub const BLOCK_32X32: u8 = 9;
 pub const BLOCK_32X64: u8 = 10;
 pub const BLOCK_64X32: u8 = 11;
 pub const BLOCK_64X64: u8 = 12;
-/// パーティション選択が不正となる組み合わせを表す番兵値（仕様 3 節では値 14 だが、
-/// 本実装では配列インデックスとして使わないため任意の判別可能な値でよい）。
+/// Sentinel value representing an invalid partition/block-size combination (the spec
+/// (§3) uses value 14, but this implementation never uses it as an array index, so
+/// any distinguishable value works).
 pub const BLOCK_INVALID: u8 = 0xFF;
 
-/// `PARTITION_TYPES`（仕様 7.4.3 節）。
+/// `PARTITION_TYPES` (spec §7.4.3).
 pub const PARTITION_NONE: u8 = 0;
 pub const PARTITION_HORZ: u8 = 1;
 pub const PARTITION_VERT: u8 = 2;
 pub const PARTITION_SPLIT: u8 = 3;
 
-/// `TX_SIZES`（仕様 6.4.10 節ほか）。
+/// `TX_SIZES` (spec §6.4.10 and others).
 pub const TX_4X4: u8 = 0;
 pub const TX_8X8: u8 = 1;
 pub const TX_16X16: u8 = 2;
 pub const TX_32X32: u8 = 3;
 
-/// `TX_MODES`（仕様 7.3.1 節）。
+/// `TX_MODES` (spec §7.3.1).
 pub const ONLY_4X4: u8 = 0;
 pub const ALLOW_8X8: u8 = 1;
 pub const ALLOW_16X16: u8 = 2;
 pub const ALLOW_32X32: u8 = 3;
 pub const TX_MODE_SELECT: u8 = 4;
 
-/// イントラ予測モード（`INTRA_MODES`、仕様 7.4.5 節）。
+/// Intra prediction modes (`INTRA_MODES`, spec §7.4.5).
 pub const DC_PRED: u8 = 0;
 pub const V_PRED: u8 = 1;
 pub const H_PRED: u8 = 2;
@@ -64,46 +65,46 @@ pub const D207_PRED: u8 = 7;
 pub const D63_PRED: u8 = 8;
 pub const TM_PRED: u8 = 9;
 
-/// インター予測モード（`y_mode` が取り得るインター側の値、仕様 7.4.11 節）。
-/// イントラモード（0..9）と同じ `y_mode` 名前空間の続きの値として定義される。
+/// Inter prediction modes (the inter-side values `y_mode` can take, spec §7.4.11).
+/// Defined as a continuation of the same `y_mode` namespace as the intra modes (0..9).
 pub const NEARESTMV: u8 = 10;
 pub const NEARMV: u8 = 11;
 pub const ZEROMV: u8 = 12;
 pub const NEWMV: u8 = 13;
 
-/// `ref_frame[ 0 ]`/`ref_frame[ 1 ]` の値（仕様 7.4.12 節）。`ref_frame[ 1 ] == 0` は
-/// `NONE`（単予測またはイントラ）を意味し、`INTRA_FRAME` と数値上一致する
-/// （両者が同時に意味を持つ場面がないため、仕様は同じ 0 を使い回している）。
+/// `ref_frame[ 0 ]`/`ref_frame[ 1 ]` values (spec §7.4.12). `ref_frame[ 1 ] == 0` means
+/// `NONE` (single prediction or intra), which coincides numerically with `INTRA_FRAME`
+/// (the spec reuses the same 0 because the two meanings never apply at the same time).
 pub const INTRA_FRAME: u8 = 0;
 pub const LAST_FRAME: u8 = 1;
 pub const GOLDEN_FRAME: u8 = 2;
 pub const ALTREF_FRAME: u8 = 3;
-/// `ref_frame[ 1 ] == NONE`（単予測）を表す番兵値。`INTRA_FRAME` と同じ 0。
+/// Sentinel value for `ref_frame[ 1 ] == NONE` (single prediction). Same as `INTRA_FRAME`'s 0.
 pub const REF_NONE: u8 = 0;
 
-/// `interpolation_filter`/`interp_filter` の値（仕様 7.2.7 節）。
+/// `interpolation_filter`/`interp_filter` values (spec §7.2.7).
 pub const EIGHTTAP: u8 = 0;
 pub const EIGHTTAP_SMOOTH: u8 = 1;
 pub const EIGHTTAP_SHARP: u8 = 2;
 pub const BILINEAR: u8 = 3;
 pub const SWITCHABLE: u8 = 4;
 
-/// `reference_mode` の値（仕様 7.3.6 節）。
+/// `reference_mode` values (spec §7.3.6).
 pub const SINGLE_REFERENCE: u8 = 0;
 pub const COMPOUND_REFERENCE: u8 = 1;
 pub const REFERENCE_MODE_SELECT: u8 = 2;
 
-/// `mv_joint` の値（仕様 7.4.13 節）。
+/// `mv_joint` values (spec §7.4.13).
 pub const MV_JOINT_ZERO: u8 = 0;
 pub const MV_JOINT_HNZVZ: u8 = 1;
 pub const MV_JOINT_HZVNZ: u8 = 2;
 pub const MV_JOINT_HNZVNZ: u8 = 3;
 
-/// 参照フレームスロット数（仕様 7.2 節、`RefFrameWidth`/`RefFrameHeight` 等の添字範囲）。
+/// Number of reference frame slots (spec §7.2, index range for `RefFrameWidth`/`RefFrameHeight`, etc.).
 pub const NUM_REF_FRAMES: usize = 8;
 
 // ---------------------------------------------------------------------------
-// 変換用ルックアップテーブル（仕様 10.2 節 "Conversion tables"）。
+// Conversion lookup tables (spec §10.2 "Conversion tables").
 // ---------------------------------------------------------------------------
 
 /// `b_width_log2_lookup[ BLOCK_SIZES ]`。
@@ -123,17 +124,18 @@ pub const MI_HEIGHT_LOG2_LOOKUP: [u8; 13] = [0, 0, 0, 0, 1, 0, 1, 2, 1, 2, 3, 2,
 /// `num_8x8_blocks_high_lookup[ BLOCK_SIZES ]`。
 pub const NUM_8X8_BLOCKS_HIGH_LOOKUP: [u8; 13] = [1, 1, 1, 1, 2, 1, 2, 4, 2, 4, 8, 4, 8];
 
-/// `max_txsize_lookup[ BLOCK_SIZES ]`（仕様 6.4.10 節）。
+/// `max_txsize_lookup[ BLOCK_SIZES ]` (spec §6.4.10).
 pub const MAX_TXSIZE_LOOKUP: [u8; 13] = [
     TX_4X4, TX_4X4, TX_4X4, TX_8X8, TX_8X8, TX_8X8, TX_16X16, TX_16X16, TX_16X16, TX_32X32,
     TX_32X32, TX_32X32, TX_32X32,
 ];
 
-/// `tx_mode_to_biggest_tx_size[ TX_MODES ]`（仕様 10.2 節）。
+/// `tx_mode_to_biggest_tx_size[ TX_MODES ]` (spec §10.2).
 pub const TX_MODE_TO_BIGGEST_TX_SIZE: [u8; 5] = [TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_32X32];
 
-/// `subsize_lookup[ PARTITION_TYPES ][ BLOCK_SIZES ]`（仕様 10.2 節）。
-/// `BLOCK_INVALID` はその partition/bsize の組が仕様上出現しないことを示す番兵値。
+/// `subsize_lookup[ PARTITION_TYPES ][ BLOCK_SIZES ]` (spec §10.2).
+/// `BLOCK_INVALID` is a sentinel value indicating that the partition/bsize combination
+/// never occurs per the spec.
 pub const SUBSIZE_LOOKUP: [[u8; 13]; 4] = [
     // PARTITION_NONE
     [
@@ -202,13 +204,14 @@ pub const SUBSIZE_LOOKUP: [[u8; 13]; 4] = [
 ];
 
 // ---------------------------------------------------------------------------
-// ツリー定義（仕様 9.3.1 節 "Tree selection process"）。
+// Tree definitions (spec §9.3.1 "Tree selection process").
 //
-// 葉は `-value`（0 は `-0 == 0` としてそのまま扱われる）、内部ノードは次のインデックスを
-// 指す非負の値。[`crate::bool_coder::BoolDecoder::read_tree`] で使用する。
+// Leaves are `-value` (0 is treated as-is, since `-0 == 0`); internal nodes are
+// non-negative values pointing to the next index. Used by
+// [`crate::bool_coder::BoolDecoder::read_tree`].
 // ---------------------------------------------------------------------------
 
-/// `partition_tree[ 6 ]`。hasRows == 1 && hasCols == 1 の場合に使う。
+/// `partition_tree[ 6 ]`. Used when hasRows == 1 && hasCols == 1.
 pub const PARTITION_TREE: [i32; 6] = [
     -(PARTITION_NONE as i32),
     2,
@@ -217,13 +220,16 @@ pub const PARTITION_TREE: [i32; 6] = [
     -(PARTITION_VERT as i32),
     -(PARTITION_SPLIT as i32),
 ];
-/// `cols_partition_tree[ 2 ]`。hasCols == 1 && hasRows == 0 の場合に使う。
+/// `cols_partition_tree[ 2 ]`. Used when hasCols == 1 && hasRows == 0.
 pub const COLS_PARTITION_TREE: [i32; 2] = [-(PARTITION_HORZ as i32), -(PARTITION_SPLIT as i32)];
-/// `rows_partition_tree[ 2 ]`。hasRows == 1 && hasCols == 0 の場合に使う。
+
+/// `segment_tree[ 14 ]` (spec §9.3.1). Used to decode `segment_id`.
+pub const SEGMENT_TREE: [i32; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
+/// `rows_partition_tree[ 2 ]`. Used when hasRows == 1 && hasCols == 0.
 pub const ROWS_PARTITION_TREE: [i32; 2] = [-(PARTITION_VERT as i32), -(PARTITION_SPLIT as i32)];
 
-/// `intra_mode_tree[ 18 ]`。`default_intra_mode`/`default_uv_mode`/`intra_mode`/
-/// `sub_intra_mode`/`uv_mode` の復号に使う。
+/// `intra_mode_tree[ 18 ]`. Used to decode `default_intra_mode`/`default_uv_mode`/
+/// `intra_mode`/`sub_intra_mode`/`uv_mode`.
 pub const INTRA_MODE_TREE: [i32; 18] = [
     -(DC_PRED as i32),
     2,
@@ -245,7 +251,7 @@ pub const INTRA_MODE_TREE: [i32; 18] = [
     -(D207_PRED as i32),
 ];
 
-/// `tx_size_32_tree[ 6 ]`。maxTxSize == TX_32X32 の場合に使う。
+/// `tx_size_32_tree[ 6 ]`. Used when maxTxSize == TX_32X32.
 pub const TX_SIZE_32_TREE: [i32; 6] = [
     -(TX_4X4 as i32),
     2,
@@ -254,23 +260,23 @@ pub const TX_SIZE_32_TREE: [i32; 6] = [
     -(TX_16X16 as i32),
     -(TX_32X32 as i32),
 ];
-/// `tx_size_16_tree[ 4 ]`。maxTxSize == TX_16X16 の場合に使う。
+/// `tx_size_16_tree[ 4 ]`. Used when maxTxSize == TX_16X16.
 pub const TX_SIZE_16_TREE: [i32; 4] = [-(TX_4X4 as i32), 2, -(TX_8X8 as i32), -(TX_16X16 as i32)];
-/// `tx_size_8_tree[ 2 ]`。maxTxSize == TX_8X8 の場合に使う（それ以外は tx_size は読まれない）。
+/// `tx_size_8_tree[ 2 ]`. Used when maxTxSize == TX_8X8 (otherwise tx_size is not read).
 pub const TX_SIZE_8_TREE: [i32; 2] = [-(TX_4X4 as i32), -(TX_8X8 as i32)];
 
-/// `inter_mode_tree[ 6 ]`（仕様 9.3.1 節）。葉の値は `y_mode - NEARESTMV`。
+/// `inter_mode_tree[ 6 ]` (spec §9.3.1). Leaf values are `y_mode - NEARESTMV`.
 pub const INTER_MODE_TREE: [i32; 6] = [
     -((ZEROMV - NEARESTMV) as i32),
     2,
-    0, // -(NEARESTMV - NEARESTMV) は常に 0（NEARESTMV が基準値のため）。
+    0, // -(NEARESTMV - NEARESTMV) is always 0 (NEARESTMV is the base value).
     4,
     -((NEARMV - NEARESTMV) as i32),
     -((NEWMV - NEARESTMV) as i32),
 ];
 
-/// `interp_filter_tree[ 4 ]`（仕様 9.3.1 節）。`BILINEAR` はフレームレベルでのみ選択可能で、
-/// ブロックレベルの `interp_filter` ツリーには現れない。
+/// `interp_filter_tree[ 4 ]` (spec §9.3.1). `BILINEAR` can only be selected at the frame
+/// level and never appears in the block-level `interp_filter` tree.
 pub const INTERP_FILTER_TREE: [i32; 4] = [
     -(EIGHTTAP as i32),
     2,
@@ -278,7 +284,7 @@ pub const INTERP_FILTER_TREE: [i32; 4] = [
     -(EIGHTTAP_SHARP as i32),
 ];
 
-/// `mv_joint_tree[ 6 ]`（仕様 9.3.1 節）。
+/// `mv_joint_tree[ 6 ]` (spec §9.3.1).
 pub const MV_JOINT_TREE: [i32; 6] = [
     -(MV_JOINT_ZERO as i32),
     2,
@@ -288,21 +294,21 @@ pub const MV_JOINT_TREE: [i32; 6] = [
     -(MV_JOINT_HNZVNZ as i32),
 ];
 
-/// `mv_class_tree[ 20 ]`（仕様 9.3.1 節）。`MV_CLASS_0`..`MV_CLASS_10` の 11 値。
+/// `mv_class_tree[ 20 ]` (spec §9.3.1). 11 values, `MV_CLASS_0`..`MV_CLASS_10`.
 pub const MV_CLASS_TREE: [i32; 20] = [
     0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
 ];
 
-/// `mv_fr_tree[ 6 ]`（仕様 9.3.1 節）。`mv_class0_fr`/`mv_fr` の復号に使う（値 0..3）。
+/// `mv_fr_tree[ 6 ]` (spec §9.3.1). Used to decode `mv_class0_fr`/`mv_fr` (values 0..3).
 pub const MV_FR_TREE: [i32; 6] = [0, 2, -1, 4, -2, -3];
 
 // ---------------------------------------------------------------------------
-// 固定確率テーブル（仕様 10.4 節 "Fixed probability tables"）。
-// キーフレーム・イントラオンリーフレームの partition/intra mode 復号でのみ使用され、
-// compressed_header による更新の対象にはならない。
+// Fixed probability tables (spec §10.4 "Fixed probability tables").
+// Used only for partition/intra mode decoding in keyframes and intra-only frames;
+// never updated by compressed_header.
 // ---------------------------------------------------------------------------
 
-/// キーフレーム用の固定 partition 確率テーブル（仕様 10.4 節 `kf_partition_probs`）。
+/// Fixed partition probability table for keyframes (spec §10.4 `kf_partition_probs`).
 pub const KF_PARTITION_PROBS: [[u8; 3]; 16] = [
     [158, 97, 94], // 8x8 -> 4x4: a/l both not split
     [93, 24, 99],  // 8x8 -> 4x4: a split, l not split
@@ -322,8 +328,8 @@ pub const KF_PARTITION_PROBS: [[u8; 3]; 16] = [
     [12, 3, 3],    // 64x64 -> 32x32: a/l both split
 ];
 
-/// キーフレーム用の固定 y_mode (default_intra_mode) 確率テーブル
-/// （仕様 10.4 節 `kf_y_mode_probs[above][left][node]`）。
+/// Fixed y_mode (default_intra_mode) probability table for keyframes
+/// (spec §10.4 `kf_y_mode_probs[above][left][node]`).
 pub const KF_Y_MODE_PROBS: [[[u8; 9]; 10]; 10] = [
     [
         // above = DC
@@ -457,7 +463,7 @@ pub const KF_Y_MODE_PROBS: [[[u8; 9]; 10]; 10] = [
     ],
 ];
 
-/// キーフレーム用の固定 uv_mode 確率テーブル（仕様 10.4 節 `kf_uv_mode_probs[y_mode][node]`）。
+/// Fixed uv_mode probability table for keyframes (spec §10.4 `kf_uv_mode_probs[y_mode][node]`).
 pub const KF_UV_MODE_PROBS: [[u8; 9]; 10] = [
     [144, 11, 54, 157, 195, 130, 46, 58, 108],  // y = DC
     [118, 15, 123, 148, 131, 101, 44, 93, 131], // y = V
@@ -472,10 +478,10 @@ pub const KF_UV_MODE_PROBS: [[u8; 9]; 10] = [
 ];
 
 // ---------------------------------------------------------------------------
-// 6.3.5 節 inv_remap_prob で使うテーブル。
+// Table used by inv_remap_prob (spec §6.3.5).
 // ---------------------------------------------------------------------------
 
-/// `inv_map_table`（仕様 6.3.5 節）。`inv_remap_prob` で使用する。
+/// `inv_map_table` (spec §6.3.5). Used by `inv_remap_prob`.
 pub const INV_MAP_TABLE: [u8; 255] = [
     7, 20, 33, 46, 59, 72, 85, 98, 111, 124, 137, 150, 163, 176, 189, 202, 215, 228, 241, 254, 1,
     2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28,
@@ -493,12 +499,13 @@ pub const INV_MAP_TABLE: [u8; 255] = [
 ];
 
 // ---------------------------------------------------------------------------
-// デフォルト確率テーブル（仕様 10.5 節 "Default probability tables"）。
-// compressed_header の diff_update_prob によって更新される前の初期値。
+// Default probability tables (spec §10.5 "Default probability tables").
+// Initial values before being updated by compressed_header's diff_update_prob.
 // ---------------------------------------------------------------------------
 
-/// `default_tx_probs`（仕様 10.5 節）。`tx_probs[maxTxSize][ctx][node]` の初期値。
-/// 先頭 (TX_4X4) は仕様上未使用だが構造をそのまま転記するため保持する。
+/// `default_tx_probs` (spec §10.5). Initial values for `tx_probs[maxTxSize][ctx][node]`.
+/// The first entry (TX_4X4) is unused per the spec, but kept to transcribe the
+/// structure as-is.
 pub const DEFAULT_TX_PROBS: [[[u8; 3]; 2]; 4] = [
     [
         // maxTxSize = TX_4X4 (unused)
@@ -522,16 +529,16 @@ pub const DEFAULT_TX_PROBS: [[[u8; 3]; 2]; 4] = [
     ],
 ];
 
-/// `default_skip_prob`（仕様 10.5 節）。
+/// `default_skip_prob` (spec §10.5).
 pub const DEFAULT_SKIP_PROB: [u8; 3] = [192, 128, 64];
 
-/// `coef_probs[ txSz ][ plane > 0 ][ is_inter ][ band ][ ctx ][ node ]` の型
-/// （仕様 6.3.7 節 `read_coef_probs`）。
+/// Type of `coef_probs[ txSz ][ plane > 0 ][ is_inter ][ band ][ ctx ][ node ]`
+/// (spec §6.3.7 `read_coef_probs`).
 pub type CoefProbs = [[[[[[u8; 3]; 6]; 6]; 2]; 2]; 4];
 
-/// `default_coef_probs`（仕様 10.5 節）。 `[txSz][plane>0][is_inter][band][ctx][node]` の初期値。
-/// band 0 はコンテキストが 3 つしかないため、後半 3 要素は仕様上 "unused" として 0 埋めされている
-/// （転記元でも `{0, 0, 0}, // unused` と明記されている）。
+/// `default_coef_probs` (spec §10.5). Initial values for `[txSz][plane>0][is_inter][band][ctx][node]`.
+/// Band 0 has only 3 contexts, so the remaining 3 elements are zero-filled as "unused"
+/// per the spec (the source also explicitly states `{0, 0, 0}, // unused`).
 pub const DEFAULT_COEF_PROBS: CoefProbs = [
     // TX_4X4
     [
@@ -1484,15 +1491,15 @@ pub const DEFAULT_COEF_PROBS: CoefProbs = [
 ];
 
 // ---------------------------------------------------------------------------
-// トークン（係数）復号用のテーブル・定数（仕様 6.4.24〜6.4.26 節、9.3.1〜9.3.2 節、
-// 10.2〜10.3 節から転記）。
+// Tables and constants for token (coefficient) decoding (transcribed from spec
+// §§6.4.24-6.4.26, §§9.3.1-9.3.2, §§10.2-10.3).
 //
-// このセクションの数値は `pdftotext -layout` で抽出した仕様 PDF テキストから
-// スクリプトで機械的に抽出したものであり（`grep -oE` による正規表現抽出）、手作業での
-// 転記ミスを避けている（詳細は README.md の M2 引き継ぎメモを参照）。
+// The values in this section were mechanically extracted by script from the spec PDF
+// text extracted with `pdftotext -layout` (regex extraction via `grep -oE`), avoiding
+// manual transcription errors (see the M2 handoff notes in README.md for details).
 // ---------------------------------------------------------------------------
 
-/// `token` シンタックス要素の値（仕様 6.4.24 節）。
+/// `token` syntax element values (spec §6.4.24).
 pub const ZERO_TOKEN: u8 = 0;
 pub const ONE_TOKEN: u8 = 1;
 pub const TWO_TOKEN: u8 = 2;
@@ -1505,7 +1512,7 @@ pub const DCT_VAL_CATEGORY4: u8 = 8;
 pub const DCT_VAL_CATEGORY5: u8 = 9;
 pub const DCT_VAL_CATEGORY6: u8 = 10;
 
-/// `token_tree[ 20 ]`（仕様 9.3.1 節）。
+/// `token_tree[ 20 ]` (spec §9.3.1).
 pub const TOKEN_TREE: [i32; 20] = [
     -(ZERO_TOKEN as i32),
     2,
@@ -1529,12 +1536,13 @@ pub const TOKEN_TREE: [i32; 20] = [
     -(DCT_VAL_CATEGORY6 as i32),
 ];
 
-/// `binary_tree[ 2 ]`（仕様 9.3.1 節）。`more_coefs` 等、単一の bool を木構造として
-/// 表現したもの。`read_tree(&BINARY_TREE, |_| prob)` は `read_bool(prob) as i32` と等価。
+/// `binary_tree[ 2 ]` (spec §9.3.1). Represents a single bool (e.g. `more_coefs`) as a
+/// tree structure. `read_tree(&BINARY_TREE, |_| prob)` is equivalent to
+/// `read_bool(prob) as i32`.
 pub const BINARY_TREE: [i32; 2] = [0, -1];
 
-/// `ss_size_lookup[ BLOCK_SIZES ][ 2 ][ 2 ]`（仕様 6.4.23 節）。
-/// `get_plane_block_size( subsize, plane )` = `SS_SIZE_LOOKUP[subsize][subx][suby]`。
+/// `ss_size_lookup[ BLOCK_SIZES ][ 2 ][ 2 ]` (spec §6.4.23).
+/// `get_plane_block_size( subsize, plane )` = `SS_SIZE_LOOKUP[subsize][subx][suby]`.
 #[rustfmt::skip]
 pub const SS_SIZE_LOOKUP: [[[u8; 2]; 2]; 13] = [
     [[BLOCK_4X4,   BLOCK_INVALID], [BLOCK_INVALID, BLOCK_INVALID]],
@@ -1552,15 +1560,17 @@ pub const SS_SIZE_LOOKUP: [[[u8; 2]; 2]; 13] = [
     [[BLOCK_64X64, BLOCK_64X32],   [BLOCK_32X64,   BLOCK_32X32]],
 ];
 
-/// `coefband_4x4[ 16 ]`（仕様 10.2 節）。
+/// `coefband_4x4[ 16 ]` (spec §10.2).
 pub const COEFBAND_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
 
-/// `coefband_8x8plus[ 1024 ]`（仕様 10.2 節）の代替実装。
+/// Alternate implementation of `coefband_8x8plus[ 1024 ]` (spec §10.2).
 ///
-/// 抽出したテーブルは先頭 21 要素（インデックス 0..=20）のみが非自明な値
-/// （0,1,1,2,2,2,3,3,3,3,4×11）を持ち、それ以降（インデックス 21..1024）はすべて 5 である
-/// ことを `pdftotext` 抽出結果から確認済み（1024 要素中 1003 要素が 5）。
-/// 1024 要素の配列をそのまま転記する代わりに、この構造を計算式として実装する。
+/// Confirmed from the `pdftotext` extraction result that only the first 21 elements
+/// (indices 0..=20) of the extracted table have non-trivial values
+/// (0,1,1,2,2,2,3,3,3,3,4x11), and everything after that (indices 21..1024) is 5
+/// (1003 of the 1024 elements are 5).
+/// Instead of transcribing the 1024-element array verbatim, this structure is
+/// implemented as a formula.
 pub fn coefband_8x8plus(c: usize) -> u8 {
     const HEAD: [u8; 21] = [
         0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
@@ -1572,10 +1582,10 @@ pub fn coefband_8x8plus(c: usize) -> u8 {
     }
 }
 
-/// `energy_class[ 12 ]`（仕様 6.4.24 節）。`TokenCache[ pos ] = energy_class[ token ]`。
+/// `energy_class[ 12 ]` (spec §6.4.24). `TokenCache[ pos ] = energy_class[ token ]`.
 pub const ENERGY_CLASS: [u8; 12] = [0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5, 5];
 
-/// `extra_bits[ 11 ][ 3 ]`（仕様 6.4.26 節）。`[token]` = `[cat, numExtra, coefBase]`。
+/// `extra_bits[ 11 ][ 3 ]` (spec §6.4.26). `[token]` = `[cat, numExtra, coefBase]`.
 #[rustfmt::skip]
 pub const EXTRA_BITS: [[u8; 3]; 11] = [
     [0, 0, 0],
@@ -1591,9 +1601,9 @@ pub const EXTRA_BITS: [[u8; 3]; 11] = [
     [6, 14, 67],
 ];
 
-/// `cat_probs[ 7 ][ 14 ]`（仕様 6.4.26 節）。行の実際の長さは `numExtra`
-/// （`EXTRA_BITS[token][1]`）と一致し、それより後ろの要素は仕様上未使用の
-/// パディング（0 埋め）である。
+/// `cat_probs[ 7 ][ 14 ]` (spec §6.4.26). The actual row length matches `numExtra`
+/// (`EXTRA_BITS[token][1]`); elements beyond that are unused padding per the spec
+/// (zero-filled).
 #[rustfmt::skip]
 pub const CAT_PROBS: [[u8; 14]; 7] = [
     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -1605,12 +1615,13 @@ pub const CAT_PROBS: [[u8; 14]; 7] = [
     [254, 254, 254, 252, 249, 243, 230, 196, 177, 153, 140, 133, 130, 129],
 ];
 
-/// `mode2txfm_map`（仕様 6.4.25 節）。イントラ予測モード（`DC_PRED`..`TM_PRED`）から
-/// `TxType` への変換。インター予測モードのエントリ（`NEARESTMV` 等、すべて `DCT_DCT`）は
-/// M2（イントラのみ）では到達しないため転記していない。
-/// `mode2txfm_map[ MB_MODE_COUNT ]`（仕様 6.4.25 節・10.2 節）。イントラモード（0..=9）に加え、
-/// インターモード（[`NEARESTMV`]..[`NEWMV`]、10..=13）も受け付け、すべて `DCT_DCT` を返す
-/// （仕様の `mode2txfm_map` テーブルは `y_mode` がインター値の場合も定義されている）。
+/// `mode2txfm_map` (spec §6.4.25). Conversion from intra prediction mode
+/// (`DC_PRED`..`TM_PRED`) to `TxType`. The entries for inter prediction modes
+/// (`NEARESTMV` etc., all `DCT_DCT`) are not transcribed since they are unreachable in
+/// M2 (intra only).
+/// `mode2txfm_map[ MB_MODE_COUNT ]` (spec §6.4.25, §10.2). Accepts intra modes (0..=9)
+/// plus inter modes ([`NEARESTMV`]..[`NEWMV`], 10..=13), all returning `DCT_DCT`
+/// (the spec's `mode2txfm_map` table is also defined for inter values of `y_mode`).
 pub fn mode2txfm_map(mode: u8) -> crate::transform::TxType {
     use crate::transform::TxType;
     match mode {
@@ -1626,12 +1637,12 @@ pub fn mode2txfm_map(mode: u8) -> crate::transform::TxType {
         TM_PRED => TxType::AdstAdst,
         NEARESTMV | NEARMV | ZEROMV | NEWMV => TxType::DctDct,
         _ => unreachable!(
-            "mode2txfm_map は 0..=13 (イントラ 0..=9 + インター 10..=13) のみを受け付ける"
+            "mode2txfm_map only accepts 0..=13 (intra 0..=9 + inter 10..=13)"
         ),
     }
 }
 
-/// `pareto_table[ 128 ][ 8 ]`（仕様 10.3 節 "Pareto probability table"）。
+/// `pareto_table[ 128 ][ 8 ]` (spec §10.3 "Pareto probability table").
 #[rustfmt::skip]
 pub const PARETO_TABLE: [[u8; 8]; 128] = [
     [3, 86, 128, 6, 86, 23, 88, 29],
@@ -1764,9 +1775,9 @@ pub const PARETO_TABLE: [[u8; 8]; 128] = [
     [255, 246, 247, 255, 239, 255, 253, 255],
 ];
 
-/// `pareto( node, prob )`（仕様 9.3.2 節）。`token` シンタックス要素の確率選択に使う。
-/// `node < 2` の場合は `prob` をそのまま返し、`node >= 2` の場合は [`PARETO_TABLE`] を
-/// 参照する（`prob` が偶数の場合は隣接 2 行の平均を取る）。
+/// `pareto( node, prob )` (spec §9.3.2). Used to select the probability for the
+/// `token` syntax element. Returns `prob` unmodified when `node < 2`; otherwise looks
+/// up [`PARETO_TABLE`] (averaging the two adjacent rows when `prob` is even).
 pub fn pareto(node: usize, prob: u8) -> u8 {
     if node < 2 {
         return prob;
@@ -1780,17 +1791,17 @@ pub fn pareto(node: usize, prob: u8) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// インターフレーム（M3）で必要となるデフォルト確率テーブル・変換テーブル
-// （仕様 10.2 節・10.5 節から転記）。
+// Default probability tables and conversion tables needed for inter frames (M3)
+// (transcribed from spec §10.2, §10.5).
 // ---------------------------------------------------------------------------
 
-/// `size_group_lookup[ BLOCK_SIZES ]`（仕様 10.2 節）。非キーフレームの `intra_mode`/
-/// `sub_intra_mode` の確率選択（`y_mode_probs[ctx]`）に使う。
+/// `size_group_lookup[ BLOCK_SIZES ]` (spec §10.2). Used for probability selection
+/// (`y_mode_probs[ctx]`) of `intra_mode`/`sub_intra_mode` in non-keyframes.
 pub const SIZE_GROUP_LOOKUP: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
 
-/// `default_partition_probs[ PARTITION_CONTEXTS ][ PARTITION_TYPES - 1 ]`（仕様 10.5 節）。
-/// キーフレーム用の [`KF_PARTITION_PROBS`] とは別に、非キーフレームで `compressed_header`
-/// により更新される確率テーブル。
+/// `default_partition_probs[ PARTITION_CONTEXTS ][ PARTITION_TYPES - 1 ]` (spec §10.5).
+/// Separate from the keyframe [`KF_PARTITION_PROBS`], this probability table is updated
+/// by `compressed_header` in non-keyframes.
 pub const DEFAULT_PARTITION_PROBS: [[u8; 3]; 16] = [
     [199, 122, 141],
     [147, 63, 159],
@@ -1810,9 +1821,10 @@ pub const DEFAULT_PARTITION_PROBS: [[u8; 3]; 16] = [
     [10, 7, 6],
 ];
 
-/// `default_y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]`（仕様 10.5 節）。
-/// 非キーフレームでの `intra_mode`/`sub_intra_mode`（`y_mode_probs`）に使う。
-/// `default_uv_mode_probs` と異なり `compressed_header` の `read_y_mode_probs()` で更新される。
+/// `default_y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]` (spec §10.5).
+/// Used for `intra_mode`/`sub_intra_mode` (`y_mode_probs`) in non-keyframes.
+/// Unlike `default_uv_mode_probs`, this is updated by `compressed_header`'s
+/// `read_y_mode_probs()`.
 pub const DEFAULT_Y_MODE_PROBS: [[u8; 9]; 4] = [
     [65, 32, 18, 144, 162, 194, 41, 51, 98],
     [132, 68, 18, 165, 217, 196, 45, 40, 78],
@@ -1820,10 +1832,10 @@ pub const DEFAULT_Y_MODE_PROBS: [[u8; 9]; 4] = [
     [221, 135, 38, 194, 248, 121, 96, 85, 29],
 ];
 
-/// `default_uv_mode_probs[ INTRA_MODES ][ INTRA_MODES - 1 ]`（仕様 10.5 節）。
-/// `compressed_header` に更新用シンタックスが存在しないため、常にこのデフォルト値が使われる
-/// （仕様 6.3 節の `compressed_header()` を参照。`read_y_mode_probs()` は `y_mode_probs` のみを
-/// 更新し、`uv_mode_probs` を更新するシンタックスは存在しない）。
+/// `default_uv_mode_probs[ INTRA_MODES ][ INTRA_MODES - 1 ]` (spec §10.5).
+/// `compressed_header` has no syntax to update this, so this default value is always
+/// used (see `compressed_header()` in spec §6.3: `read_y_mode_probs()` updates only
+/// `y_mode_probs`, and there is no syntax to update `uv_mode_probs`).
 pub const DEFAULT_UV_MODE_PROBS: [[u8; 9]; 10] = [
     [120, 7, 76, 176, 208, 126, 28, 54, 103],
     [48, 12, 154, 155, 139, 90, 34, 117, 119],
@@ -1837,20 +1849,20 @@ pub const DEFAULT_UV_MODE_PROBS: [[u8; 9]; 10] = [
     [101, 21, 107, 181, 192, 103, 19, 67, 125],
 ];
 
-/// `default_is_inter_prob[ IS_INTER_CONTEXTS ]`（仕様 10.5 節）。
+/// `default_is_inter_prob[ IS_INTER_CONTEXTS ]` (spec §10.5).
 pub const DEFAULT_IS_INTER_PROB: [u8; 4] = [9, 102, 187, 225];
 
-/// `default_comp_mode_prob[ COMP_MODE_CONTEXTS ]`（仕様 10.5 節）。
+/// `default_comp_mode_prob[ COMP_MODE_CONTEXTS ]` (spec §10.5).
 pub const DEFAULT_COMP_MODE_PROB: [u8; 5] = [239, 183, 119, 96, 41];
 
-/// `default_comp_ref_prob[ REF_CONTEXTS ]`（仕様 10.5 節）。
+/// `default_comp_ref_prob[ REF_CONTEXTS ]` (spec §10.5).
 pub const DEFAULT_COMP_REF_PROB: [u8; 5] = [50, 126, 123, 221, 226];
 
-/// `default_single_ref_prob[ REF_CONTEXTS ][ 2 ]`（仕様 10.5 節）。
+/// `default_single_ref_prob[ REF_CONTEXTS ][ 2 ]` (spec §10.5).
 pub const DEFAULT_SINGLE_REF_PROB: [[u8; 2]; 5] =
     [[33, 16], [77, 74], [142, 142], [172, 170], [238, 247]];
 
-/// `default_inter_mode_probs[ INTER_MODE_CONTEXTS ][ INTER_MODES - 1 ]`（仕様 10.5 節）。
+/// `default_inter_mode_probs[ INTER_MODE_CONTEXTS ][ INTER_MODES - 1 ]` (spec §10.5).
 pub const DEFAULT_INTER_MODE_PROBS: [[u8; 3]; 7] = [
     [2, 173, 34],
     [7, 145, 85],
@@ -1862,51 +1874,51 @@ pub const DEFAULT_INTER_MODE_PROBS: [[u8; 3]; 7] = [
 ];
 
 /// `default_interp_filter_probs[ INTERP_FILTER_CONTEXTS ][ SWITCHABLE_FILTERS - 1 ]`
-/// （仕様 10.5 節）。
+/// (spec §10.5).
 pub const DEFAULT_INTERP_FILTER_PROBS: [[u8; 2]; 4] = [[235, 162], [36, 255], [34, 3], [149, 144]];
 
-/// `default_mv_joint_probs[ 3 ]`（仕様 10.5 節）。
+/// `default_mv_joint_probs[ 3 ]` (spec §10.5).
 pub const DEFAULT_MV_JOINT_PROBS: [u8; 3] = [32, 64, 96];
 
-/// `default_mv_sign_prob[ 2 ]`（仕様 10.5 節）。
+/// `default_mv_sign_prob[ 2 ]` (spec §10.5).
 pub const DEFAULT_MV_SIGN_PROB: [u8; 2] = [128, 128];
 
-/// `default_mv_class_probs[ 2 ][ MV_CLASSES - 1 ]`（仕様 10.5 節）。
+/// `default_mv_class_probs[ 2 ][ MV_CLASSES - 1 ]` (spec §10.5).
 pub const DEFAULT_MV_CLASS_PROBS: [[u8; 10]; 2] = [
     [224, 144, 192, 168, 192, 176, 192, 198, 198, 245],
     [216, 128, 176, 160, 176, 176, 192, 198, 198, 208],
 ];
 
-/// `default_mv_class0_bit_prob[ 2 ]`（仕様 10.5 節）。
+/// `default_mv_class0_bit_prob[ 2 ]` (spec §10.5).
 pub const DEFAULT_MV_CLASS0_BIT_PROB: [u8; 2] = [216, 208];
 
-/// `default_mv_bits_prob[ 2 ][ MV_OFFSET_BITS ]`（仕様 10.5 節）。
+/// `default_mv_bits_prob[ 2 ][ MV_OFFSET_BITS ]` (spec §10.5).
 pub const DEFAULT_MV_BITS_PROB: [[u8; 10]; 2] = [
     [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
     [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
 ];
 
-/// `default_mv_class0_fr_probs[ 2 ][ CLASS0_SIZE ][ 3 ]`（仕様 10.5 節）。
+/// `default_mv_class0_fr_probs[ 2 ][ CLASS0_SIZE ][ 3 ]` (spec §10.5).
 pub const DEFAULT_MV_CLASS0_FR_PROBS: [[[u8; 3]; 2]; 2] = [
     [[128, 128, 64], [96, 112, 64]],
     [[128, 128, 64], [96, 112, 64]],
 ];
 
-/// `default_mv_fr_probs[ 2 ][ 3 ]`（仕様 10.5 節）。
+/// `default_mv_fr_probs[ 2 ][ 3 ]` (spec §10.5).
 pub const DEFAULT_MV_FR_PROBS: [[u8; 3]; 2] = [[64, 96, 64], [64, 96, 64]];
 
-/// `default_mv_class0_hp_prob[ 2 ]`（仕様 10.5 節）。
+/// `default_mv_class0_hp_prob[ 2 ]` (spec §10.5).
 pub const DEFAULT_MV_CLASS0_HP_PROB: [u8; 2] = [160, 160];
 
-/// `default_mv_hp_prob[ 2 ]`（仕様 10.5 節）。
+/// `default_mv_hp_prob[ 2 ]` (spec §10.5).
 pub const DEFAULT_MV_HP_PROB: [u8; 2] = [128, 128];
 
 // ---------------------------------------------------------------------------
-// 動きベクトル予測（仕様 6.5 節 "Motion vector prediction"）で使う定数テーブル。
+// Constant tables used for motion vector prediction (spec §6.5 "Motion vector prediction").
 // ---------------------------------------------------------------------------
 
-/// `mv_ref_blocks[ BLOCK_SIZES ][ MVREF_NEIGHBOURS ][ 2 ]`（仕様 6.5.1 節）。
-/// 各要素は `(deltaRow, deltaCol)`。
+/// `mv_ref_blocks[ BLOCK_SIZES ][ MVREF_NEIGHBOURS ][ 2 ]` (spec §6.5.1).
+/// Each element is `(deltaRow, deltaCol)`.
 pub const MV_REF_BLOCKS: [[(i32, i32); 8]; 13] = [
     [
         (-1, 0),
@@ -2040,24 +2052,26 @@ pub const MV_REF_BLOCKS: [[(i32, i32); 8]; 13] = [
     ],
 ];
 
-/// `mode_2_counter[ MB_MODE_COUNT ]`（仕様 6.5.1 節）。`YModes` の値（イントラ 0..9、
-/// インター [`NEARESTMV`]..[`NEWMV`] 10..13）から `contextCounter` への加算値を求める。
+/// `mode_2_counter[ MB_MODE_COUNT ]` (spec §6.5.1). Maps `YModes` values (intra 0..9,
+/// inter [`NEARESTMV`]..[`NEWMV`] 10..13) to the value added to `contextCounter`.
 pub const MODE_2_COUNTER: [u8; 14] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 3, 1];
 
-/// `counter_to_context[ 19 ]`（仕様 6.5.1 節）。`contextCounter`（0..=18）から
-/// `inter_mode_probs` の文脈（0..=6。7 を超える値は `INVALID_CASE` で本来出現しない）への変換。
+/// `counter_to_context[ 19 ]` (spec §6.5.1). Converts `contextCounter` (0..=18) to the
+/// `inter_mode_probs` context (0..=6; values above 7 are `INVALID_CASE` and never
+/// actually occur).
 pub const COUNTER_TO_CONTEXT: [u8; 19] = [2, 3, 4, 1, 3, 9, 0, 9, 9, 5, 5, 9, 5, 9, 9, 9, 9, 9, 6];
 
-/// `idx_n_column_to_subblock[ 4 ][ 2 ]`（仕様 6.5.11 節）。`get_sub_block_mv` で使う。
+/// `idx_n_column_to_subblock[ 4 ][ 2 ]` (spec §6.5.11). Used by `get_sub_block_mv`.
 pub const IDX_N_COLUMN_TO_SUBBLOCK: [[u8; 2]; 4] = [[1, 2], [1, 3], [3, 2], [3, 3]];
 
 // =============================================================================
-// インター予測（仕様 8.5.2 節）: サブペル補間フィルタ係数表。
+// Inter prediction (spec §8.5.2): subpel interpolation filter coefficient tables.
 // =============================================================================
 
-/// `subpel_filters[ 4 ][ 16 ][ 8 ]`（仕様 8.5.2.4 節）。添字は [`EIGHTTAP`]/[`EIGHTTAP_SMOOTH`]/
-/// [`EIGHTTAP_SHARP`]/[`BILINEAR`]（0..3）の `interp_filter` 値と一致する。
-/// pdftotext -raw で抽出した仕様 PDF のテキストをそのまま転記した数値。
+/// `subpel_filters[ 4 ][ 16 ][ 8 ]` (spec §8.5.2.4). The index matches the
+/// `interp_filter` value of [`EIGHTTAP`]/[`EIGHTTAP_SMOOTH`]/[`EIGHTTAP_SHARP`]/
+/// [`BILINEAR`] (0..3).
+/// Values transcribed verbatim from the spec PDF text extracted with pdftotext -raw.
 pub const SUBPEL_FILTERS: [[[i32; 8]; 16]; 4] = [
     // EIGHTTAP (regular)
     [
@@ -2137,33 +2151,33 @@ pub const SUBPEL_FILTERS: [[[i32; 8]; 16]; 4] = [
     ],
 ];
 
-/// `REF_SCALE_SHIFT`（仕様 3 節、動きベクトルスケーリング用定数）。
+/// `REF_SCALE_SHIFT` (spec §3, constant used for motion vector scaling).
 pub const REF_SCALE_SHIFT: u32 = 14;
-/// `SUBPEL_BITS`（仕様 3 節）。
+/// `SUBPEL_BITS` (spec §3).
 pub const SUBPEL_BITS: u32 = 4;
-/// `SUBPEL_SHIFTS`（仕様 3 節）。`1 << SUBPEL_BITS`。
+/// `SUBPEL_SHIFTS` (spec §3). `1 << SUBPEL_BITS`.
 pub const SUBPEL_SHIFTS: i32 = 16;
-/// `SUBPEL_MASK`（仕様 3 節）。`SUBPEL_SHIFTS - 1`。
+/// `SUBPEL_MASK` (spec §3). `SUBPEL_SHIFTS - 1`.
 pub const SUBPEL_MASK: i32 = 15;
-/// `INTERP_EXTEND`（仕様 3 節）。動きベクトルクランプ処理で使う。
+/// `INTERP_EXTEND` (spec §3). Used in motion vector clamping.
 pub const INTERP_EXTEND: i32 = 4;
-/// `MI_SIZE`（仕様 3 節）。
+/// `MI_SIZE` (spec §3).
 pub const MI_SIZE_PX: i32 = 8;
 
 // =============================================================================
-// 確率適応（仕様 8.4 節 "Probability adaptation process"）。
+// Probability adaptation (spec §8.4 "Probability adaptation process").
 // =============================================================================
 
-/// `COUNT_SAT`（仕様 3 節、確率適応で使う定数）。
+/// `COUNT_SAT` (spec §3, constant used in probability adaptation).
 pub const COUNT_SAT: u32 = 20;
-/// `MAX_UPDATE_FACTOR`（仕様 3 節）。
+/// `MAX_UPDATE_FACTOR` (spec §3).
 pub const MAX_UPDATE_FACTOR: u32 = 128;
 
-/// `small_token_tree[ 6 ]`（仕様 8.4.3 節）。`merge_probs` を `coef_probs[...][ 1..3 ]`
-/// （`ONE_TOKEN`/`TWO_TOKEN` 以上をまとめた 3 値ぶんの木）に適用する際に使う。
+/// `small_token_tree[ 6 ]` (spec §8.4.3). Used when applying `merge_probs` to
+/// `coef_probs[...][ 1..3 ]` (a 3-value tree combining `ONE_TOKEN`/`TWO_TOKEN` and above).
 pub const SMALL_TOKEN_TREE: [i32; 6] = [
     0,
-    0, // 未使用（index 0..1、merge_probs は i=2 から辿るため参照されない）
+    0, // unused (index 0..1; merge_probs traverses from i=2, so these are never referenced)
     -(ZERO_TOKEN as i32),
     4,
     -(ONE_TOKEN as i32),
@@ -2177,7 +2191,7 @@ mod token_tables_tests {
     #[test]
     fn pareto_table_shape_and_spot_values() {
         assert_eq!(PARETO_TABLE.len(), 128);
-        // 仕様 PDF 抽出結果の先頭・末尾行をピンポイントで確認する。
+        // Spot-check the first and last rows of the spec PDF extraction result.
         assert_eq!(PARETO_TABLE[0], [3, 86, 128, 6, 86, 23, 88, 29]);
         assert_eq!(PARETO_TABLE[127], [255, 246, 247, 255, 239, 255, 253, 255]);
     }
@@ -2235,12 +2249,12 @@ mod token_tables_tests {
         for (token, row) in EXTRA_BITS.iter().enumerate() {
             let num_extra = row[1] as usize;
             let cat = row[0] as usize;
-            // cat_probs の該当行のうち、numExtra 個の要素は非ゼロ（token=ZERO..FOUR の
-            // num_extra=0 の行のみ例外）である必要がある。
+            // Of the corresponding cat_probs row, the first numExtra elements must be
+            // non-zero (except for the token=ZERO..FOUR rows where num_extra=0).
             if num_extra > 0 {
                 assert!(
                     CAT_PROBS[cat][..num_extra].iter().all(|&p| p != 0),
-                    "token={token}: cat_probs[{cat}][..{num_extra}] に想定外の 0 がある"
+                    "token={token}: cat_probs[{cat}][..{num_extra}] has an unexpected 0"
                 );
             }
         }

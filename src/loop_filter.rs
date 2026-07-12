@@ -1,7 +1,8 @@
-//! デブロッキング（ループ）フィルタ（仕様 8.8 節 "Loop filter process"）。
+//! Deblocking (loop) filter (spec §8.8 "Loop filter process").
 //!
-//! 仕様 8.8 節に忠実に、フレーム全体を次の入れ子ループで走査する（節冒頭のフレーム全体の
-//! 走査擬似コードそのまま）:
+//! Faithfully to spec §8.8, the entire frame is traversed with the following
+//! nested loops (taken directly from the frame-wide traversal pseudocode at
+//! the top of the section):
 //!
 //! ```text
 //! for ( row = 0; row < MiRows; row += 8 )
@@ -11,27 +12,26 @@
 //!         superblock loop filter process( plane, pass, row, col )
 //! ```
 //!
-//! `pass == 0` が縦エッジ（左右のブロック境界）、`pass == 1` が横エッジ（上下のブロック境界）
-//! を意味する。同じサンプルが複数回フィルタされ得るため、この走査順（縦→横、スーパーブロック
-//! ラスタ順）を厳密に守る必要がある（仕様 8.8 節の NOTE を参照）。
+//! `pass == 0` means vertical edges (left/right block boundaries), and
+//! `pass == 1` means horizontal edges (top/bottom block boundaries). Since
+//! the same sample can be filtered multiple times, this traversal order
+//! (vertical -> horizontal, superblock raster order) must be strictly
+//! followed (see the NOTE in spec §8.8).
 //!
-//! # 既知の簡略化
+//! # Known simplifications
 //!
-//! - `isIntra`（`RefFrames[row][col][0] <= INTRA_FRAME`）・`modeType`（`YModes` が
-//!   `NEARESTMV`/`NEARMV`/`NEWMV` かどうか）は M3 で `MiInfo` に追加した `ref_frame`/`y_mode`
-//!   から実値を参照する（`superblock_loop_filter` 参照）。
-//! - `segmentation_enabled == true` のフレームは `tile.rs` が `TileError::SegmentationNotSupported`
-//!   として拒否するため、`seg_feature_active( SEG_LVL_ALT_L )` は常に偽と仮定できる
-//!   （仕様 8.8.1 節 手順 2 は発生しない）。
-//! - `loop_filter_ref_deltas`/`loop_filter_mode_deltas` はフレーム間で持続する状態だが
-//!   （仕様 7.2 節 `setup_past_independence`）、本実装は毎フレーム `parse_loop_filter_params`
-//!   内でデフォルト値 `[1, 0, -1, -1]`/`[0, 0]` から起動する（前フレームからの引き継ぎ未実装）。
-//!   これはループフィルタの出力画素にのみ影響し、ビットストリームの読み取りには影響しない
-//!   （`loop_filter_params()` が読むビット数は現在のデルタ値に依存しないため）。M3 後半で
-//!   フレーム間状態として引き継ぐよう改修する。
+//! - `isIntra` (`RefFrames[row][col][0] <= INTRA_FRAME`) and `modeType`
+//!   (whether `YModes` is `NEARESTMV`/`NEARMV`/`NEWMV`) are read from the
+//!   real `ref_frame`/`y_mode` values added to `MiInfo` in M3 (see
+//!   `superblock_loop_filter`).
+//! - `loop_filter_ref_deltas`/`loop_filter_mode_deltas` persist across frames
+//!   as spec §7.2 requires: `Decoder` (`lib.rs`) stores the previous frame's
+//!   deltas and passes them into `parse_loop_filter_params`, which seeds from
+//!   them (or from the default values `[1, 0, -1, -1]`/`[0, 0]` when
+//!   `FrameIsIntra || error_resilient_mode`, i.e. `setup_past_independence`).
 
 use crate::framebuffer::Plane;
-use crate::header::LoopFilterParams;
+use crate::header::{LoopFilterParams, SegmentationParams, SEG_LVL_ALT_L};
 use crate::prob_tables::{
     BLOCK_16X16, BLOCK_8X8, MAX_TXSIZE_LOOKUP, NEARESTMV, NEARMV, NEWMV,
     NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP, SS_SIZE_LOOKUP, TX_16X16, TX_4X4,
@@ -43,10 +43,11 @@ const MAX_SEGMENTS: usize = 8;
 const MAX_REF_FRAMES: usize = 4;
 const MAX_MODE_LF_DELTAS: usize = 2;
 const MAX_LOOP_FILTER: i32 = 63;
-/// 参照フレーム種別のインデックス（仕様の `RefFrame` 列挙のうち本実装が使う値のみ）。
+/// Reference frame type index (only the values from the spec's `RefFrame`
+/// enum that this implementation uses).
 const INTRA_FRAME: usize = 0;
 
-/// `LvlLookup[ segmentId ][ ref ][ mode ]`（仕様 8.8.1 節）。
+/// `LvlLookup[ segmentId ][ ref ][ mode ]` (spec §8.8.1).
 type LvlLookup = [[[i32; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SEGMENTS];
 
 #[inline]
@@ -63,9 +64,10 @@ fn clip3(low: i32, high: i32, v: i32) -> i32 {
     v.clamp(low, high)
 }
 
-/// `get_uv_tx_size()`（仕様 6.4.22 節）。`src/tile.rs` の `TileDecoder::get_uv_tx_size` と
-/// 等価だが、ループフィルタは `TileDecoder` の外（`&self` を持たない自由関数）で完結させる
-/// ため、ここに小さく複製している。
+/// `get_uv_tx_size()` (spec §6.4.22). Equivalent to
+/// `TileDecoder::get_uv_tx_size` in `src/tile.rs`, but duplicated here in
+/// small form because the loop filter is self-contained outside of
+/// `TileDecoder` (as a free function without `&self`).
 fn get_uv_tx_size(mi_size: u8, tx_size: u8, subsampling_x: u32, subsampling_y: u32) -> u8 {
     if mi_size < BLOCK_8X8 {
         return TX_4X4;
@@ -74,35 +76,45 @@ fn get_uv_tx_size(mi_size: u8, tx_size: u8, subsampling_x: u32, subsampling_y: u
     tx_size.min(MAX_TXSIZE_LOOKUP[plane_sz as usize])
 }
 
-/// 仕様 8.8.1 節 "Loop filter frame init process"。
-fn build_lvl_lookup(lf: &LoopFilterParams) -> LvlLookup {
-    // nShift はフレームレベルの loop_filter_level から一度だけ計算される
-    // （lvlSeg からではない点に注意。仕様本文どおり）。
+/// Spec §8.8.1 "Loop filter frame init process".
+fn build_lvl_lookup(lf: &LoopFilterParams, seg: &SegmentationParams) -> LvlLookup {
+    // nShift is computed once from the frame-level loop_filter_level
+    // (note: not from lvlSeg — this matches the spec text).
     let n_shift = (lf.level as i32) >> 5;
     let mut table: LvlLookup = [[[0; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SEGMENTS];
 
-    for seg in table.iter_mut() {
-        // segmentation_enabled == true のフレームは呼び出し前に拒否されているため、
-        // seg_feature_active(SEG_LVL_ALT_L) は常に偽（手順 2 は適用しない）。
-        let lvl_seg = lf.level as i32;
+    for (segment_id, seg_table) in table.iter_mut().enumerate() {
+        // Step 1-2 (spec §8.8.1): lvlSeg starts at loop_filter_level, then
+        // seg_feature_active(SEG_LVL_ALT_L) overrides it (absolute or delta).
+        let mut lvl_seg = lf.level as i32;
+        if seg.enabled && seg.feature_enabled[segment_id][SEG_LVL_ALT_L] {
+            let data = seg.feature_data[segment_id][SEG_LVL_ALT_L];
+            lvl_seg = if seg.abs_or_delta_update {
+                data
+            } else {
+                data + lf.level as i32
+            };
+            lvl_seg = clip3(0, MAX_LOOP_FILTER, lvl_seg);
+        }
 
         if !lf.delta_enabled {
-            for r in seg.iter_mut() {
+            for r in seg_table.iter_mut() {
                 for m in r.iter_mut() {
                     *m = lvl_seg;
                 }
             }
         } else {
             let intra_lvl = lvl_seg + (lf.ref_deltas[INTRA_FRAME] as i32) * (1 << n_shift);
-            seg[INTRA_FRAME][0] = clip3(0, MAX_LOOP_FILTER, intra_lvl);
-            // seg[INTRA_FRAME][1] は仕様上定義されない（INTRA_FRAME 行は mode=0 のみ）。
-            // キーフレームでは isIntra が常に真で modeType が常に 0 なので参照されない。
+            seg_table[INTRA_FRAME][0] = clip3(0, MAX_LOOP_FILTER, intra_lvl);
+            // seg_table[INTRA_FRAME][1] is not defined by the spec (the INTRA_FRAME
+            // row only has mode=0). On keyframes isIntra is always true and
+            // modeType is always 0, so it's never referenced.
             for (r, ref_delta) in lf.ref_deltas.iter().enumerate().skip(1) {
                 for (m, mode_delta) in lf.mode_deltas.iter().enumerate() {
                     let inter_lvl = lvl_seg
                         + (*ref_delta as i32) * (1 << n_shift)
                         + (*mode_delta as i32) * (1 << n_shift);
-                    seg[r][m] = clip3(0, MAX_LOOP_FILTER, inter_lvl);
+                    seg_table[r][m] = clip3(0, MAX_LOOP_FILTER, inter_lvl);
                 }
             }
         }
@@ -110,8 +122,9 @@ fn build_lvl_lookup(lf: &LoopFilterParams) -> LvlLookup {
     table
 }
 
-/// 仕様 8.8.4 節 "Adaptive filter strength process" のうち `limit`/`blimit`/`thresh` の計算。
-/// （`lvl` は呼び出し側で `LvlLookup` から求めて渡す。）
+/// The `limit`/`blimit`/`thresh` computation from spec §8.8.4 "Adaptive
+/// filter strength process". (`lvl` is looked up from `LvlLookup` by the
+/// caller and passed in.)
 fn adaptive_filter_strength(lvl: i32, sharpness: u8) -> (i32, i32, i32) {
     let shift = if sharpness > 4 {
         2
@@ -130,7 +143,7 @@ fn adaptive_filter_strength(lvl: i32, sharpness: u8) -> (i32, i32, i32) {
     (limit, blimit, thresh)
 }
 
-/// 仕様 8.8.3 節 "Filter size process"。
+/// Spec §8.8.3 "Filter size process".
 #[allow(clippy::too_many_arguments)]
 fn filter_size_process(
     tx_sz: u8,
@@ -158,8 +171,9 @@ fn filter_size_process(
     }
 }
 
-/// `x + dx*k, y + dy*k` の位置のサンプルを読む（仕様の `q_k`/`p_k` の一般形。
-/// `k` が負のとき `p` 側、非負のとき `q` 側を表す）。
+/// Reads the sample at position `x + dx*k, y + dy*k` (the general form of the
+/// spec's `q_k`/`p_k`: negative `k` denotes the `p` side, non-negative `k`
+/// denotes the `q` side).
 #[inline]
 fn get_off(plane: &Plane, x: usize, y: usize, dx: i64, dy: i64, k: i64) -> i32 {
     let px = (x as i64 + dx * k) as usize;
@@ -178,9 +192,10 @@ fn set_off(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, k: i64, v: i
     plane.set(px, py, v as u8);
 }
 
-/// 仕様 8.8.5.1 節 "Filter mask process"。戻り値は `(hevMask, filterMask, flatMask, flatMask2)`。
-/// `BitDepth == 8` 固定（本デコーダは 8bit のみ対応、`decode_keyframe` 参照）のため、
-/// 仕様の `<< (BitDepth - 8)` によるビット深度スケーリングは恒等（シフト量 0）として省略した。
+/// Spec §8.8.5.1 "Filter mask process". Returns `(hevMask, filterMask, flatMask, flatMask2)`.
+/// Since `BitDepth == 8` is fixed (this decoder only supports 8bit, see
+/// `decode_keyframe`), the spec's bit-depth scaling via `<< (BitDepth - 8)`
+/// is omitted as an identity operation (shift amount 0).
 #[allow(clippy::too_many_arguments)]
 fn compute_filter_mask(
     plane: &Plane,
@@ -251,7 +266,7 @@ fn compute_filter_mask(
     (hev_mask, filter_mask, flat_mask, flat_mask2)
 }
 
-/// 仕様 8.8.5.2 節 "Narrow filter process"（`filter4`）。`BitDepth == 8` 固定。
+/// Spec §8.8.5.2 "Narrow filter process" (`filter4`). `BitDepth == 8` fixed.
 fn narrow_filter(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, hev_mask: bool) {
     let clamp4 = |v: i32| clip3(-128, 127, v);
 
@@ -284,10 +299,10 @@ fn narrow_filter(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, hev_ma
     }
 }
 
-/// 仕様 8.8.5.3 節 "Wide filter process"。`log2_size` は 3（8タップ）または 4（16タップ）。
+/// Spec §8.8.5.3 "Wide filter process". `log2_size` is 3 (8-tap) or 4 (16-tap).
 fn wide_filter(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, log2_size: u32) {
     let n: i64 = (1i64 << (log2_size - 1)) - 1;
-    // F のインデックスは -n..n-1。オフセット n を足して 0 始まりの配列に格納する。
+    // F's index is -n..n-1. Stored in a 0-based array by adding offset n.
     let mut f = [0i32; 16];
 
     let mut i = -n;
@@ -310,7 +325,7 @@ fn wide_filter(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, log2_siz
     }
 }
 
-/// 仕様 8.8.5 節 "Sample filtering process"。
+/// Spec §8.8.5 "Sample filtering process".
 #[allow(clippy::too_many_arguments)]
 fn sample_filtering(
     plane: &mut Plane,
@@ -338,7 +353,7 @@ fn sample_filtering(
     }
 }
 
-/// 仕様 8.8.2 節 "Superblock loop filter process"。
+/// Spec §8.8.2 "Superblock loop filter process".
 #[allow(clippy::too_many_arguments)]
 fn superblock_loop_filter(
     planes: &mut [Plane; 3],
@@ -392,7 +407,7 @@ fn superblock_loop_filter(
                 mi_size.max(BLOCK_16X16)
             };
             let skip = mi.skip;
-            // 仕様 8.8.2 節手順9: isIntra = RefFrames[loopRow][loopCol][0] <= INTRA_FRAME。
+            // Spec §8.8.2 step 9: isIntra = RefFrames[loopRow][loopCol][0] <= INTRA_FRAME.
             let ref_frame = mi.ref_frame[0];
             let is_intra = ref_frame == INTRA_FRAME as u8;
 
@@ -426,7 +441,7 @@ fn superblock_loop_filter(
                 tx_sz, is_32_edge, pass, x, y, sub_x, sub_y, mi_cols, mi_rows,
             );
 
-            // 仕様 8.8.4 節: modeType = 1 if mode in {NEARESTMV,NEARMV,NEWMV} else 0。
+            // Spec §8.8.4: modeType = 1 if mode in {NEARESTMV,NEARMV,NEWMV} else 0.
             let mode_type = matches!(mi.y_mode, NEARESTMV | NEARMV | NEWMV) as usize;
             let lvl = lvl_lookup[mi.segment_id as usize][ref_frame as usize][mode_type];
 
@@ -448,11 +463,13 @@ fn superblock_loop_filter(
     }
 }
 
-/// 仕様 8.8 節 "Loop filter process" のフレーム全体エントリポイント。
+/// Frame-wide entry point for spec §8.8 "Loop filter process".
 ///
-/// `planes` は `CurrFrame`（`TileDecoder::planes`/`planes_mut` 相当、スーパーブロック境界まで
-/// 確保済みのバッファ）、`mi_grid` はモード情報グリッド、`mi_cols`/`mi_rows` は
-/// `compute_image_size()` で得られる非パディングの mi 単位フレームサイズ。
+/// `planes` is `CurrFrame` (equivalent to `TileDecoder::planes`/`planes_mut`,
+/// a buffer allocated out to superblock boundaries); `mi_grid` is the mode
+/// info grid; `mi_cols`/`mi_rows` is the non-padded, mi-unit frame size
+/// obtained from `compute_image_size()`.
+#[allow(clippy::too_many_arguments)]
 pub fn loop_filter_frame(
     planes: &mut [Plane; 3],
     mi_grid: &MiGrid,
@@ -461,8 +478,9 @@ pub fn loop_filter_frame(
     subsampling_x: u32,
     subsampling_y: u32,
     lf: &LoopFilterParams,
+    seg: &SegmentationParams,
 ) {
-    let lvl_lookup = build_lvl_lookup(lf);
+    let lvl_lookup = build_lvl_lookup(lf, seg);
 
     let mut row = 0u32;
     while row < mi_rows {
@@ -504,6 +522,20 @@ mod tests {
         assert_eq!(round2(4, 3), 1); // (4+4)>>3 = 1
     }
 
+    /// A `SegmentationParams` with segmentation disabled (the M2 default).
+    fn no_segmentation() -> SegmentationParams {
+        SegmentationParams {
+            enabled: false,
+            update_map: false,
+            tree_probs: [255; 7],
+            pred_prob: [255; 3],
+            temporal_update: false,
+            abs_or_delta_update: false,
+            feature_enabled: [[false; 4]; MAX_SEGMENTS],
+            feature_data: [[0; 4]; MAX_SEGMENTS],
+        }
+    }
+
     #[test]
     fn lvl_lookup_without_deltas_is_flat_level() {
         let lf = LoopFilterParams {
@@ -513,7 +545,7 @@ mod tests {
             ref_deltas: [1, 0, -1, -1],
             mode_deltas: [0, 0],
         };
-        let table = build_lvl_lookup(&lf);
+        let table = build_lvl_lookup(&lf, &no_segmentation());
         for seg in table.iter() {
             for r in seg.iter() {
                 for m in r.iter() {
@@ -525,7 +557,7 @@ mod tests {
 
     #[test]
     fn lvl_lookup_applies_intra_ref_delta() {
-        // level=40 -> nShift = 40>>5 = 1。ref_deltas[INTRA_FRAME] のデフォルトは 1。
+        // level=40 -> nShift = 40>>5 = 1. Default of ref_deltas[INTRA_FRAME] is 1.
         let lf = LoopFilterParams {
             level: 40,
             sharpness: 0,
@@ -533,9 +565,53 @@ mod tests {
             ref_deltas: [1, 0, -1, -1],
             mode_deltas: [0, 0],
         };
-        let table = build_lvl_lookup(&lf);
+        let table = build_lvl_lookup(&lf, &no_segmentation());
         // intraLvl = 40 + 1*(1<<1) = 42
         assert_eq!(table[0][INTRA_FRAME][0], 42);
+    }
+
+    #[test]
+    fn lvl_lookup_seg_lvl_alt_l_absolute_override() {
+        let lf = LoopFilterParams {
+            level: 20,
+            sharpness: 0,
+            delta_enabled: false,
+            ref_deltas: [1, 0, -1, -1],
+            mode_deltas: [0, 0],
+        };
+        let mut seg = no_segmentation();
+        seg.enabled = true;
+        seg.abs_or_delta_update = true;
+        seg.feature_enabled[3][SEG_LVL_ALT_L] = true;
+        seg.feature_data[3][SEG_LVL_ALT_L] = 50;
+        let table = build_lvl_lookup(&lf, &seg);
+        // Segment 3 uses the absolute override (50); other segments stay flat at 20.
+        for m in table[3].iter().flatten() {
+            assert_eq!(*m, 50);
+        }
+        for m in table[0].iter().flatten() {
+            assert_eq!(*m, 20);
+        }
+    }
+
+    #[test]
+    fn lvl_lookup_seg_lvl_alt_l_delta_is_clipped() {
+        let lf = LoopFilterParams {
+            level: 60,
+            sharpness: 0,
+            delta_enabled: false,
+            ref_deltas: [1, 0, -1, -1],
+            mode_deltas: [0, 0],
+        };
+        let mut seg = no_segmentation();
+        seg.enabled = true;
+        seg.abs_or_delta_update = false;
+        seg.feature_enabled[2][SEG_LVL_ALT_L] = true;
+        seg.feature_data[2][SEG_LVL_ALT_L] = 10; // 60 + 10 = 70, clipped to 63.
+        let table = build_lvl_lookup(&lf, &seg);
+        for m in table[2].iter().flatten() {
+            assert_eq!(*m, 63);
+        }
     }
 
     #[test]
@@ -548,7 +624,7 @@ mod tests {
 
     #[test]
     fn narrow_filter_flat_input_is_noop_like() {
-        // 完全に平坦な入力（すべて同じ値）はフィルタしても変化しないはず。
+        // A perfectly flat input (all the same value) should be unchanged by filtering.
         let mut p = Plane::new(8, 1);
         for x in 0..8 {
             p.set(x, 0, 128);

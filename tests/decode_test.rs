@@ -1,11 +1,12 @@
-//! `decode_keyframe`（M2 の公開 API）の統合テスト。
+//! Integration tests for `decode_keyframe` (the M2 public API).
 //!
-//! `tests/vectors/` にダウンロード済みの実データ（キーフレームを含む VP9 ストリーム）を使い、
-//! 最初のキーフレームが最後までデコードでき、出力された Y プレーンが単調でない
-//! （実写系ベクタとして妥当な統計値を持つ）ことを検証する。
+//! Using real data downloaded into `tests/vectors/` (a VP9 stream containing a key frame),
+//! this verifies that the first key frame decodes through to completion and that the
+//! resulting Y plane isn't uniform (i.e. it has statistics consistent with a real-world
+//! video vector).
 //!
-//! テストベクタが存在しない環境では、該当テストは早期 return + `eprintln!` でスキップされる
-//! （取得方法は README.md を参照）。
+//! In environments without test vectors, the corresponding test is skipped via early
+//! return + `eprintln!` (see README.md for how to obtain them).
 
 use std::path::Path;
 
@@ -51,8 +52,8 @@ fn check_vector(relative_path: &str, expected_width: u32, expected_height: u32) 
 
     if !path.exists() {
         eprintln!(
-            "[skip] テストベクタが見つからないためスキップします: {}\n\
-             README.md の手順に従って事前にダウンロードしてください。",
+            "[skip] Test vector not found, skipping: {}\n\
+             Please download it beforehand following the instructions in README.md.",
             path.display()
         );
         return;
@@ -107,17 +108,17 @@ fn check_vector(relative_path: &str, expected_width: u32, expected_height: u32) 
 
     assert!(
         !stats.all_same,
-        "{}: Y プレーンが全ピクセル同値（デコード結果が不自然）",
+        "{}: Y plane has a single uniform value across all pixels (decode result looks wrong)",
         path.display()
     );
     assert!(
         stats.variance > 0.0,
-        "{}: Y プレーンの分散が 0",
+        "{}: Y plane variance is 0",
         path.display()
     );
     assert!(
         stats.min < 50 && stats.max > 200,
-        "{}: 実写系ベクタとして不自然な輝度レンジ (min={}, max={})",
+        "{}: luma range looks unnatural for a real-world video vector (min={}, max={})",
         path.display(),
         stats.min,
         stats.max

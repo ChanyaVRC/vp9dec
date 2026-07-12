@@ -1,26 +1,29 @@
-//! タイル・スーパーブロック・モード情報・係数（トークン）の復号
-//! （仕様 6.4 節 "Decode tiles syntax"）。
+//! Decoding of tiles, superblocks, mode info, and coefficients (tokens)
+//! (spec §6.4 "Decode tiles syntax").
 //!
-//! M3 でインターフレーム（`FrameIsIntra == 0`）に対応し、`mode_info()` は `frame_is_intra`
-//! に応じて `intra_frame_mode_info()`/`inter_frame_mode_info()` を呼び分ける。
-//! `inter_frame_mode_info()`（仕様 6.4.11〜6.4.20 節）は動きベクトル予測（仕様 6.5 節、
-//! `find_mv_refs`/`find_best_ref_mvs`/`append_sub8x8_mvs`）を含めて実装しているが、
-//! **動き補償・サブピクセル補間（仕様 8.5.2 節 `predict_inter`）自体は未実装** で、
-//! [`predict_inter_stub`](crate::predict::predict_inter_stub) を呼ぶのみに留めている
-//! （ビットストリーム読了には影響しない。仕様 7.4.15 節 NOTE を参照。M3 後半で実装する）。
+//! M3 adds support for inter frames (`FrameIsIntra == 0`); `mode_info()` dispatches to
+//! `intra_frame_mode_info()`/`inter_frame_mode_info()` depending on `frame_is_intra`.
+//! `inter_frame_mode_info()` (spec §6.4.11-6.4.20) is implemented including motion vector
+//! prediction (spec §6.5, `find_mv_refs`/`find_best_ref_mvs`/`append_sub8x8_mvs`), and
+//! motion compensation / sub-pixel interpolation is performed via
+//! [`predict_inter`](crate::predict::predict_inter) (spec §8.5.2).
 //!
-//! [`TileDecoder::residual`] が仕様 6.4.21 節 `residual()` の実装であり、プレーンごとに
-//! イントラ予測（[`crate::predict::predict_intra`]）→ トークン復号
-//! （[`TileDecoder::tokens_and_reconstruct`]、仕様 6.4.24〜6.4.26 節）→ 逆量子化・逆変換・
-//! 再構成（仕様 8.6.2 節）を行い、結果を [`TileDecoder::planes`] のフレームバッファに書き込む。
-//! ループフィルタ（仕様 8.8 節）は M2b で実装予定のため未適用（ブロックノイズが残り得る）。
+//! [`TileDecoder::residual`] implements `residual()` from spec §6.4.21, and for each plane
+//! performs intra prediction ([`crate::predict::predict_intra`]) -> token decoding
+//! ([`TileDecoder::tokens_and_reconstruct`], spec §6.4.24-6.4.26) -> inverse quantization,
+//! inverse transform, and reconstruction (spec §8.6.2), writing the result into the frame
+//! buffers in [`TileDecoder::planes`].
+//! The loop filter (spec §8.8) is planned for M2b and is not yet applied (blocking artifacts
+//! may remain).
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
 use crate::compressed_header::{CompressedHeader, CompressedHeaderProbs};
 use crate::counts::Counts;
 use crate::dpb::RefFrameData;
 use crate::framebuffer::Plane;
-use crate::header::{self, NewFrameHeader};
+use crate::header::{
+    self, NewFrameHeader, SegmentationParams, SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
+};
 use crate::mv::{
     add_mv_ref_list, clamp_mv_col, clamp_mv_row, scale_mv, use_mv_hp, Mv, MVREF_NEIGHBOURS,
     MV_BORDER, MV_PRED_BORDER, ZERO_MV,
@@ -37,56 +40,52 @@ use crate::prob_tables::{
     MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_TREE, MV_REF_BLOCKS, NEARESTMV, NEARMV, NEWMV,
     NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP, NUM_8X8_BLOCKS_HIGH_LOOKUP,
     NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_TREE,
-    PARTITION_VERT, REFERENCE_MODE_SELECT, REF_NONE, SINGLE_REFERENCE, SIZE_GROUP_LOOKUP,
-    SS_SIZE_LOOKUP, SUBSIZE_LOOKUP, SWITCHABLE, TX_16X16, TX_32X32, TX_4X4, TX_8X8, TX_MODE_SELECT,
-    TX_MODE_TO_BIGGEST_TX_SIZE, TX_SIZE_16_TREE, TX_SIZE_32_TREE, TX_SIZE_8_TREE, ZEROMV,
-    ZERO_TOKEN,
+    PARTITION_VERT, REFERENCE_MODE_SELECT, REF_NONE, SEGMENT_TREE, SINGLE_REFERENCE,
+    SIZE_GROUP_LOOKUP, SS_SIZE_LOOKUP, SUBSIZE_LOOKUP, SWITCHABLE, TX_16X16, TX_32X32, TX_4X4,
+    TX_8X8, TX_MODE_SELECT, TX_MODE_TO_BIGGEST_TX_SIZE, TX_SIZE_16_TREE, TX_SIZE_32_TREE,
+    TX_SIZE_8_TREE, ZEROMV, ZERO_TOKEN,
 };
-use crate::quant::{get_ac_quant, get_dc_quant};
+use crate::quant::{get_ac_quant, get_dc_quant, get_qindex, SegQIndexOverride};
 use crate::scan::{get_scan, TxSize};
 use crate::transform::{inverse_transform_block, TxType};
 
-/// タイル・パーティション復号時に発生し得るエラー。
+/// Errors that can occur while decoding tiles/partitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileError {
-    /// タイルデータの bool デコーダ初期化に失敗した。
+    /// Failed to initialize the bool decoder for the tile data.
     BoolCoder(BoolCoderError),
-    /// タイルサイズフィールドがデータ長を超えるなど、タイル分割が不正。
+    /// Tile partitioning is invalid, e.g. the tile size field exceeds the data length.
     InvalidTileSize,
-    /// `subsize_lookup` が `BLOCK_INVALID` を返した（ビットストリーム不整合）。
+    /// `subsize_lookup` returned `BLOCK_INVALID` (bitstream inconsistency).
     InvalidPartition,
-    /// `segmentation_enabled == true` のフレーム。詳細なセグメンテーションパラメータ
-    /// （`segmentation_update_map` 等）は `src/header.rs` がまだ保持していないため、
-    /// 現時点ではキーフレームのセグメンテーションはサポート対象外。
-    SegmentationNotSupported,
 }
 
-/// 1 つの 8x8 mode info 単位が保持する情報（仕様 2.37 節 "Mode info"）。
+/// Information held by a single 8x8 mode info unit (spec §2.37 "Mode info").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MiInfo {
     pub skip: bool,
     pub tx_size: u8,
     pub mi_size: u8,
-    /// `y_mode`（`MiSize >= BLOCK_8X8` の場合は `sub_modes` すべてと同じ値）。イントラブロック
-    /// では `DC_PRED`..`TM_PRED`（0..9）、インターブロックでは `NEARESTMV`..`NEWMV`（10..13）。
+    /// `y_mode` (same value as all of `sub_modes` when `MiSize >= BLOCK_8X8`). For intra
+    /// blocks this is `DC_PRED`..`TM_PRED` (0..9); for inter blocks it is `NEARESTMV`..`NEWMV` (10..13).
     pub y_mode: u8,
-    /// イントラブロックのみ意味を持つ（インターブロックでは未使用、0）。
+    /// Only meaningful for intra blocks (unused, 0, for inter blocks).
     pub uv_mode: u8,
-    /// 8x8 単位内の 4 つの 4x4 サブブロックのイントラモード（`MiSize < BLOCK_8X8` の場合のみ
-    /// 複数の異なる値を取り得る）。インターブロックでは未使用（`[DC_PRED; 4]`）。
+    /// Intra modes for the 4 4x4 sub-blocks within an 8x8 unit (can take multiple distinct
+    /// values only when `MiSize < BLOCK_8X8`). Unused for inter blocks (`[DC_PRED; 4]`).
     pub sub_modes: [u8; 4],
     pub segment_id: u8,
-    /// `ref_frame[ 0..2 ]`（仕様 7.4.12 節）。イントラブロックでは `[INTRA_FRAME, REF_NONE]`。
-    /// `ref_frame[0] != INTRA_FRAME` であることが「インターブロックである」ことの判定条件
-    /// （`is_inter`）そのもの。
+    /// `ref_frame[ 0..2 ]` (spec §7.4.12). For intra blocks this is `[INTRA_FRAME, REF_NONE]`.
+    /// `ref_frame[0] != INTRA_FRAME` is itself the condition for "this is an inter block"
+    /// (`is_inter`).
     pub ref_frame: [u8; 2],
-    /// `Mvs[ refList ]`（代表 MV、`BlockMvs[ refList ][ 3 ]` と同じ、仕様 6.4.4 節）。
-    /// 単位は 1/8 pel。イントラブロックでは `[[0, 0]; 2]`。
+    /// `Mvs[ refList ]` (representative MV, same as `BlockMvs[ refList ][ 3 ]`, spec §6.4.4).
+    /// Units are 1/8 pel. `[[0, 0]; 2]` for intra blocks.
     pub mv: [[i32; 2]; 2],
-    /// `SubMvs[ refList ][ block 0..4 ]`（仕様 6.4.4 節）。`find_mv_refs` の
-    /// `get_sub_block_mv` が近傍ブロックのサブ MV を参照する際に使う。
+    /// `SubMvs[ refList ][ block 0..4 ]` (spec §6.4.4). Used by `get_sub_block_mv` in
+    /// `find_mv_refs` when referencing the sub MVs of neighboring blocks.
     pub sub_mvs: [[[i32; 2]; 4]; 2],
-    /// `interp_filter`（仕様 6.4.16 節）。イントラブロックでは未使用（0）。
+    /// `interp_filter` (spec §6.4.16). Unused for intra blocks (0).
     pub interp_filter: u8,
 }
 
@@ -108,11 +107,11 @@ impl Default for MiInfo {
     }
 }
 
-/// フレーム全体の mode info を 8x8 単位で保持するグリッド。
+/// A grid holding mode info for the whole frame, in 8x8 units.
 ///
-/// 仕様の `Skips`/`TxSizes`/`MiSizes`/`YModes`/`SegmentIds`/`SubModes` 各配列をまとめて
-/// 1 つの構造体にしたもの。サイズは `Sb64Cols*8 x Sb64Rows*8`
-/// （フレーム端のスーパーブロックがフレーム外にはみ出す分も含めて確保する）。
+/// This bundles the spec's `Skips`/`TxSizes`/`MiSizes`/`YModes`/`SegmentIds`/`SubModes`
+/// arrays into a single struct. Its size is `Sb64Cols*8 x Sb64Rows*8`
+/// (allocated to also cover the portion of edge superblocks that extends past the frame).
 #[derive(Debug, Clone)]
 pub struct MiGrid {
     cols: usize,
@@ -146,39 +145,50 @@ impl MiGrid {
     }
 }
 
-/// `get_tile_offset( tileNum, mis, tileSzLog2 )`（仕様 6.4.1 節）。
+/// `get_tile_offset( tileNum, mis, tileSzLog2 )` (spec §6.4.1).
 fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32 {
     let sbs = (mis + 7) >> 3;
     let offset = ((tile_num * sbs) >> tile_sz_log2) << 3;
     offset.min(mis)
 }
 
-/// タイル・スーパーブロックを走査してモード情報を復号するデコーダ。
+/// Decoder that walks tiles and superblocks to decode mode info.
 ///
-/// 1 フレーム分の状態（mode info グリッド、above/left パーティションコンテキスト）を保持する。
+/// Holds per-frame state (mode info grid, above/left partition context).
 pub struct TileDecoder {
     tx_mode: u8,
     probs: CompressedHeaderProbs,
-    segmentation_enabled: bool,
+    segmentation: SegmentationParams,
     mi_cols: u32,
     mi_rows: u32,
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mi_grid: MiGrid,
-    /// `AbovePartitionContext`。フレーム幅全体（`Sb64Cols*8`）にわたって持続し、
-    /// フレーム毎に一度だけ（`decode_tiles` の先頭で）クリアされる（仕様 7.4.1 節）。
+    /// `AbovePartitionContext`. Persists across the whole frame width (`Sb64Cols*8`) and is
+    /// cleared only once per frame (at the start of `decode_tiles`) (spec §7.4.1).
     above_partition_context: Vec<u8>,
-    /// `LeftPartitionContext`。本来はフレーム高さ全体のサイズを持つ配列だが、
-    /// スーパーブロック行ごとにクリアされ、常にそのスーパーブロック行内の相対位置
-    /// （絶対 mi 行番号 mod 8）でしかアクセスされないため、8 要素の配列として保持する。
+    /// `LeftPartitionContext`. Conceptually an array spanning the full frame height, but it
+    /// is cleared per superblock row and only ever accessed at the relative position within
+    /// that superblock row (absolute mi row number mod 8), so it is kept as an 8-element array.
     left_partition_context: [u8; 8],
-    // 現在デコード中のタイルの範囲。
+    /// `AboveSegPredContext` (spec §6.4.12). Same persistence/sizing rationale as
+    /// `above_partition_context`.
+    above_seg_pred_context: Vec<u8>,
+    /// `LeftSegPredContext` (spec §6.4.12). Same persistence/sizing rationale as
+    /// `left_partition_context`.
+    left_seg_pred_context: [u8; 8],
+    /// `PrevSegmentIds[ MiRow ][ MiCol ]` (spec §6.4.14 `get_segment_id`), in
+    /// row-major `MiRows x MiCols` layout (unpadded, unlike `mi_grid`). Supplied
+    /// by the caller ([`Decoder`](crate::Decoder)), which is responsible for the
+    /// size-change-clears-to-zero rule of spec §7.2.6.
+    prev_segment_ids: Vec<u8>,
+    // Range of the tile currently being decoded.
     mi_col_start: u32,
     mi_col_end: u32,
     mi_row_start: u32,
     mi_row_end: u32,
 
-    // --- 係数復号・再構成に必要な追加状態（仕様 6.4.21〜6.4.26 節、8.5〜8.6 節）。---
+    // --- Additional state needed for coefficient decoding/reconstruction (spec §6.4.21-6.4.26, §8.5-8.6). ---
     bit_depth: u8,
     subsampling_x: u32,
     subsampling_y: u32,
@@ -187,78 +197,94 @@ pub struct TileDecoder {
     delta_q_y_dc: i32,
     delta_q_uv_dc: i32,
     delta_q_uv_ac: i32,
-    /// `CurrFrame[ plane ]`。インデックス 0=Y, 1=U, 2=V。
+    /// `CurrFrame[ plane ]`. Index 0=Y, 1=U, 2=V.
     planes: [Plane; 3],
-    /// `AboveNonzeroContext[ plane ]`。4x4 単位でフレーム幅全体を持続する
-    /// （フレーム毎に一度だけクリア）。
+    /// `AboveNonzeroContext[ plane ]`. Persists across the whole frame width in 4x4 units
+    /// (cleared only once per frame).
     above_nonzero_context: [Vec<u8>; 3],
-    /// `LeftNonzeroContext[ plane ]`。スーパーブロック行ごとにクリアされ、常にそのスーパー
-    /// ブロック行内の相対位置（絶対 4x4 行番号 mod 16）でしかアクセスされないため、
-    /// 16 要素の配列として保持する（64 画素 / 4 = 16）。
+    /// `LeftNonzeroContext[ plane ]`. Cleared per superblock row and only ever accessed at
+    /// the relative position within that superblock row (absolute 4x4 row number mod 16),
+    /// so it is kept as a 16-element array (64 pixels / 4 = 16).
     left_nonzero_context: [[u8; 16]; 3],
 
-    // --- インターフレーム（仕様 6.4.11〜6.4.20 節・6.5 節）に必要な追加状態。---
-    /// `FrameIsIntra`。
+    // --- Additional state needed for inter frames (spec §6.4.11-6.4.20, §6.5). ---
+    /// `FrameIsIntra`.
     frame_is_intra: bool,
-    /// `ref_frame_sign_bias[ 0..4 ]`（非圧縮ヘッダ由来）。
+    /// `ref_frame_sign_bias[ 0..4 ]` (from the uncompressed header).
     ref_frame_sign_bias: [bool; 4],
     allow_high_precision_mv: bool,
-    /// `interpolation_filter`（`SWITCHABLE` の場合はブロックごとに `interp_filter` を読む）。
+    /// `interpolation_filter` (when `SWITCHABLE`, `interp_filter` is read per block).
     interpolation_filter: u8,
-    /// `reference_mode`/`CompFixedRef`/`CompVarRef`（圧縮ヘッダ由来、仕様 6.3.12・6.3.18 節）。
+    /// `reference_mode`/`CompFixedRef`/`CompVarRef` (from the compressed header, spec §6.3.12/6.3.18).
     reference_mode: u8,
     comp_fixed_ref: u8,
     comp_var_ref: [u8; 2],
-    /// `UsePrevFrameMvs`（仕様 7.2.6 節）。真の場合、`prev_mi_grid` から前フレームの
-    /// `Mvs`/`RefFrames` を参照する。
+    /// `UsePrevFrameMvs` (spec §7.2.6). When true, `Mvs`/`RefFrames` of the previous frame
+    /// are referenced via `prev_mi_grid`.
     use_prev_frame_mvs: bool,
-    /// 直前にデコードしたフレームの `MiGrid`（`PrevMvs`/`PrevRefFrames` 相当）。
-    /// `use_prev_frame_mvs == false` の場合は参照されない（`None` でもよい）。
+    /// `MiGrid` of the most recently decoded frame (equivalent to `PrevMvs`/`PrevRefFrames`).
+    /// Not referenced when `use_prev_frame_mvs == false` (may be `None`).
     prev_mi_grid: Option<MiGrid>,
 
-    // --- 動き補償（仕様 8.5.2 節）に必要な追加状態。---
-    /// `FrameWidth`/`FrameHeight`（表示・スケーリング計算用の実サイズ。`mi_cols*8` 等の
-    /// パディング済みサイズとは異なる）。
+    // --- Additional state needed for motion compensation (spec §8.5.2). ---
+    /// `FrameWidth`/`FrameHeight` (actual size used for display/scaling calculations, distinct
+    /// from the padded size such as `mi_cols*8`).
     frame_width: u32,
     frame_height: u32,
-    /// この 1 フレームの復号に使う参照フレームの実ピクセルデータ（DPB から解決済み、
-    /// 呼び出し側が `header.ref_frame_idx` を使って解決済み）。添字は `ref_frame` 値
-    /// `LAST_FRAME..=ALTREF_FRAME` から `LAST_FRAME` を引いたもの。`FrameIsIntra == 1` の
-    /// 場合は全要素 `None`。
+    /// Actual pixel data of the reference frames used to decode this frame (already resolved
+    /// from the DPB by the caller using `header.ref_frame_idx`). Indexed by the `ref_frame`
+    /// value `LAST_FRAME..=ALTREF_FRAME` minus `LAST_FRAME`. All elements are `None` when
+    /// `FrameIsIntra == 1`.
     resolved_refs: [Option<RefFrameData>; 3],
 
-    // --- 確率適応（仕様 8.4 節）用のカウンタ収集（仕様 9.3.4 節）。---
+    // --- Counter collection for probability adaptation (spec §8.4, spec §9.3.4). ---
     counts: Counts,
 }
 
 impl TileDecoder {
-    /// 非圧縮ヘッダと圧縮ヘッダから `TileDecoder` を構築する。
+    /// Builds a `TileDecoder` from the uncompressed and compressed headers.
     ///
     /// # Panics
-    /// `header.color_config.bit_depth != 8` の場合にパニックする。8bit 以外
-    /// （10bit/12bit）のフレームバッファは [`Plane`] が `u8` 固定であるため表現できない。
-    /// 呼び出し側（[`crate::decode_keyframe`]）は `TileDecoder::new` を呼ぶ前に
-    /// `bit_depth` を検査すること。`use_prev_frame_mvs`/`prev_mi_grid` は常に
-    /// `false`/`None`（キーフレーム・M2 互換の単純なコンストラクタ）。
+    /// Panics if `header.color_config.bit_depth != 8`. Frame buffers for depths other than
+    /// 8bit (10bit/12bit) cannot be represented since [`Plane`] is fixed to `u8`.
+    /// The caller ([`crate::decode_keyframe`]) must check `bit_depth` before calling
+    /// `TileDecoder::new`. `use_prev_frame_mvs`/`prev_mi_grid` are always
+    /// `false`/`None` (a simple constructor for key frames / M2 compatibility).
+    /// `prev_segment_ids` is seeded to all-zero (the "first frame" state of spec
+    /// §7.2.6), sized to this frame's `MiRows x MiCols`.
     pub fn new(header: &NewFrameHeader, compressed: &CompressedHeader) -> Self {
-        Self::new_with_prev(header, compressed, false, None, [None, None, None])
+        let image_size = header::compute_image_size(header.width, header.height);
+        let zero_prev_segment_ids = vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize];
+        Self::new_with_prev(
+            header,
+            compressed,
+            false,
+            None,
+            [None, None, None],
+            zero_prev_segment_ids,
+        )
     }
 
-    /// [`TileDecoder::new`] のインターフレーム対応版。`use_prev_frame_mvs`/`prev_mi_grid`
-    /// は仕様 7.2.6 節の `UsePrevFrameMvs` とそれが参照する前フレームの `Mvs`/`RefFrames`
-    /// （`find_mv_refs` の `usePrev` 分岐、仕様 6.5.1 節）に対応する。`resolved_refs` は
-    /// 動き補償（仕様 8.5.2 節）で使う参照フレームの実ピクセルデータ（[`crate::dpb::Dpb`]
-    /// から呼び出し側が解決したもの、添字は `ref_frame_idx` と同じ）。
+    /// Inter-frame-capable version of [`TileDecoder::new`]. `use_prev_frame_mvs`/`prev_mi_grid`
+    /// correspond to `UsePrevFrameMvs` from spec §7.2.6 and the previous frame's
+    /// `Mvs`/`RefFrames` that it references (the `usePrev` branch of `find_mv_refs`, spec
+    /// §6.5.1). `resolved_refs` is the actual pixel data of the reference frames used for
+    /// motion compensation (spec §8.5.2) (resolved by the caller from [`crate::dpb::Dpb`],
+    /// indexed the same way as `ref_frame_idx`). `prev_segment_ids` is `PrevSegmentIds`
+    /// (spec §6.4.14), row-major `MiRows x MiCols`; unlike `prev_mi_grid` it is NOT gated
+    /// by `use_prev_frame_mvs` (its own persistence/reset rules are spec §7.2.6/§8.1 step 3,
+    /// tracked by the caller — see `Decoder::prev_segment_ids` in `src/lib.rs`).
     pub fn new_with_prev(
         header: &NewFrameHeader,
         compressed: &CompressedHeader,
         use_prev_frame_mvs: bool,
         prev_mi_grid: Option<MiGrid>,
         resolved_refs: [Option<RefFrameData>; 3],
+        prev_segment_ids: Vec<u8>,
     ) -> Self {
         assert_eq!(
             header.color_config.bit_depth, 8,
-            "TileDecoder は 8bit フレームのみサポートする"
+            "TileDecoder only supports 8bit frames"
         );
         let image_size = header::compute_image_size(header.width, header.height);
         let grid_cols = (image_size.sb64_cols * 8) as usize;
@@ -266,8 +292,8 @@ impl TileDecoder {
         let subsampling_x = header.color_config.subsampling_x as u32;
         let subsampling_y = header.color_config.subsampling_y as u32;
 
-        // フレームバッファはスーパーブロック境界（Sb64Cols*64 / Sb64Rows*64）まで
-        // 切り上げて確保する（src/framebuffer.rs のドキュメント参照）。
+        // Frame buffers are allocated rounded up to the superblock boundary
+        // (Sb64Cols*64 / Sb64Rows*64) (see the docs in src/framebuffer.rs).
         let y_w = (image_size.sb64_cols * 64) as usize;
         let y_h = (image_size.sb64_rows * 64) as usize;
         let uv_w = y_w >> subsampling_x;
@@ -277,7 +303,7 @@ impl TileDecoder {
             Plane::new(uv_w, uv_h),
             Plane::new(uv_w, uv_h),
         ];
-        // AboveNonzeroContext は 4x4 単位（8x8 mi 単位の 2 倍）でフレーム幅全体を持続する。
+        // AboveNonzeroContext persists across the whole frame width in 4x4 units (2x the 8x8 mi unit).
         let above_nz_len = grid_cols * 2;
         let above_nonzero_context = [
             vec![0u8; above_nz_len],
@@ -288,7 +314,7 @@ impl TileDecoder {
         Self {
             tx_mode: compressed.tx_mode,
             probs: compressed.probs.clone(),
-            segmentation_enabled: header.segmentation_enabled,
+            segmentation: header.segmentation,
             mi_cols: image_size.mi_cols,
             mi_rows: image_size.mi_rows,
             tile_cols_log2: header.tile_cols_log2,
@@ -296,6 +322,9 @@ impl TileDecoder {
             mi_grid: MiGrid::new(grid_cols, grid_rows),
             above_partition_context: vec![0u8; grid_cols],
             left_partition_context: [0u8; 8],
+            above_seg_pred_context: vec![0u8; grid_cols],
+            left_seg_pred_context: [0u8; 8],
+            prev_segment_ids,
             mi_col_start: 0,
             mi_col_end: image_size.mi_cols,
             mi_row_start: 0,
@@ -327,7 +356,7 @@ impl TileDecoder {
         }
     }
 
-    /// 収集済みのシンタックス要素カウンタ（仕様 8.4 節の確率適応に使う）。
+    /// The collected syntax element counters (used for probability adaptation, spec §8.4).
     pub fn counts(&self) -> &Counts {
         &self.counts
     }
@@ -336,19 +365,19 @@ impl TileDecoder {
         &self.mi_grid
     }
 
-    /// デコード済みのプレーンバッファ（`CurrFrame`）への参照を返す。
-    /// インデックス 0=Y, 1=U, 2=V。バッファはスーパーブロック境界まで切り上げたサイズを
-    /// 持つため、呼び出し側で表示サイズにクロップする必要がある
-    /// （[`crate::decode_keyframe`] が行う）。
+    /// Returns a reference to the decoded plane buffers (`CurrFrame`).
+    /// Index 0=Y, 1=U, 2=V. The buffers have a size rounded up to the superblock boundary,
+    /// so the caller must crop to the display size
+    /// (done by [`crate::decode_keyframe`]).
     pub fn planes(&self) -> &[Plane; 3] {
         &self.planes
     }
 
-    /// ループフィルタ（仕様 8.8 節、[`crate::loop_filter`]）をデコード済みの `planes` に
-    /// 適用する。`decode_tiles` の直後、`planes()` で出力を読み出す前に呼ぶこと。
+    /// Applies the loop filter (spec §8.8, [`crate::loop_filter`]) to the decoded `planes`.
+    /// Call this right after `decode_tiles`, before reading the output via `planes()`.
     ///
-    /// `self.planes`（`&mut`）と `self.mi_grid`（`&`）を別々のフィールドとして直接借用する
-    /// ことで、両方を同時に必要とする `loop_filter_frame` に安全に渡している。
+    /// By directly borrowing `self.planes` (`&mut`) and `self.mi_grid` (`&`) as separate
+    /// fields, both can be passed safely to `loop_filter_frame`, which needs both at once.
     pub fn apply_loop_filter(&mut self, lf: &header::LoopFilterParams) {
         crate::loop_filter::loop_filter_frame(
             &mut self.planes,
@@ -358,23 +387,28 @@ impl TileDecoder {
             self.subsampling_x,
             self.subsampling_y,
             lf,
+            &self.segmentation,
         );
     }
 
+    /// `clear_above_context( )` (spec §7.4.1): also clears `AboveSegPredContext`.
     fn clear_above_context(&mut self) {
         self.above_partition_context.iter_mut().for_each(|v| *v = 0);
+        self.above_seg_pred_context.iter_mut().for_each(|v| *v = 0);
         for plane_ctx in self.above_nonzero_context.iter_mut() {
             plane_ctx.iter_mut().for_each(|v| *v = 0);
         }
     }
 
+    /// `clear_left_context( )` (spec §7.4.2): also clears `LeftSegPredContext`.
     fn clear_left_context(&mut self) {
         self.left_partition_context = [0u8; 8];
+        self.left_seg_pred_context = [0u8; 8];
         self.left_nonzero_context = [[0u8; 16]; 3];
     }
 
-    /// `decode_tiles( sz )`（仕様 6.4 節）。`data` は非圧縮ヘッダ直後、
-    /// 圧縮ヘッダを除いたタイルデータ全体（フレームデータの残り全部）。
+    /// `decode_tiles( sz )` (spec §6.4). `data` is the entire tile data following the
+    /// uncompressed header, excluding the compressed header (the rest of the frame data).
     pub fn decode_tiles(&mut self, mut data: &[u8]) -> Result<(), TileError> {
         let tile_cols = 1u32 << self.tile_cols_log2;
         let tile_rows = 1u32 << self.tile_rows_log2;
@@ -413,7 +447,7 @@ impl TileDecoder {
         Ok(())
     }
 
-    /// `decode_tile( )`（仕様 6.4.2 節）。
+    /// `decode_tile( )` (spec §6.4.2).
     fn decode_tile(&mut self, r: &mut BoolDecoder) -> Result<(), TileError> {
         let mut row = self.mi_row_start;
         while row < self.mi_row_end {
@@ -428,7 +462,7 @@ impl TileDecoder {
         Ok(())
     }
 
-    /// `decode_partition( r, c, bsize )`（仕様 6.4.3 節）。
+    /// `decode_partition( r, c, bsize )` (spec §6.4.3).
     fn decode_partition(
         &mut self,
         r: &mut BoolDecoder,
@@ -481,17 +515,17 @@ impl TileDecoder {
         Ok(())
     }
 
-    /// `partition` シンタックス要素の読み取り（仕様 9.3.1 節・9.3.2 節）。
+    /// Reads the `partition` syntax element (spec §9.3.1 / §9.3.2).
     ///
-    /// 仕様 9.3.2 節の文面は「FrameIsIntra == 0 のとき kf_partition_probs を使う」と
-    /// 記載しているが、これは既知の誤記である。`compressed_header()`
-    /// （仕様 6.3 節）は `FrameIsIntra == 0` の場合にのみ `partition_probs` を読み込むため、
-    /// 文面通りに実装すると FrameIsIntra == 1 (キーフレーム) で未初期化のまま更新されない
-    /// `partition_probs` を参照することになり、`kf_` 接頭辞の意図（キーフレーム専用の固定表）
-    /// とも矛盾する。本実装では文意を修正し、`FrameIsIntra == 1`（キーフレーム・イントラ
-    /// オンリーフレーム）では固定表 `KF_PARTITION_PROBS` を、`FrameIsIntra == 0`
-    /// （インターフレーム）では `compressed_header()` で更新される `partition_probs`
-    /// （`self.probs.partition_probs`）を使う。
+    /// The spec §9.3.2 text states "use kf_partition_probs when FrameIsIntra == 0", but this
+    /// is a known erratum. Since `compressed_header()` (spec §6.3) only reads
+    /// `partition_probs` when `FrameIsIntra == 0`, implementing the text literally would mean
+    /// referencing `partition_probs` while it is uninitialized and never updated for
+    /// FrameIsIntra == 1 (key frames), which also contradicts the intent of the `kf_` prefix
+    /// (a fixed table specific to key frames). This implementation corrects the wording: for
+    /// `FrameIsIntra == 1` (key frames / intra-only frames) it uses the fixed table
+    /// `KF_PARTITION_PROBS`, and for `FrameIsIntra == 0` (inter frames) it uses
+    /// `partition_probs` as updated by `compressed_header()` (`self.probs.partition_probs`).
     fn read_partition(
         &mut self,
         r: &mut BoolDecoder,
@@ -519,20 +553,20 @@ impl TileDecoder {
             &self.probs.partition_probs[ctx]
         };
 
-        // 仕様 9.3: `partition` は常に type T のシンタックス要素であり、hasRows/hasCols に
-        // よってビットを読まない（tree selection process が直接値を返す）場合でも、
-        // 仕様 9.3.4 節のカウント処理は必ず呼ばれる（`counts_partition[ctx][syntax]`）。
+        // Spec §9.3: `partition` is always a type T syntax element, and even when no bit is
+        // read due to hasRows/hasCols (the tree selection process returns a value directly),
+        // the counting process from spec §9.3.4 is always invoked (`counts_partition[ctx][syntax]`).
         let partition = if has_rows && has_cols {
             r.read_tree(&PARTITION_TREE, |node| probs[node]) as u8
         } else if has_cols {
-            // cols_partition_tree: node2 は 1 に固定される。
+            // cols_partition_tree: node2 is fixed at 1.
             if r.read_bool(probs[1]) {
                 PARTITION_SPLIT
             } else {
                 PARTITION_HORZ
             }
         } else if has_rows {
-            // rows_partition_tree: node2 は 2 に固定される。
+            // rows_partition_tree: node2 is fixed at 2.
             if r.read_bool(probs[2]) {
                 PARTITION_SPLIT
             } else {
@@ -547,7 +581,7 @@ impl TileDecoder {
         partition
     }
 
-    /// `decode_block( r, c, subsize )`（仕様 6.4.4 節）。
+    /// `decode_block( r, c, subsize )` (spec §6.4.4).
     fn decode_block(
         &mut self,
         r: &mut BoolDecoder,
@@ -565,8 +599,8 @@ impl TileDecoder {
         };
         let is_inter = info.ref_frame[0] != INTRA_FRAME;
         let eob_total = self.residual(r, row, col, &info, avail_u, avail_l, is_inter);
-        // 仕様 6.4.4 節: is_inter && subsize >= BLOCK_8X8 && EobTotal == 0 の場合、
-        // skip を後付けで 1 にする（残差が実際には全く無かったことが判明したため）。
+        // Spec §6.4.4: when is_inter && subsize >= BLOCK_8X8 && EobTotal == 0, retroactively
+        // set skip to 1 (since it turns out there was actually no residual at all).
         if is_inter && subsize >= BLOCK_8X8 && eob_total == 0 {
             info.skip = true;
         }
@@ -581,7 +615,7 @@ impl TileDecoder {
         Ok(())
     }
 
-    /// `get_uv_tx_size( )`（仕様 6.4.22 節）。
+    /// `get_uv_tx_size( )` (spec §6.4.22).
     fn get_uv_tx_size(&self, mi_size: u8, tx_size: u8) -> u8 {
         if mi_size < BLOCK_8X8 {
             return TX_4X4;
@@ -590,14 +624,14 @@ impl TileDecoder {
         tx_size.min(MAX_TXSIZE_LOOKUP[plane_sz as usize])
     }
 
-    /// `get_plane_block_size( subsize, plane )`（仕様 6.4.23 節）。
+    /// `get_plane_block_size( subsize, plane )` (spec §6.4.23).
     fn get_plane_block_size(&self, subsize: u8, plane: usize) -> u8 {
         let subx = if plane > 0 { self.subsampling_x } else { 0 } as usize;
         let suby = if plane > 0 { self.subsampling_y } else { 0 } as usize;
         SS_SIZE_LOOKUP[subsize as usize][subx][suby]
     }
 
-    /// `residual( )`（仕様 6.4.21 節）。戻り値は `EobTotal`（仕様 6.4.4 節）。
+    /// `residual( )` (spec §6.4.21). The return value is `EobTotal` (spec §6.4.4).
     #[allow(clippy::too_many_arguments)]
     fn residual(
         &mut self,
@@ -632,14 +666,14 @@ impl TileDecoder {
             let base_y = (row * 8) >> sub_y;
             let maxx = (self.mi_cols * 8) >> sub_x;
             let maxy = (self.mi_rows * 8) >> sub_y;
-            // predict_intra に渡す maxX/maxY（仕様 8.5.1 節）はプレーン全体の座標での
-            // クリップ境界であり、maxx/maxy(上記, residual のブロック内クリップ用) とは
-            // 意味が異なる点に注意。
+            // Note that maxX/maxY passed to predict_intra (spec §8.5.1) are the clip bounds
+            // in whole-plane coordinates, which is a different meaning from maxx/maxy above
+            // (used for in-block clipping in residual).
             let pred_max_x = ((self.mi_cols * 8) >> sub_x).saturating_sub(1) as usize;
             let pred_max_y = ((self.mi_rows * 8) >> sub_y).saturating_sub(1) as usize;
 
             if is_inter {
-                // `predict_inter()`（仕様 8.5.2 節）: 動き補償・サブピクセル補間。
+                // `predict_inter()` (spec §8.5.2): motion compensation / sub-pixel interpolation.
                 let refs: [Option<&RefFrameData>; 2] = [
                     if info.ref_frame[0] > INTRA_FRAME {
                         self.resolved_refs[(info.ref_frame[0] - LAST_FRAME) as usize].as_ref()
@@ -780,6 +814,7 @@ impl TileDecoder {
                                 tx_sz,
                                 tx_type,
                                 is_inter,
+                                info.segment_id,
                             );
                         }
                     }
@@ -800,7 +835,7 @@ impl TileDecoder {
         eob_total
     }
 
-    /// `get_scan( )`（仕様 6.4.25 節）のうち `TxType` を決定する部分。
+    /// The part of `get_scan( )` (spec §6.4.25) that determines `TxType`.
     #[allow(clippy::too_many_arguments)]
     fn compute_tx_type(
         &self,
@@ -826,8 +861,8 @@ impl TileDecoder {
                 mode2txfm_map(mode)
             }
         } else {
-            // is_inter の場合 y_mode は NEARESTMV..NEWMV (10..13) を取り、
-            // mode2txfm_map はこれらをすべて DctDct に写像する（仕様 10.2 節）。
+            // When is_inter, y_mode takes NEARESTMV..NEWMV (10..13), and mode2txfm_map maps
+            // all of these to DctDct (spec §10.2).
             mode2txfm_map(y_mode)
         }
     }
@@ -841,8 +876,8 @@ impl TileDecoder {
         }
     }
 
-    /// `tokens( )`（仕様 6.4.24 節）+ `reconstruct( )`（仕様 8.6.2 節）。
-    /// 戻り値は `nonzero`（仕様 6.4.24 節の `nonzero = c > 0`）。
+    /// `tokens( )` (spec §6.4.24) + `reconstruct( )` (spec §8.6.2).
+    /// The return value is `nonzero` (`nonzero = c > 0` from spec §6.4.24).
     #[allow(clippy::too_many_arguments)]
     fn tokens_and_reconstruct(
         &mut self,
@@ -853,6 +888,7 @@ impl TileDecoder {
         tx_sz: u8,
         tx_type: TxType,
         is_inter: bool,
+        segment_id: u8,
     ) -> bool {
         let n = (tx_sz as u32) + 2;
         let n0 = 1usize << n;
@@ -881,7 +917,7 @@ impl TileDecoder {
                 coefband_8x8plus(c) as usize
             };
 
-            // ctx の導出（仕様 9.3.2 節、more_coefs/token 共通）。
+            // Derivation of ctx (spec §9.3.2, shared by more_coefs/token).
             let ctx = if c == 0 {
                 let mut above = 0u32;
                 let mut left = 0u32;
@@ -927,12 +963,13 @@ impl TileDecoder {
                     break;
                 }
             } else {
-                // 仕様 9.3.4 節末尾の "special case"（PDF 上は本文が欠落しているが、9.3 節の
-                // 一般規則「T 型シンタックス要素は、たとえビットを読まなくてもカウント処理は
-                // 必ず呼ばれる」（partition の hasRows/hasCols==false と同型のパターン）から
-                // 導かれる唯一の一貫した解釈として、checkEob==0 のため実際には more_coefs を
-                // 読まない箇所でも、値 1（コンテキストは token と同じ ctx）としてカウントする。
-                // 全フレーム MD5 コンフォーマンスで実証的に検証済み。
+                // The "special case" at the end of spec §9.3.4 (the body text is missing from
+                // the PDF, but this is the one consistent interpretation derivable from the
+                // general rule in §9.3, "a type T syntax element always has its counting
+                // process invoked even when no bit is read" — the same pattern as
+                // partition's hasRows/hasCols==false case): even where more_coefs is not
+                // actually read because checkEob==0, count it as if the value were 1 (using
+                // the same ctx as token). Verified empirically via full-frame MD5 conformance.
                 self.counts.more_coefs[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
                     [1] += 1;
             }
@@ -965,9 +1002,18 @@ impl TileDecoder {
 
         let nonzero = c > 0;
 
-        // 逆量子化 + 逆変換 + 再構成（仕様 8.6.2 節）。
+        // Inverse quantization + inverse transform + reconstruction (spec §8.6.2).
         let dq_denom: i64 = if tx_sz == TX_32X32 { 2 } else { 1 };
-        let qindex = self.base_q_idx;
+        // `get_qindex( )` (spec §8.6.1): SEG_LVL_ALT_Q overrides base_q_idx per-segment.
+        let seg_q_override = if self.seg_feature_active(segment_id, SEG_LVL_ALT_Q) {
+            Some(SegQIndexOverride {
+                data: self.segmentation.feature_data[segment_id as usize][SEG_LVL_ALT_Q],
+                abs_or_delta_update: self.segmentation.abs_or_delta_update,
+            })
+        } else {
+            None
+        };
+        let qindex = get_qindex(self.base_q_idx, seg_q_override);
         let ac_quant = get_ac_quant(self.bit_depth, qindex, plane, self.delta_q_uv_ac) as i64;
         let dc_quant = get_dc_quant(
             self.bit_depth,
@@ -995,7 +1041,7 @@ impl TileDecoder {
         nonzero
     }
 
-    /// `read_coef( token )`（仕様 6.4.26 節）。
+    /// `read_coef( token )` (spec §6.4.26).
     fn read_coef(&self, r: &mut BoolDecoder, token: u8) -> i32 {
         let row = &EXTRA_BITS[token as usize];
         let cat = row[0] as usize;
@@ -1003,8 +1049,8 @@ impl TileDecoder {
         let mut coef = row[2] as i32;
 
         if token == DCT_VAL_CATEGORY6 {
-            // BitDepth == 8 の場合、このループは 0 回実行される
-            // （`for e in 0..(BitDepth-8)`）。10bit/12bit は M2 の対象外。
+            // When BitDepth == 8, this loop runs 0 times
+            // (`for e in 0..(BitDepth-8)`). 10bit/12bit are out of scope for M2.
             for e in 0..(self.bit_depth.saturating_sub(8) as u32) {
                 let high_bit = r.read_bool(255) as i32;
                 coef += high_bit << (5 + self.bit_depth as u32 - e);
@@ -1019,24 +1065,75 @@ impl TileDecoder {
         coef
     }
 
-    /// `intra_segment_id( )`（仕様 6.4.7 節）。
-    ///
-    /// `segmentation_enabled == true` の場合、`segmentation_update_map` や
-    /// `segmentation_tree_probs` が必要になるが、`src/header.rs` は M2 時点で
-    /// `segmentation_enabled` の有無しか保持していない。そのため segmentation が有効な
-    /// フレームは現時点ではサポート対象外としてエラーを返す
-    /// （実データの `vp90-2-*.ivf` テストベクタでは `segmentation_enabled == false` であることを
-    /// 確認済みで、少なくともこの範囲では影響がない）。
-    fn intra_segment_id(&self) -> Result<u8, TileError> {
-        if self.segmentation_enabled {
-            Err(TileError::SegmentationNotSupported)
+    /// `seg_feature_active( feature )` (spec §6.4.9).
+    fn seg_feature_active(&self, segment_id: u8, feature: usize) -> bool {
+        self.segmentation.enabled && self.segmentation.feature_enabled[segment_id as usize][feature]
+    }
+
+    /// `intra_segment_id( )` (spec §6.4.7). Used for `FrameIsIntra` blocks
+    /// (key frames / intra-only frames), which have no temporal prediction of
+    /// `segment_id` (unlike `inter_segment_id`).
+    fn intra_segment_id(&self, r: &mut BoolDecoder) -> u8 {
+        if self.segmentation.enabled && self.segmentation.update_map {
+            r.read_tree(&SEGMENT_TREE, |node| self.segmentation.tree_probs[node]) as u8
         } else {
-            Ok(0)
+            0
         }
     }
 
-    /// `read_skip( )`（仕様 6.4.8 節）。セグメンテーション未サポートのため
-    /// `seg_feature_active( SEG_LVL_SKIP )` は常に false として扱う。
+    /// `get_segment_id( )` (spec §6.4.14). The predicted segment id is the
+    /// smallest value found in the on-screen region of `PrevSegmentIds`
+    /// covered by the current block.
+    fn get_segment_id(&self, row: u32, col: u32, mi_size: u8) -> u8 {
+        let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
+        let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
+        let xmis = (self.mi_cols - col).min(bw);
+        let ymis = (self.mi_rows - row).min(bh);
+        let mut seg = 7u8;
+        for y in 0..ymis {
+            for x in 0..xmis {
+                let idx = ((row + y) * self.mi_cols + (col + x)) as usize;
+                seg = seg.min(self.prev_segment_ids[idx]);
+            }
+        }
+        seg
+    }
+
+    /// `inter_segment_id( )` (spec §6.4.12). Used for blocks in an inter frame
+    /// (`!FrameIsIntra`), whether or not the individual block itself is inter-coded.
+    fn inter_segment_id(&mut self, r: &mut BoolDecoder, row: u32, col: u32, mi_size: u8) -> u8 {
+        if !self.segmentation.enabled {
+            return 0;
+        }
+        let predicted_segment_id = self.get_segment_id(row, col, mi_size);
+        if !self.segmentation.update_map {
+            return predicted_segment_id;
+        }
+        if !self.segmentation.temporal_update {
+            return r.read_tree(&SEGMENT_TREE, |node| self.segmentation.tree_probs[node]) as u8;
+        }
+
+        let ctx = (self.left_seg_pred_context[(row % 8) as usize]
+            + self.above_seg_pred_context[col as usize]) as usize;
+        let seg_id_predicted = r.read_bool(self.segmentation.pred_prob[ctx]);
+        let segment_id = if seg_id_predicted {
+            predicted_segment_id
+        } else {
+            r.read_tree(&SEGMENT_TREE, |node| self.segmentation.tree_probs[node]) as u8
+        };
+
+        let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
+        let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
+        for i in 0..bw {
+            self.above_seg_pred_context[(col + i) as usize] = seg_id_predicted as u8;
+        }
+        for i in 0..bh {
+            self.left_seg_pred_context[((row + i) % 8) as usize] = seg_id_predicted as u8;
+        }
+        segment_id
+    }
+
+    /// `read_skip( )` (spec §6.4.8).
     fn read_skip(
         &mut self,
         r: &mut BoolDecoder,
@@ -1044,7 +1141,11 @@ impl TileDecoder {
         col: u32,
         avail_u: bool,
         avail_l: bool,
+        segment_id: u8,
     ) -> bool {
+        if self.seg_feature_active(segment_id, SEG_LVL_SKIP) {
+            return true;
+        }
         let mut ctx = 0usize;
         if avail_u && self.mi_grid.get(row - 1, col).skip {
             ctx += 1;
@@ -1059,7 +1160,7 @@ impl TileDecoder {
         skip
     }
 
-    /// `read_tx_size( allowSelect )`（仕様 6.4.10 節）。
+    /// `read_tx_size( allowSelect )` (spec §6.4.10).
     fn read_tx_size(
         &mut self,
         r: &mut BoolDecoder,
@@ -1108,7 +1209,7 @@ impl TileDecoder {
         }
     }
 
-    /// `intra_frame_mode_info( )`（仕様 6.4.6 節）。
+    /// `intra_frame_mode_info( )` (spec §6.4.6).
     fn intra_frame_mode_info(
         &mut self,
         r: &mut BoolDecoder,
@@ -1118,8 +1219,8 @@ impl TileDecoder {
         avail_u: bool,
         avail_l: bool,
     ) -> Result<MiInfo, TileError> {
-        let segment_id = self.intra_segment_id()?;
-        let skip = self.read_skip(r, row, col, avail_u, avail_l);
+        let segment_id = self.intra_segment_id(r);
+        let skip = self.read_skip(r, row, col, avail_u, avail_l, segment_id);
         let tx_size = self.read_tx_size(r, mi_size, true, (row, col), (avail_u, avail_l));
 
         let mut sub_modes = [DC_PRED; 4];
@@ -1198,10 +1299,10 @@ impl TileDecoder {
     }
 
     // =========================================================================
-    // インターフレーム（`FrameIsIntra == 0`）のモード情報復号（仕様 6.4.11〜6.4.20 節）。
+    // Inter frame (`FrameIsIntra == 0`) mode info decoding (spec §6.4.11-6.4.20).
     // =========================================================================
 
-    /// `inter_frame_mode_info( )`（仕様 6.4.11 節）。
+    /// `inter_frame_mode_info( )` (spec §6.4.11).
     fn inter_frame_mode_info(
         &mut self,
         r: &mut BoolDecoder,
@@ -1232,11 +1333,9 @@ impl TileDecoder {
             above_single: above_ref_frame[1] == REF_NONE,
         };
 
-        // セグメンテーション未サポート（`intra_segment_id`/`inter_segment_id` は
-        // segmentation_enabled == false の場合、どちらも常に 0 を返す点で等価）。
-        let segment_id = self.intra_segment_id()?;
-        let skip = self.read_skip(r, row, col, avail_u, avail_l);
-        let is_inter = self.read_is_inter(r, &neighbors);
+        let segment_id = self.inter_segment_id(r, row, col, mi_size);
+        let skip = self.read_skip(r, row, col, avail_u, avail_l, segment_id);
+        let is_inter = self.read_is_inter(r, &neighbors, segment_id);
         let tx_size = self.read_tx_size(
             r,
             mi_size,
@@ -1252,9 +1351,12 @@ impl TileDecoder {
         }
     }
 
-    /// `read_is_inter( )`（仕様 6.4.13 節）。`seg_feature_active( SEG_LVL_REF_FRAME )` は
-    /// セグメンテーション未サポートのため常に false。
-    fn read_is_inter(&mut self, r: &mut BoolDecoder, n: &NeighborRefInfo) -> bool {
+    /// `read_is_inter( )` (spec §6.4.13).
+    fn read_is_inter(&mut self, r: &mut BoolDecoder, n: &NeighborRefInfo, segment_id: u8) -> bool {
+        if self.seg_feature_active(segment_id, SEG_LVL_REF_FRAME) {
+            return self.segmentation.feature_data[segment_id as usize][SEG_LVL_REF_FRAME]
+                != INTRA_FRAME as i32;
+        }
         let ctx = if n.avail_u && n.avail_l {
             if n.left_intra && n.above_intra {
                 3
@@ -1275,7 +1377,7 @@ impl TileDecoder {
         is_inter
     }
 
-    /// `intra_block_mode_info( )`（仕様 6.4.15 節）。インターフレーム内のイントラブロック用。
+    /// `intra_block_mode_info( )` (spec §6.4.15). For intra blocks within an inter frame.
     fn intra_block_mode_info(
         &mut self,
         r: &mut BoolDecoder,
@@ -1301,7 +1403,7 @@ impl TileDecoder {
             while idy < 2 {
                 let mut idx = 0u32;
                 while idx < 2 {
-                    // sub_intra_mode: ctx は常に 0（仕様 9.3.2 節）。
+                    // sub_intra_mode: ctx is always 0 (spec §9.3.2).
                     let mode = r
                         .read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[0][node])
                         as u8;
@@ -1339,9 +1441,14 @@ impl TileDecoder {
         })
     }
 
-    /// `read_ref_frames( )`（仕様 6.4.17 節）。`seg_feature_active( SEG_LVL_REF_FRAME )` は
-    /// セグメンテーション未サポートのため常に false。
-    fn read_ref_frames(&mut self, r: &mut BoolDecoder, n: &NeighborRefInfo) -> [u8; 2] {
+    /// `read_ref_frames( )` (spec §6.4.17).
+    fn read_ref_frames(&mut self, r: &mut BoolDecoder, n: &NeighborRefInfo, segment_id: u8) -> [u8; 2] {
+        if self.seg_feature_active(segment_id, SEG_LVL_REF_FRAME) {
+            return [
+                self.segmentation.feature_data[segment_id as usize][SEG_LVL_REF_FRAME] as u8,
+                REF_NONE,
+            ];
+        }
         let comp_mode = if self.reference_mode == REFERENCE_MODE_SELECT {
             let ctx = self.comp_mode_ctx(n);
             let bit = r.read_bool(self.probs.comp_mode_prob[ctx]);
@@ -1382,7 +1489,7 @@ impl TileDecoder {
         }
     }
 
-    /// `comp_mode` の文脈導出（仕様 9.3.2 節）。
+    /// Context derivation for `comp_mode` (spec §9.3.2).
     fn comp_mode_ctx(&self, n: &NeighborRefInfo) -> usize {
         let fixed = self.comp_fixed_ref;
         if n.avail_u && n.avail_l {
@@ -1412,7 +1519,7 @@ impl TileDecoder {
         }
     }
 
-    /// `comp_ref` の文脈導出（仕様 9.3.2 節）。
+    /// Context derivation for `comp_ref` (spec §9.3.2).
     fn comp_ref_ctx(&self, n: &NeighborRefInfo) -> usize {
         let fix_ref_idx = self.ref_frame_sign_bias[self.comp_fixed_ref as usize] as usize;
         let var_ref_idx = 1 - fix_ref_idx;
@@ -1493,7 +1600,7 @@ impl TileDecoder {
         }
     }
 
-    /// `single_ref_p1` の文脈導出（仕様 9.3.2 節）。
+    /// Context derivation for `single_ref_p1` (spec §9.3.2).
     fn single_ref_p1_ctx(&self, n: &NeighborRefInfo) -> usize {
         if n.avail_u && n.avail_l {
             if n.above_intra && n.left_intra {
@@ -1563,7 +1670,7 @@ impl TileDecoder {
         }
     }
 
-    /// `single_ref_p2` の文脈導出（仕様 9.3.2 節）。
+    /// Context derivation for `single_ref_p2` (spec §9.3.2).
     fn single_ref_p2_ctx(&self, n: &NeighborRefInfo) -> usize {
         if n.avail_u && n.avail_l {
             if n.above_intra && n.left_intra {
@@ -1659,8 +1766,8 @@ impl TileDecoder {
         }
     }
 
-    /// `interp_filter` の文脈導出（仕様 9.3.2 節）。`3` は「両隣接ブロックの少なくとも一方が
-    /// イントラ、またはフィルタが不一致」を表す番兵値。
+    /// Context derivation for `interp_filter` (spec §9.3.2). `3` is a sentinel value meaning
+    /// "at least one of the two neighboring blocks is intra, or the filters disagree".
     fn interp_filter_ctx(&self, row: u32, col: u32, n: &NeighborRefInfo) -> usize {
         let left_interp = if n.avail_l && n.left_ref_frame[0] > INTRA_FRAME {
             self.mi_grid.get(row, col - 1).interp_filter
@@ -1683,7 +1790,7 @@ impl TileDecoder {
         }
     }
 
-    /// `inter_block_mode_info( )`（仕様 6.4.16 節）。
+    /// `inter_block_mode_info( )` (spec §6.4.16).
     #[allow(clippy::too_many_arguments)]
     fn inter_block_mode_info(
         &mut self,
@@ -1696,7 +1803,7 @@ impl TileDecoder {
         segment_id: u8,
         n: &NeighborRefInfo,
     ) -> Result<MiInfo, TileError> {
-        let ref_frame = self.read_ref_frames(r, n);
+        let ref_frame = self.read_ref_frames(r, n, segment_id);
 
         let mut nearest_mv: [Mv; 2] = [ZERO_MV; 2];
         let mut near_mv: [Mv; 2] = [ZERO_MV; 2];
@@ -1717,8 +1824,14 @@ impl TileDecoder {
         let is_compound = ref_frame[1] > INTRA_FRAME;
         let n_refs = 1 + is_compound as usize;
 
+        // §6.4.16: when seg_feature_active(SEG_LVL_SKIP), y_mode is forced to ZEROMV without
+        // reading inter_mode. Bitstream conformance guarantees MiSize >= BLOCK_8X8 whenever
+        // seg_feature_active(SEG_LVL_SKIP) is set here, so the MiSize < BLOCK_8X8 sub8x8 loop
+        // below never runs in that case.
         let mut y_mode = ZEROMV;
-        if mi_size >= BLOCK_8X8 {
+        if self.seg_feature_active(segment_id, SEG_LVL_SKIP) {
+            // y_mode stays ZEROMV.
+        } else if mi_size >= BLOCK_8X8 {
             let ctx = mode_context[ref_frame[0] as usize] as usize;
             let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
                 self.probs.inter_mode_probs[ctx][node]
@@ -1806,7 +1919,7 @@ impl TileDecoder {
         })
     }
 
-    /// `assign_mv( isCompound )`（仕様 6.4.18 節）。
+    /// `assign_mv( isCompound )` (spec §6.4.18).
     fn assign_mv(
         &mut self,
         r: &mut BoolDecoder,
@@ -1828,7 +1941,7 @@ impl TileDecoder {
         mv
     }
 
-    /// `read_mv( ref )`（仕様 6.4.19 節）。
+    /// `read_mv( ref )` (spec §6.4.19).
     fn read_mv(&mut self, r: &mut BoolDecoder, best_mv: Mv) -> Mv {
         let use_hp = self.allow_high_precision_mv && use_mv_hp(best_mv);
         let mv_joint = r.read_tree(&MV_JOINT_TREE, |node| self.probs.mv_joint_probs[node]) as u8;
@@ -1843,7 +1956,7 @@ impl TileDecoder {
         [best_mv[0] + diff[0], best_mv[1] + diff[1]]
     }
 
-    /// `read_mv_component( comp )`（仕様 6.4.20 節）。
+    /// `read_mv_component( comp )` (spec §6.4.20).
     fn read_mv_component(&mut self, r: &mut BoolDecoder, comp: usize, use_hp: bool) -> i32 {
         let sign = r.read_bool(self.probs.mv_sign_prob[comp]);
         self.counts.mv_sign[comp][sign as usize] += 1;
@@ -1890,7 +2003,7 @@ impl TileDecoder {
         }
     }
 
-    /// `is_inside( candidateR, candidateC )`（仕様 6.5.2 節）。
+    /// `is_inside( candidateR, candidateC )` (spec §6.5.2).
     fn is_inside(&self, r: i32, c: i32) -> bool {
         r >= 0
             && (r as u32) < self.mi_rows
@@ -1898,14 +2011,14 @@ impl TileDecoder {
             && c < self.mi_col_end as i32
     }
 
-    /// `get_block_mv( candidateR, candidateC, refList, usePrev )`（仕様 6.5.10 節）。
-    /// 戻り値は `(CandidateMv, CandidateFrame)`。
+    /// `get_block_mv( candidateR, candidateC, refList, usePrev )` (spec §6.5.10).
+    /// The return value is `(CandidateMv, CandidateFrame)`.
     fn get_block_mv(&self, row: u32, col: u32, ref_list: usize, use_prev: bool) -> (Mv, u8) {
         if use_prev {
             let grid = self
                 .prev_mi_grid
                 .as_ref()
-                .expect("use_prev_frame_mvs が真の場合 prev_mi_grid は必ず Some");
+                .expect("prev_mi_grid must be Some when use_prev_frame_mvs is true");
             let info = grid.get(row, col);
             (info.mv[ref_list], info.ref_frame[ref_list])
         } else {
@@ -1914,7 +2027,7 @@ impl TileDecoder {
         }
     }
 
-    /// `if_same_ref_frame_add_mv( candidateR, candidateC, refFrame, usePrev )`（仕様 6.5.7 節）。
+    /// `if_same_ref_frame_add_mv( candidateR, candidateC, refFrame, usePrev )` (spec §6.5.7).
     fn if_same_ref_frame_add_mv(
         &self,
         row: u32,
@@ -1933,7 +2046,7 @@ impl TileDecoder {
         }
     }
 
-    /// `if_diff_ref_frame_add_mv( candidateR, candidateC, refFrame, usePrev )`（仕様 6.5.8 節）。
+    /// `if_diff_ref_frame_add_mv( candidateR, candidateC, refFrame, usePrev )` (spec §6.5.8).
     fn if_diff_ref_frame_add_mv(
         &self,
         row: u32,
@@ -1956,7 +2069,7 @@ impl TileDecoder {
         }
     }
 
-    /// `find_mv_refs( refFrame, block )`（仕様 6.5.1 節）。戻り値は `(RefListMv, ModeContext)`。
+    /// `find_mv_refs( refFrame, block )` (spec §6.5.1). The return value is `(RefListMv, ModeContext)`.
     fn find_mv_refs(
         &self,
         row: u32,
@@ -2060,7 +2173,7 @@ impl TileDecoder {
         (ref_list_mv, mode_context)
     }
 
-    /// `find_best_ref_mvs( refList )`（仕様 6.5.12 節）。戻り値は `(NearestMv, NearMv, BestMv)`。
+    /// `find_best_ref_mvs( refList )` (spec §6.5.12). The return value is `(NearestMv, NearMv, BestMv)`.
     fn find_best_ref_mvs(
         &self,
         row: u32,
@@ -2088,7 +2201,7 @@ impl TileDecoder {
         (out[0], out[1], out[0])
     }
 
-    /// `append_sub8x8_mvs( block, refList )`（仕様 6.5.14 節）。戻り値は `(NearestMv, NearMv)`。
+    /// `append_sub8x8_mvs( block, refList )` (spec §6.5.14). The return value is `(NearestMv, NearMv)`.
     #[allow(clippy::too_many_arguments)]
     fn append_sub8x8_mvs(
         &self,
@@ -2134,8 +2247,8 @@ impl TileDecoder {
     }
 }
 
-/// `inter_frame_mode_info( )`（仕様 6.4.11 節）が導出する近傍情報
-/// （`LeftRefFrame`/`AboveRefFrame`/`LeftIntra`/`AboveIntra`/`LeftSingle`/`AboveSingle`）。
+/// Neighbor information derived by `inter_frame_mode_info( )` (spec §6.4.11)
+/// (`LeftRefFrame`/`AboveRefFrame`/`LeftIntra`/`AboveIntra`/`LeftSingle`/`AboveSingle`).
 struct NeighborRefInfo {
     avail_u: bool,
     avail_l: bool,
@@ -2156,7 +2269,21 @@ mod tests {
     };
     use crate::prob_tables::{BLOCK_4X4, BLOCK_64X64 as B64, ONLY_4X4};
 
-    /// テスト用に最小限の `NewFrameHeader` を組み立てる。8x8 (1 MI, 1 SB) のキーフレーム。
+    /// A disabled `SegmentationParams` (the M2 default / most existing tests).
+    fn no_segmentation() -> crate::header::SegmentationParams {
+        crate::header::SegmentationParams {
+            enabled: false,
+            update_map: false,
+            tree_probs: [255; 7],
+            pred_prob: [255; 3],
+            temporal_update: false,
+            abs_or_delta_update: false,
+            feature_enabled: [[false; 4]; 8],
+            feature_data: [[0; 4]; 8],
+        }
+    }
+
+    /// Builds a minimal `NewFrameHeader` for tests. An 8x8 (1 MI, 1 SB) key frame.
     fn minimal_header(width: u32, height: u32) -> NewFrameHeader {
         NewFrameHeader {
             profile: 0,
@@ -2185,6 +2312,7 @@ mod tests {
             refresh_frame_context: true,
             frame_parallel_decoding_mode: false,
             frame_context_idx: 0,
+            frame_context_idx_raw: 0,
             loop_filter: LoopFilterParams {
                 level: 0,
                 sharpness: 0,
@@ -2199,7 +2327,7 @@ mod tests {
                 delta_q_uv_ac: 0,
                 lossless: true,
             },
-            segmentation_enabled: false,
+            segmentation: no_segmentation(),
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             header_size_in_bytes: 0,
@@ -2218,40 +2346,40 @@ mod tests {
 
     #[test]
     fn get_tile_offset_matches_spec_formula() {
-        // MiCols=1, tileSzLog2=0 -> 1 タイルのみで offset は 0 と mis になる。
+        // MiCols=1, tileSzLog2=0 -> only 1 tile, so offset is 0 and mis.
         assert_eq!(get_tile_offset(0, 1, 0), 0);
         assert_eq!(get_tile_offset(1, 1, 0), 1);
     }
 
     #[test]
     fn single_skip_block_decodes_without_residual_error() {
-        // 8x8 (1 MI) の 1 スーパーブロックだけのフレーム。
-        // partition (BLOCK_64X64, hasRows=false, hasCols=false) -> ビットを読まず SPLIT
+        // A frame consisting of a single superblock of 8x8 (1 MI).
+        // partition (BLOCK_64X64, hasRows=false, hasCols=false) -> SPLIT with no bit read
         // partition (BLOCK_32X32, hasRows=false, hasCols=false) -> SPLIT
         // partition (BLOCK_16X16, hasRows=false, hasCols=false) -> SPLIT
-        // partition (BLOCK_8X8, hasRows=false, hasCols=false) -> SPLIT だが
-        //   num8x8=1 なので half_block8x8=0 となり hasRows/hasCols は判定次第。
-        // MiCols=MiRows=1 なので half_block8x8 は常に 0 のため
-        // hasRows = (r+0) < 1 = true (r=0), hasCols = true。よって最上位から
-        // has_rows=has_cols=true でツリー全体を読む必要がある。
+        // partition (BLOCK_8X8, hasRows=false, hasCols=false) -> SPLIT, but
+        //   num8x8=1 so half_block8x8=0, and hasRows/hasCols depend on the check.
+        // Since MiCols=MiRows=1, half_block8x8 is always 0, so
+        // hasRows = (r+0) < 1 = true (r=0), hasCols = true. So from the top level,
+        // has_rows=has_cols=true and the whole tree must be read.
         let header = minimal_header(8, 8);
         let compressed = default_compressed_header();
         let mut decoder = TileDecoder::new(&header, &compressed);
 
         let mut enc = BoolEncoder::new();
-        // BLOCK_64X64: has_rows=true, has_cols=true (MiRows=MiCols=1, half=32>>... 実際は
-        // num8x8=8, half=4, (0+4)<1 は false なので hasRows=hasCols=false -> ビットなしで SPLIT。
-        // BLOCK_32X32: num8x8=4, half=2, (0+2)<1 false -> hasRows=hasCols=false -> SPLIT (ビットなし)
-        // BLOCK_16X16: num8x8=2, half=1, (0+1)<1 false -> hasRows=hasCols=false -> SPLIT (ビットなし)
-        // BLOCK_8X8: num8x8=1, half=0, (0+0)<1 true -> hasRows=hasCols=true -> partition_tree を読む
-        let ctx = 3 * 4; // bsl(BLOCK_8X8)=0 の実際の ctx は above/left context 次第。後述のクロージャに委ねる。
+        // BLOCK_64X64: has_rows=true, has_cols=true (MiRows=MiCols=1, half=32>>... actually
+        // num8x8=8, half=4, (0+4)<1 is false so hasRows=hasCols=false -> SPLIT with no bit read.
+        // BLOCK_32X32: num8x8=4, half=2, (0+2)<1 false -> hasRows=hasCols=false -> SPLIT (no bit)
+        // BLOCK_16X16: num8x8=2, half=1, (0+1)<1 false -> hasRows=hasCols=false -> SPLIT (no bit)
+        // BLOCK_8X8: num8x8=1, half=0, (0+0)<1 true -> hasRows=hasCols=true -> read partition_tree
+        let ctx = 3 * 4; // bsl(BLOCK_8X8)=0; the actual ctx depends on the above/left context. Left to the closure below.
         let _ = ctx;
-        // partition = PARTITION_NONE を選択する: partition_tree の最初の分岐で bit=0。
+        // Choose partition = PARTITION_NONE: bit=0 at the first branch of partition_tree.
         enc.write_bool(false, KF_PARTITION_PROBS[0][0]);
         // intra_frame_mode_info: skip=1
         enc.write_bool(true, CompressedHeaderProbs::default().skip_prob[0]);
-        // read_tx_size: tx_mode=ONLY_4X4 なので allowSelect でもツリーは読まれない。
-        // default_intra_mode (MiSize=BLOCK_8X8 >= BLOCK_8X8): DC_PRED を選択(木の最初の分岐 bit=0)
+        // read_tx_size: tx_mode=ONLY_4X4, so the tree is not read even with allowSelect.
+        // default_intra_mode (MiSize=BLOCK_8X8 >= BLOCK_8X8): choose DC_PRED (bit=0 at the first tree branch)
         enc.write_bool(
             false,
             KF_Y_MODE_PROBS[DC_PRED as usize][DC_PRED as usize][0],
@@ -2270,16 +2398,17 @@ mod tests {
         assert_eq!(info.y_mode, DC_PRED);
         assert_eq!(info.uv_mode, DC_PRED);
         assert_eq!(info.tx_size, TX_4X4);
-        let _ = B64; // BLOCK_64X64 の別名インポートを使用していることの明示 (未使用警告防止)。
+        let _ = B64; // Explicitly use the BLOCK_64X64 alias import (avoid unused warning).
         let _ = BLOCK_4X4;
     }
 
     #[test]
     fn non_skip_block_with_all_zero_tokens_decodes_successfully() {
-        // 8x8 (1 MI) の非 skip ブロック。lossless なので tx_size は常に TX_4X4 で、
-        // Y プレーンは 2x2=4 個、U/V プレーンは 1 個ずつの 4x4 変換ブロックを持つ。
-        // 各ブロックで最初の more_coefs を false にする（係数なし）ことで、
-        // トークン復号・逆量子化・逆変換・再構成の一連の処理を最小構成で検証する。
+        // A non-skip 8x8 (1 MI) block. Since lossless, tx_size is always TX_4X4, and the Y
+        // plane has 2x2=4 4x4 transform blocks, while U/V each have 1.
+        // Setting the first more_coefs to false in each block (no coefficients) verifies the
+        // full token decoding / inverse quantization / inverse transform / reconstruction
+        // pipeline with a minimal configuration.
         let header = minimal_header(8, 8);
         let compressed = default_compressed_header();
         let mut decoder = TileDecoder::new(&header, &compressed);
@@ -2297,7 +2426,7 @@ mod tests {
         let y_more_coefs_prob = CompressedHeaderProbs::default().coef_probs[0][0][0][0][0][0];
         let uv_more_coefs_prob = CompressedHeaderProbs::default().coef_probs[0][1][0][0][0][0];
         for _ in 0..4 {
-            enc.write_bool(false, y_more_coefs_prob); // Y の 4 個の 4x4 ブロック: more_coefs=0
+            enc.write_bool(false, y_more_coefs_prob); // Y's 4 4x4 blocks: more_coefs=0
         }
         enc.write_bool(false, uv_more_coefs_prob); // U
         enc.write_bool(false, uv_more_coefs_prob); // V
@@ -2309,44 +2438,209 @@ mod tests {
 
         let info = decoder.mi_grid().get(0, 0);
         assert!(!info.skip);
-        // 全係数ゼロなので、再構成後のピクセル値は予測値（DC_PRED, 参照不可なので
-        // bit_depth の中間値 128）のままのはず。
+        // Since all coefficients are zero, the reconstructed pixel value should remain the
+        // predicted value (DC_PRED, and since no reference is available, the bit_depth
+        // midpoint 128).
         assert_eq!(decoder.planes()[0].get(0, 0), 128);
     }
 
+    // =========================================================================
+    // Unit tests for segmentation (spec §6.4.7, §6.4.9, §6.4.12, §6.4.14).
+    // =========================================================================
+
+    /// `intra_segment_id()` reads `segment_tree` when `update_map == 1`.
     #[test]
-    fn segmentation_enabled_is_rejected() {
+    fn intra_segment_id_reads_tree_when_update_map() {
         let mut header = minimal_header(8, 8);
-        header.segmentation_enabled = true;
+        header.segmentation.enabled = true;
+        header.segmentation.update_map = true;
+        header.segmentation.tree_probs = [128; 7];
+        let compressed = default_compressed_header();
+        let decoder = TileDecoder::new(&header, &compressed);
+
+        // segment_tree[14] = {2,4,6,8,10,12, 0,-1,-2,-3,-4,-5,-6,-7} (spec §9.3.1). Leaf
+        // value 5 is reached via node 0 (bit=1 -> index 4), node 2 (bit=0 -> index 10),
+        // node 5 (bit=1 -> index 11, leaf -(-5)=5): bit path [1,0,1].
+        let mut enc = BoolEncoder::new();
+        enc.write_bool(true, 128);
+        enc.write_bool(false, 128);
+        enc.write_bool(true, 128);
+        let buf = enc.finish();
+        let mut r = BoolDecoder::new(&buf).expect("valid bitstream");
+
+        assert_eq!(decoder.intra_segment_id(&mut r), 5);
+    }
+
+    /// `intra_segment_id()` returns 0 without reading any bits when segmentation is
+    /// disabled or `update_map == 0`.
+    #[test]
+    fn intra_segment_id_is_zero_without_update_map() {
+        let header = minimal_header(8, 8); // segmentation disabled.
+        let compressed = default_compressed_header();
+        let decoder = TileDecoder::new(&header, &compressed);
+
+        // An empty tile: if intra_segment_id tried to read a bit, this would panic/error.
+        let mut r = BoolDecoder::new(&[0x00]).expect("valid bitstream");
+        assert_eq!(decoder.intra_segment_id(&mut r), 0);
+    }
+
+    /// `get_segment_id()` (spec §6.4.14): the predicted id is the minimum over the
+    /// on-screen `PrevSegmentIds` region covered by the block, clipped at the frame edge.
+    #[test]
+    fn get_segment_id_takes_min_over_block_region() {
+        // 32x32 -> MiCols=MiRows=4. prev_segment_ids laid out row-major 4x4.
+        let header = minimal_header(32, 32);
+        let compressed = default_compressed_header();
+        #[rustfmt::skip]
+        let prev_segment_ids = vec![
+            3, 3, 3, 3,
+            3, 1, 2, 3,
+            3, 3, 3, 3,
+            3, 3, 3, 3,
+        ];
+        let decoder = TileDecoder::new_with_prev(
+            &header,
+            &compressed,
+            false,
+            None,
+            [None, None, None],
+            prev_segment_ids,
+        );
+        // BLOCK_32X32 at (0,0) covers the whole 4x4 region -> min is 1.
+        assert_eq!(
+            decoder.get_segment_id(0, 0, crate::prob_tables::BLOCK_32X32),
+            1
+        );
+        // BLOCK_8X8 at (1,1) covers only PrevSegmentIds[1][1] = 1.
+        assert_eq!(decoder.get_segment_id(1, 1, BLOCK_8X8), 1);
+        // BLOCK_8X8 at (0,0) covers only PrevSegmentIds[0][0] = 3.
+        assert_eq!(decoder.get_segment_id(0, 0, BLOCK_8X8), 3);
+    }
+
+    /// `inter_segment_id()` (spec §6.4.12): when `seg_id_predicted == 1`, `segment_id` is
+    /// taken from `get_segment_id()` (the previous frame's map) without reading `segment_id`.
+    #[test]
+    fn inter_segment_id_temporal_prediction_uses_prev_map() {
+        let mut header = minimal_inter_header(8, 8);
+        header.segmentation.enabled = true;
+        header.segmentation.update_map = true;
+        header.segmentation.temporal_update = true;
+        header.segmentation.pred_prob = [64; 3];
+        let compressed = default_compressed_header();
+        let prev_segment_ids = vec![6u8]; // MiCols=MiRows=1 at 8x8.
+        let mut decoder = TileDecoder::new_with_prev(
+            &header,
+            &compressed,
+            false,
+            None,
+            [None, None, None],
+            prev_segment_ids,
+        );
+
+        // seg_id_predicted = 1: only 1 bit is read (no segment_id tree read).
+        let mut enc = BoolEncoder::new();
+        enc.write_bool(true, 64);
+        let buf = enc.finish();
+        let mut r = BoolDecoder::new(&buf).expect("valid bitstream");
+
+        assert_eq!(decoder.inter_segment_id(&mut r, 0, 0, BLOCK_8X8), 6);
+    }
+
+    /// `read_skip()` (spec §6.4.8): when `seg_feature_active( SEG_LVL_SKIP )`, `skip` is
+    /// forced to 1 without reading a bit or incrementing `counts.skip`.
+    #[test]
+    fn read_skip_seg_lvl_skip_forces_without_reading_bit() {
+        let mut header = minimal_header(8, 8);
+        header.segmentation.enabled = true;
+        header.segmentation.feature_enabled[2][SEG_LVL_SKIP] = true;
         let compressed = default_compressed_header();
         let mut decoder = TileDecoder::new(&header, &compressed);
 
-        // 中身がどうであれ intra_segment_id() の時点でエラーになる。
-        let buf = [0u8; 4];
-        let err = decoder.decode_tiles(&buf).unwrap_err();
-        assert_eq!(err, TileError::SegmentationNotSupported);
+        // Empty tile data: if read_skip tried to read a bit, BoolDecoder::new would still
+        // succeed on an all-zero buffer, but the returned value would come from the (absent)
+        // stream rather than being forced; counts.skip is the reliable signal here.
+        let mut r = BoolDecoder::new(&[0x00]).expect("valid bitstream");
+        let skip = decoder.read_skip(&mut r, 0, 0, false, false, 2);
+        assert!(skip);
+        assert_eq!(decoder.counts.skip, Counts::new().skip);
+    }
+
+    /// `read_is_inter()` (spec §6.4.13): when `seg_feature_active( SEG_LVL_REF_FRAME )`,
+    /// `is_inter` is derived from `FeatureData` without reading a bit or counting.
+    #[test]
+    fn read_is_inter_seg_lvl_ref_frame_forces_without_reading_bit() {
+        let mut header = minimal_inter_header(8, 8);
+        header.segmentation.enabled = true;
+        header.segmentation.feature_enabled[1][SEG_LVL_REF_FRAME] = true;
+        header.segmentation.feature_data[1][SEG_LVL_REF_FRAME] = LAST_FRAME as i32;
+        let compressed = default_compressed_header();
+        let mut decoder = TileDecoder::new(&header, &compressed);
+        let n = NeighborRefInfo {
+            avail_u: false,
+            avail_l: false,
+            left_ref_frame: [INTRA_FRAME, REF_NONE],
+            above_ref_frame: [INTRA_FRAME, REF_NONE],
+            left_intra: true,
+            above_intra: true,
+            left_single: true,
+            above_single: true,
+        };
+
+        let mut r = BoolDecoder::new(&[0x00]).expect("valid bitstream");
+        assert!(decoder.read_is_inter(&mut r, &n, 1));
+        assert_eq!(decoder.counts.is_inter, Counts::new().is_inter);
+    }
+
+    /// `read_ref_frames()` (spec §6.4.17): when `seg_feature_active( SEG_LVL_REF_FRAME )`,
+    /// `ref_frame` is `[FeatureData, NONE]` (no compound) without reading a bit or counting.
+    #[test]
+    fn read_ref_frames_seg_lvl_ref_frame_returns_feature_value() {
+        let mut header = minimal_inter_header(8, 8);
+        header.segmentation.enabled = true;
+        header.segmentation.feature_enabled[4][SEG_LVL_REF_FRAME] = true;
+        header.segmentation.feature_data[4][SEG_LVL_REF_FRAME] = GOLDEN_FRAME as i32;
+        let compressed = default_compressed_header();
+        let mut decoder = TileDecoder::new(&header, &compressed);
+        let n = NeighborRefInfo {
+            avail_u: false,
+            avail_l: false,
+            left_ref_frame: [INTRA_FRAME, REF_NONE],
+            above_ref_frame: [INTRA_FRAME, REF_NONE],
+            left_intra: true,
+            above_intra: true,
+            left_single: true,
+            above_single: true,
+        };
+
+        let mut r = BoolDecoder::new(&[0x00]).expect("valid bitstream");
+        assert_eq!(
+            decoder.read_ref_frames(&mut r, &n, 4),
+            [GOLDEN_FRAME, REF_NONE]
+        );
+        assert_eq!(decoder.counts.comp_mode, Counts::new().comp_mode);
+        assert_eq!(decoder.counts.single_ref, Counts::new().single_ref);
     }
 
     #[test]
     fn invalid_tile_size_is_rejected() {
         let header = minimal_header(64, 64);
-        // 64x64 -> MiCols=8, Sb64Cols=1 なのでタイルは 1 つのままだが、
-        // tile_cols_log2 を強制的に 1 にしてタイルサイズフィールドを要求させる。
+        // 64x64 -> MiCols=8, Sb64Cols=1, so there is still only 1 tile, but force
+        // tile_cols_log2 to 1 to require a tile size field.
         let mut header = header;
         header.tile_cols_log2 = 1;
         let compressed = default_compressed_header();
         let mut decoder = TileDecoder::new(&header, &compressed);
 
-        // 4 バイト未満なのでタイルサイズフィールドすら読めない。
+        // Less than 4 bytes, so not even the tile size field can be read.
         let buf = [0u8; 2];
         let err = decoder.decode_tiles(&buf).unwrap_err();
         assert_eq!(err, TileError::InvalidTileSize);
     }
 
     // =========================================================================
-    // MV 復号（仕様 6.4.19〜6.4.20 節）の単体テスト。
-    // `BoolEncoder`（test_support）で既知の MV をエンコードし、`TileDecoder::read_mv`/
-    // `read_mv_component`（非公開メソッド）で復号して往復一致を確認する。
+    // Unit tests for MV decoding (spec §6.4.19-6.4.20).
+    // Encode a known MV with `BoolEncoder` (test_support), decode it with
+    // `TileDecoder::read_mv`/`read_mv_component` (private methods), and check round-trip equality.
     // =========================================================================
 
     fn minimal_inter_header(width: u32, height: u32) -> NewFrameHeader {
@@ -2364,14 +2658,14 @@ mod tests {
         let mut decoder = TileDecoder::new(&header, &compressed);
         let probs = CompressedHeaderProbs::default();
 
-        // mv_sign=0(正), mv_class=MV_CLASS_0, class0_bit=1, class0_fr=2, (use_hp=false のため
-        // class0_hp は読まれず 1 とみなされる)。
+        // mv_sign=0(positive), mv_class=MV_CLASS_0, class0_bit=1, class0_fr=2, (since
+        // use_hp=false, class0_hp is not read and is taken as 1).
         // mag = ((1<<3)|(2<<1)|1) + 1 = 13 + 1 = 14
         let mut enc = BoolEncoder::new();
         enc.write_bool(false, probs.mv_sign_prob[0]);
         enc.write_bool(false, probs.mv_class_probs[0][0]); // MV_CLASS_0 (tree leaf)
         enc.write_bool(true, probs.mv_class0_bit_prob[0]); // class0_bit = 1
-                                                           // class0_fr = 2: MV_FR_TREE のビット列 [1,1,0]
+                                                           // class0_fr = 2: bit sequence [1,1,0] of MV_FR_TREE
         enc.write_bool(true, probs.mv_class0_fr_probs[0][1][0]);
         enc.write_bool(true, probs.mv_class0_fr_probs[0][1][1]);
         enc.write_bool(false, probs.mv_class0_fr_probs[0][1][2]);
@@ -2390,15 +2684,15 @@ mod tests {
         let probs = CompressedHeaderProbs::default();
 
         let mut enc = BoolEncoder::new();
-        enc.write_bool(true, probs.mv_sign_prob[1]); // sign = 負
+        enc.write_bool(true, probs.mv_sign_prob[1]); // sign = negative
         enc.write_bool(false, probs.mv_class_probs[1][0]); // MV_CLASS_0
         enc.write_bool(false, probs.mv_class0_bit_prob[1]); // class0_bit = 0
-                                                            // class0_fr = 0: ビット列 [0]
+                                                            // class0_fr = 0: bit sequence [0]
         enc.write_bool(false, probs.mv_class0_fr_probs[1][0][0]);
         let buf = enc.finish();
 
         let mut r = BoolDecoder::new(&buf).expect("valid bitstream");
-        // mag = ((0<<3)|(0<<1)|1) + 1 = 2、符号が負なので -2。
+        // mag = ((0<<3)|(0<<1)|1) + 1 = 2, and since the sign is negative, -2.
         let mag = decoder.read_mv_component(&mut r, 1, false);
         assert_eq!(mag, -2);
     }
@@ -2410,20 +2704,20 @@ mod tests {
         let mut decoder = TileDecoder::new(&header, &compressed);
         let probs = CompressedHeaderProbs::default();
 
-        // mv_class = MV_CLASS_1 (値 1): ツリー [0,2,-1,4,...] で bit0=1,bit1=0 -> leaf -1 (値1)。
+        // mv_class = MV_CLASS_1 (value 1): in the tree [0,2,-1,4,...], bit0=1,bit1=0 -> leaf -1 (value 1).
         let mut enc = BoolEncoder::new();
-        enc.write_bool(false, probs.mv_sign_prob[0]); // 正
+        enc.write_bool(false, probs.mv_sign_prob[0]); // positive
         enc.write_bool(true, probs.mv_class_probs[0][0]);
         enc.write_bool(false, probs.mv_class_probs[0][1]);
-        // mv_class=1 -> d のビットを 1 個読む (mv_bit)。d=1 とする。
+        // mv_class=1 -> read 1 bit of d (mv_bit). Let d=1.
         enc.write_bool(true, probs.mv_bits_prob[0][0]);
-        // mv_fr = 1: ビット列 [1,0]
+        // mv_fr = 1: bit sequence [1,0]
         enc.write_bool(true, probs.mv_fr_probs[0][0]);
         enc.write_bool(false, probs.mv_fr_probs[0][1]);
         let buf = enc.finish();
 
         let mut r = BoolDecoder::new(&buf).expect("valid bitstream");
-        // mag = CLASS0_SIZE << (1+2) = 2<<3 = 16; d=1 (bit0=1), fr=1, hp(強制1)
+        // mag = CLASS0_SIZE << (1+2) = 2<<3 = 16; d=1 (bit0=1), fr=1, hp(forced 1)
         // mag += ((1<<3)|(1<<1)|1) + 1 = (8|2|1)+1 = 11+1 = 12 -> total 16+12 = 28
         let mag = decoder.read_mv_component(&mut r, 0, false);
         assert_eq!(mag, 28);
@@ -2431,7 +2725,7 @@ mod tests {
 
     #[test]
     fn read_mv_full_roundtrip_with_best_mv_offset() {
-        // read_mv(ref) = BestMv + diffMv。mv_joint = MV_JOINT_HNZVNZ (両成分とも非ゼロ)。
+        // read_mv(ref) = BestMv + diffMv. mv_joint = MV_JOINT_HNZVNZ (both components nonzero).
         let header = minimal_inter_header(64, 64);
         let compressed = default_compressed_header();
         let mut decoder = TileDecoder::new(&header, &compressed);
@@ -2439,18 +2733,18 @@ mod tests {
         let best_mv: Mv = [10, -20];
 
         let mut enc = BoolEncoder::new();
-        // mv_joint tree: MV_JOINT_HNZVNZ(=3) のビット列 [1,1,1]
+        // mv_joint tree: bit sequence [1,1,1] for MV_JOINT_HNZVNZ(=3)
         enc.write_bool(true, probs.mv_joint_probs[0]);
         enc.write_bool(true, probs.mv_joint_probs[1]);
         enc.write_bool(true, probs.mv_joint_probs[2]);
-        // comp 0 (row): mag=14 (前テストと同じ class0 パターン、符号正)
+        // comp 0 (row): mag=14 (same class0 pattern as the earlier test, positive sign)
         enc.write_bool(false, probs.mv_sign_prob[0]);
         enc.write_bool(false, probs.mv_class_probs[0][0]);
         enc.write_bool(true, probs.mv_class0_bit_prob[0]);
         enc.write_bool(true, probs.mv_class0_fr_probs[0][1][0]);
         enc.write_bool(true, probs.mv_class0_fr_probs[0][1][1]);
         enc.write_bool(false, probs.mv_class0_fr_probs[0][1][2]);
-        // comp 1 (col): mag=2、符号負 -> -2
+        // comp 1 (col): mag=2, negative sign -> -2
         enc.write_bool(true, probs.mv_sign_prob[1]);
         enc.write_bool(false, probs.mv_class_probs[1][0]);
         enc.write_bool(false, probs.mv_class0_bit_prob[1]);
@@ -2458,7 +2752,7 @@ mod tests {
         let buf = enc.finish();
 
         let mut r = BoolDecoder::new(&buf).expect("valid bitstream");
-        // allow_high_precision_mv=false なので use_hp は常に false（use_mv_hp の結果に関わらず）。
+        // allow_high_precision_mv=false, so use_hp is always false (regardless of use_mv_hp's result).
         let mv = decoder.read_mv(&mut r, best_mv);
         assert_eq!(mv, [10 + 14, -20 + (-2)]);
     }

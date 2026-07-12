@@ -1,7 +1,8 @@
-//! 圧縮ヘッダ（`compressed_header`）のパース（仕様 6.3 節）。
+//! Parsing of the compressed header (`compressed_header`) (spec §6.3).
 //!
-//! `compressed_header()` は `header_size_in_bytes` バイト分の bool 符号化されたデータで、
-//! 変換モード (`tx_mode`) と各種確率テーブルの更新内容を保持する。
+//! `compressed_header()` is `header_size_in_bytes` bytes of bool-coded data
+//! holding the transform mode (`tx_mode`) and the update contents of the
+//! various probability tables.
 //!
 //! ```text
 //! compressed_header( ) {
@@ -24,8 +25,8 @@
 //! }
 //! ```
 //!
-//! `FrameIsIntra == 0` の場合にのみ呼ばれるインター関連の読み取り（`read_inter_mode_probs`
-//! 以降、仕様 6.3.9〜6.3.18 節）は M3 で実装した。
+//! The inter-related reads called only when `FrameIsIntra == 0`
+//! (`read_inter_mode_probs` onward, spec §6.3.9-6.3.18) were implemented in M3.
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
 use crate::prob_tables::{
@@ -40,69 +41,70 @@ use crate::prob_tables::{
     TX_MODE_SELECT, TX_MODE_TO_BIGGEST_TX_SIZE,
 };
 
-/// `compressed_header` パース時に発生し得るエラー。
+/// Errors that can occur while parsing `compressed_header`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressedHeaderError {
-    /// bool デコーダの初期化に失敗した（`header_size_in_bytes` が 0 など）。
+    /// Bool decoder initialization failed (e.g. `header_size_in_bytes` is 0).
     BoolCoder(BoolCoderError),
 }
 
-/// `compressed_header()` で更新される確率テーブル一式。
+/// The full set of probability tables updated by `compressed_header()`.
 ///
-/// 仕様の `load_probs`/`save_probs`（仕様 7.1.2 節）が操作する「すべての確率テーブル」に
-/// 相当し、そのままフレームコンテキスト（[`FrameContext`]、4 スロット）として保存・復元される。
+/// Corresponds to "all probability tables" operated on by the spec's
+/// `load_probs`/`save_probs` (spec §7.1.2), and is saved/restored as-is as the
+/// frame context ([`FrameContext`], 4 slots).
 ///
-/// `uv_mode_probs` には `compressed_header()` の forward update シンタックスは存在しない
-/// （`read_y_mode_probs()` は `y_mode_probs` のみを更新する）が、仕様 8.4.4 節
-/// `adapt_noncoef_probs()` の backward adaptation 対象には含まれる
-/// （`adapt_probs( intra_mode_tree, uv_mode_probs[ i ], counts_uv_mode[ i ] )`）ため、
-/// `load_probs`/`save_probs` が操作するテーブルの一つとしてここに保持する。
+/// `uv_mode_probs` has no forward update syntax in `compressed_header()`
+/// (`read_y_mode_probs()` only updates `y_mode_probs`), but it is a target of
+/// backward adaptation in spec §8.4.4 `adapt_noncoef_probs()`
+/// (`adapt_probs( intra_mode_tree, uv_mode_probs[ i ], counts_uv_mode[ i ] )`),
+/// so it is kept here as one of the tables operated on by `load_probs`/`save_probs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressedHeaderProbs {
-    /// `uv_mode_probs[y_mode][node]`。forward update シンタックスは無いが backward
-    /// adaptation の対象（上記ドキュメント参照）。
+    /// `uv_mode_probs[y_mode][node]`. Has no forward update syntax but is a
+    /// target of backward adaptation (see doc comment above).
     pub uv_mode_probs: [[u8; 9]; 10],
-    /// `tx_probs[maxTxSize][ctx][node]`。[`crate::prob_tables::DEFAULT_TX_PROBS`] と同じレイアウト。
+    /// `tx_probs[maxTxSize][ctx][node]`. Same layout as [`crate::prob_tables::DEFAULT_TX_PROBS`].
     pub tx_probs: [[[u8; 3]; 2]; 4],
-    /// `coef_probs[txSz][plane>0][is_inter][band][ctx][node]`。
+    /// `coef_probs[txSz][plane>0][is_inter][band][ctx][node]`.
     pub coef_probs: CoefProbs,
-    /// `skip_prob[ctx]`（仕様 6.3.8 節）。
+    /// `skip_prob[ctx]` (spec §6.3.8).
     pub skip_prob: [u8; 3],
-    /// `inter_mode_probs[ctx][node]`（仕様 6.3.9 節）。`FrameIsIntra == 0` でのみ更新される。
+    /// `inter_mode_probs[ctx][node]` (spec §6.3.9). Updated only when `FrameIsIntra == 0`.
     pub inter_mode_probs: [[u8; 3]; 7],
-    /// `interp_filter_probs[ctx][node]`（仕様 6.3.10 節）。
+    /// `interp_filter_probs[ctx][node]` (spec §6.3.10).
     pub interp_filter_probs: [[u8; 2]; 4],
-    /// `is_inter_prob[ctx]`（仕様 6.3.11 節）。
+    /// `is_inter_prob[ctx]` (spec §6.3.11).
     pub is_inter_prob: [u8; 4],
-    /// `comp_mode_prob[ctx]`（仕様 6.3.13 節）。
+    /// `comp_mode_prob[ctx]` (spec §6.3.13).
     pub comp_mode_prob: [u8; 5],
-    /// `single_ref_prob[ctx][0..2]`（仕様 6.3.13 節）。
+    /// `single_ref_prob[ctx][0..2]` (spec §6.3.13).
     pub single_ref_prob: [[u8; 2]; 5],
-    /// `comp_ref_prob[ctx]`（仕様 6.3.13 節）。
+    /// `comp_ref_prob[ctx]` (spec §6.3.13).
     pub comp_ref_prob: [u8; 5],
-    /// `y_mode_probs[ctx][node]`（仕様 6.3.14 節）。非キーフレーム専用
-    /// （キーフレームは常に固定表 [`crate::prob_tables::KF_Y_MODE_PROBS`] を使う）。
+    /// `y_mode_probs[ctx][node]` (spec §6.3.14). Non-key-frame only (key
+    /// frames always use the fixed table [`crate::prob_tables::KF_Y_MODE_PROBS`]).
     pub y_mode_probs: [[u8; 9]; 4],
-    /// `partition_probs[ctx][node]`（仕様 6.3.15 節）。非キーフレーム専用
-    /// （キーフレームは常に固定表 [`crate::prob_tables::KF_PARTITION_PROBS`] を使う）。
+    /// `partition_probs[ctx][node]` (spec §6.3.15). Non-key-frame only (key
+    /// frames always use the fixed table [`crate::prob_tables::KF_PARTITION_PROBS`]).
     pub partition_probs: [[u8; 3]; 16],
-    /// `mv_joint_probs[node]`（仕様 6.3.16 節）。
+    /// `mv_joint_probs[node]` (spec §6.3.16).
     pub mv_joint_probs: [u8; 3],
-    /// `mv_sign_prob[comp]`。
+    /// `mv_sign_prob[comp]`.
     pub mv_sign_prob: [u8; 2],
-    /// `mv_class_probs[comp][node]`。
+    /// `mv_class_probs[comp][node]`.
     pub mv_class_probs: [[u8; 10]; 2],
-    /// `mv_class0_bit_prob[comp]`。
+    /// `mv_class0_bit_prob[comp]`.
     pub mv_class0_bit_prob: [u8; 2],
-    /// `mv_bits_prob[comp][i]`。
+    /// `mv_bits_prob[comp][i]`.
     pub mv_bits_prob: [[u8; 10]; 2],
-    /// `mv_class0_fr_probs[comp][class0bit][node]`。
+    /// `mv_class0_fr_probs[comp][class0bit][node]`.
     pub mv_class0_fr_probs: [[[u8; 3]; 2]; 2],
-    /// `mv_fr_probs[comp][node]`。
+    /// `mv_fr_probs[comp][node]`.
     pub mv_fr_probs: [[u8; 3]; 2],
-    /// `mv_class0_hp_prob[comp]`。
+    /// `mv_class0_hp_prob[comp]`.
     pub mv_class0_hp_prob: [u8; 2],
-    /// `mv_hp_prob[comp]`。
+    /// `mv_hp_prob[comp]`.
     pub mv_hp_prob: [u8; 2],
 }
 
@@ -134,33 +136,35 @@ impl Default for CompressedHeaderProbs {
     }
 }
 
-/// フレームコンテキスト（仕様 7.1.2 節の `load_probs`/`save_probs` が操作する単位）。
-/// `CompressedHeaderProbs` そのものが「保存・復元されるすべての確率テーブル」に相当する。
+/// Frame context (the unit operated on by `load_probs`/`save_probs` in spec §7.1.2).
+/// `CompressedHeaderProbs` itself corresponds to "all probability tables that are saved and restored".
 pub type FrameContext = CompressedHeaderProbs;
 
-/// `frame_context_idx`（0..=3）でアドレスされる 4 スロットのフレームコンテキスト保存領域。
+/// The 4-slot frame context storage area, addressed by `frame_context_idx` (0..=3).
 ///
-/// 仕様 7.2 節 `setup_past_independence()` はキーフレーム・イントラオンリーフレーム・
-/// エラーレジリエントフレームで全確率テーブルをデフォルト値にリセットしたうえで
-/// （`frame_type == KEY_FRAME` 等の条件下では）4 スロットすべてに `save_probs(i)` する。
-/// 非キーフレームでは `frame_context_idx` が指すスロットから `load_probs`
-/// （このデコーダでは `parse_compressed_header_ex` の `starting_probs` 引数）し、
-/// `refresh_frame_context == 1` であれば結果を同じスロットへ `save_probs` で書き戻す。
+/// Spec §7.2's `setup_past_independence()` resets all probability tables to
+/// their default values for key frames, intra-only frames, and error-resilient
+/// frames, and then (under conditions such as `frame_type == KEY_FRAME`) calls
+/// `save_probs(i)` for all 4 slots. For non-key frames, `load_probs` is
+/// performed from the slot pointed to by `frame_context_idx` (the
+/// `starting_probs` argument of `parse_compressed_header_ex` in this decoder),
+/// and if `refresh_frame_context == 1`, the result is written back to the same
+/// slot via `save_probs`.
 ///
-/// **既知の制約（M3 前半）**: 仕様 8.4 節の確率適応（`adapt_coef_probs`/`adapt_noncoef_probs`、
-/// 出現頻度に基づく backward adaptation）は未実装。本実装は `save_probs` 時に
-/// `compressed_header()` の forward update（`diff_update_prob`）適用後の値をそのまま保存する。
-/// これは `frame_parallel_decoding_mode == 1`（adaptation が無効）のフレームでは仕様どおり
-/// 正確だが、`frame_parallel_decoding_mode == 0` のフレームでは仕様上必要な backward
-/// adaptation の分だけ次フレーム以降の確率値がずれる可能性がある（M3 後半で対応）。
+/// Backward probability adaptation from spec §8.4
+/// (`adapt_coef_probs`/`adapt_noncoef_probs`, based on observed frequencies)
+/// is implemented in `counts.rs` and driven by `Decoder` (see
+/// `refresh_probs` in `lib.rs`), which adapts the probabilities after tile
+/// decode and writes them back via `save_probs` when
+/// `refresh_frame_context == 1`.
 #[derive(Debug, Clone)]
 pub struct FrameContextStore {
     contexts: [FrameContext; 4],
 }
 
 impl FrameContextStore {
-    /// 4 スロットすべてをデフォルト値で初期化する
-    /// （`setup_past_independence()` 直後に `save_probs(i)` for i in 0..4 したのと等価）。
+    /// Initializes all 4 slots with default values (equivalent to calling
+    /// `save_probs(i)` for i in 0..4 right after `setup_past_independence()`).
     pub fn new() -> Self {
         Self {
             contexts: std::array::from_fn(|_| FrameContext::default()),
@@ -175,8 +179,8 @@ impl FrameContextStore {
         self.contexts[idx as usize] = ctx;
     }
 
-    /// `setup_past_independence()` の全スロットリセット（キーフレーム・エラーレジリエント
-    /// フレームなどで発生する）。
+    /// The all-slots reset performed by `setup_past_independence()` (occurs
+    /// for key frames, error-resilient frames, etc.).
     pub fn reset_all(&mut self) {
         self.contexts = std::array::from_fn(|_| FrameContext::default());
     }
@@ -188,23 +192,23 @@ impl Default for FrameContextStore {
     }
 }
 
-/// `compressed_header()` のパース結果。
+/// Result of parsing `compressed_header()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressedHeader {
-    /// `tx_mode`（仕様 7.3.1 節）。
+    /// `tx_mode` (spec §7.3.1).
     pub tx_mode: u8,
-    /// 更新後の確率テーブル一式。
+    /// The full set of updated probability tables.
     pub probs: CompressedHeaderProbs,
-    /// `reference_mode`（仕様 7.3.6 節）。`FrameIsIntra == 1` の場合は常に `SINGLE_REFERENCE`。
+    /// `reference_mode` (spec §7.3.6). Always `SINGLE_REFERENCE` when `FrameIsIntra == 1`.
     pub reference_mode: u8,
-    /// `CompFixedRef`（仕様 6.3.18 節）。`reference_mode == SINGLE_REFERENCE` の場合は未使用（0）。
+    /// `CompFixedRef` (spec §6.3.18). Unused (0) when `reference_mode == SINGLE_REFERENCE`.
     pub comp_fixed_ref: u8,
-    /// `CompVarRef[ 0..2 ]`（仕様 6.3.18 節）。`reference_mode == SINGLE_REFERENCE` の場合は
-    /// 未使用（`[0, 0]`）。
+    /// `CompVarRef[ 0..2 ]` (spec §6.3.18). Unused (`[0, 0]`) when
+    /// `reference_mode == SINGLE_REFERENCE`.
     pub comp_var_ref: [u8; 2],
 }
 
-/// `read_prob()` に相当する `B(252)` の bool 読み取り + 更新判定（仕様 6.3.3 節 `diff_update_prob`）。
+/// A `B(252)` bool read plus update decision, equivalent to `read_prob()` (spec §6.3.3 `diff_update_prob`).
 ///
 /// ```text
 /// diff_update_prob( prob ) {
@@ -226,7 +230,7 @@ fn diff_update_prob(r: &mut BoolDecoder, prob: u8) -> u8 {
     }
 }
 
-/// `decode_term_subexp()`（仕様 6.3.4 節）。すべてのフィールドは `L(n)`（`read_literal`）で読む。
+/// `decode_term_subexp()` (spec §6.3.4). All fields are read via `L(n)` (`read_literal`).
 fn decode_term_subexp(r: &mut BoolDecoder) -> u32 {
     if r.read_literal(1) == 0 {
         return r.read_literal(4);
@@ -245,10 +249,10 @@ fn decode_term_subexp(r: &mut BoolDecoder) -> u32 {
     (v << 1) - 1 + bit
 }
 
-/// `inv_remap_prob( deltaProb, prob )`（仕様 6.3.5 節）。
+/// `inv_remap_prob( deltaProb, prob )` (spec §6.3.5).
 fn inv_remap_prob(delta_prob: u32, prob: u8) -> u8 {
     let v = INV_MAP_TABLE[delta_prob as usize] as u32;
-    // m--（prob から 1 引いた値）を以降で使う。
+    // m-- (prob minus 1) is used from here on.
     let m = prob as i32 - 1;
     let result = if (m << 1) <= 255 {
         1 + inv_recenter_nonneg(v, m as u32) as i32
@@ -258,7 +262,7 @@ fn inv_remap_prob(delta_prob: u32, prob: u8) -> u8 {
     result as u8
 }
 
-/// `inv_recenter_nonneg( v, m )`（仕様 6.3.6 節）。
+/// `inv_recenter_nonneg( v, m )` (spec §6.3.6).
 fn inv_recenter_nonneg(v: u32, m: u32) -> u32 {
     if v > 2 * m {
         return v;
@@ -270,14 +274,14 @@ fn inv_recenter_nonneg(v: u32, m: u32) -> u32 {
     }
 }
 
-/// `read_tx_mode()`（仕様 6.3.1 節）。
+/// `read_tx_mode()` (spec §6.3.1).
 fn read_tx_mode(r: &mut BoolDecoder, lossless: bool) -> u8 {
     if lossless {
-        TX_4X4 // ONLY_4X4 と同じ値 (0)
+        TX_4X4 // Same value as ONLY_4X4 (0)
     } else {
         let mut tx_mode = r.read_literal(2) as u8;
         if tx_mode == TX_32X32 {
-            // ALLOW_32X32 (=3) と TX_32X32 (=3) は値が一致するため同じ定数を使い回している。
+            // ALLOW_32X32 (=3) and TX_32X32 (=3) share the same value, so the same constant is reused.
             let tx_mode_select = r.read_literal(1) as u8;
             tx_mode += tx_mode_select;
         }
@@ -285,7 +289,7 @@ fn read_tx_mode(r: &mut BoolDecoder, lossless: bool) -> u8 {
     }
 }
 
-/// `tx_mode_probs()`（仕様 6.3.2 節）。`tx_mode == TX_MODE_SELECT` の場合のみ呼ばれる。
+/// `tx_mode_probs()` (spec §6.3.2). Called only when `tx_mode == TX_MODE_SELECT`.
 fn read_tx_mode_probs(r: &mut BoolDecoder, tx_probs: &mut [[[u8; 3]; 2]; 4]) {
     // tx_probs_8x8[ TX_SIZE_CONTEXTS ][ TX_SIZES - 3 = 1 ]
     for ctx in tx_probs[TX_8X8 as usize].iter_mut() {
@@ -307,7 +311,7 @@ fn read_tx_mode_probs(r: &mut BoolDecoder, tx_probs: &mut [[[u8; 3]; 2]; 4]) {
     }
 }
 
-/// `read_coef_probs()`（仕様 6.3.7 節）。
+/// `read_coef_probs()` (spec §6.3.7).
 fn read_coef_probs(r: &mut BoolDecoder, tx_mode: u8, coef_probs: &mut CoefProbs) {
     let max_tx_size = TX_MODE_TO_BIGGEST_TX_SIZE[tx_mode as usize];
     for tx_sz in 0..=max_tx_size {
@@ -330,14 +334,14 @@ fn read_coef_probs(r: &mut BoolDecoder, tx_mode: u8, coef_probs: &mut CoefProbs)
     }
 }
 
-/// `read_skip_prob()`（仕様 6.3.8 節）。
+/// `read_skip_prob()` (spec §6.3.8).
 fn read_skip_prob(r: &mut BoolDecoder, skip_prob: &mut [u8; 3]) {
     for prob in skip_prob.iter_mut() {
         *prob = diff_update_prob(r, *prob);
     }
 }
 
-/// `read_inter_mode_probs()`（仕様 6.3.9 節）。
+/// `read_inter_mode_probs()` (spec §6.3.9).
 fn read_inter_mode_probs(r: &mut BoolDecoder, probs: &mut [[u8; 3]; 7]) {
     for ctx in probs.iter_mut() {
         for node in ctx.iter_mut() {
@@ -346,7 +350,7 @@ fn read_inter_mode_probs(r: &mut BoolDecoder, probs: &mut [[u8; 3]; 7]) {
     }
 }
 
-/// `read_interp_filter_probs()`（仕様 6.3.10 節）。
+/// `read_interp_filter_probs()` (spec §6.3.10).
 fn read_interp_filter_probs(r: &mut BoolDecoder, probs: &mut [[u8; 2]; 4]) {
     for ctx in probs.iter_mut() {
         for node in ctx.iter_mut() {
@@ -355,14 +359,14 @@ fn read_interp_filter_probs(r: &mut BoolDecoder, probs: &mut [[u8; 2]; 4]) {
     }
 }
 
-/// `read_is_inter_probs()`（仕様 6.3.11 節）。
+/// `read_is_inter_probs()` (spec §6.3.11).
 fn read_is_inter_probs(r: &mut BoolDecoder, probs: &mut [u8; 4]) {
     for prob in probs.iter_mut() {
         *prob = diff_update_prob(r, *prob);
     }
 }
 
-/// `setup_compound_reference_mode()`（仕様 6.3.18 節）。戻り値は `(CompFixedRef, CompVarRef)`。
+/// `setup_compound_reference_mode()` (spec §6.3.18). Returns `(CompFixedRef, CompVarRef)`.
 fn setup_compound_reference_mode(ref_frame_sign_bias: &[bool; 4]) -> (u8, [u8; 2]) {
     if ref_frame_sign_bias[LAST_FRAME as usize] == ref_frame_sign_bias[GOLDEN_FRAME as usize] {
         (ALTREF_FRAME, [LAST_FRAME, GOLDEN_FRAME])
@@ -374,8 +378,8 @@ fn setup_compound_reference_mode(ref_frame_sign_bias: &[bool; 4]) -> (u8, [u8; 2
     }
 }
 
-/// `frame_reference_mode()`（仕様 6.3.12 節）。戻り値は
-/// `(reference_mode, CompFixedRef, CompVarRef)`。
+/// `frame_reference_mode()` (spec §6.3.12). Returns
+/// `(reference_mode, CompFixedRef, CompVarRef)`.
 fn frame_reference_mode(r: &mut BoolDecoder, ref_frame_sign_bias: &[bool; 4]) -> (u8, u8, [u8; 2]) {
     let compound_reference_allowed = ref_frame_sign_bias[GOLDEN_FRAME as usize]
         != ref_frame_sign_bias[LAST_FRAME as usize]
@@ -406,7 +410,7 @@ fn frame_reference_mode(r: &mut BoolDecoder, ref_frame_sign_bias: &[bool; 4]) ->
     (reference_mode, comp_fixed_ref, comp_var_ref)
 }
 
-/// `frame_reference_mode_probs()`（仕様 6.3.13 節）。
+/// `frame_reference_mode_probs()` (spec §6.3.13).
 fn frame_reference_mode_probs(
     r: &mut BoolDecoder,
     reference_mode: u8,
@@ -430,7 +434,7 @@ fn frame_reference_mode_probs(
     }
 }
 
-/// `read_y_mode_probs()`（仕様 6.3.14 節）。非キーフレーム専用の `y_mode_probs` を更新する。
+/// `read_y_mode_probs()` (spec §6.3.14). Updates the non-key-frame-only `y_mode_probs`.
 fn read_y_mode_probs(r: &mut BoolDecoder, probs: &mut [[u8; 9]; 4]) {
     for ctx in probs.iter_mut() {
         for node in ctx.iter_mut() {
@@ -439,7 +443,7 @@ fn read_y_mode_probs(r: &mut BoolDecoder, probs: &mut [[u8; 9]; 4]) {
     }
 }
 
-/// `read_partition_probs()`（仕様 6.3.15 節）。非キーフレーム専用の `partition_probs` を更新する。
+/// `read_partition_probs()` (spec §6.3.15). Updates the non-key-frame-only `partition_probs`.
 fn read_partition_probs(r: &mut BoolDecoder, probs: &mut [[u8; 3]; 16]) {
     for ctx in probs.iter_mut() {
         for node in ctx.iter_mut() {
@@ -448,9 +452,9 @@ fn read_partition_probs(r: &mut BoolDecoder, probs: &mut [[u8; 3]; 16]) {
     }
 }
 
-/// `update_mv_prob( prob )`（仕様 6.3.17 節）。`diff_update_prob` とは異なり、`B(252)` で
-/// 更新有無を読んだ後は `decode_term_subexp`/`inv_remap_prob` ではなく `L(7)` を直接
-/// 使う点に注意。
+/// `update_mv_prob( prob )` (spec §6.3.17). Note that, unlike `diff_update_prob`,
+/// after reading whether to update via `B(252)`, this reads `L(7)` directly
+/// rather than using `decode_term_subexp`/`inv_remap_prob`.
 fn update_mv_prob(r: &mut BoolDecoder, prob: u8) -> u8 {
     if r.read_bool(252) {
         let mv_prob = r.read_literal(7) as u8;
@@ -460,7 +464,7 @@ fn update_mv_prob(r: &mut BoolDecoder, prob: u8) -> u8 {
     }
 }
 
-/// `mv_probs()`（仕様 6.3.16 節）。
+/// `mv_probs()` (spec §6.3.16).
 fn mv_probs(r: &mut BoolDecoder, allow_high_precision_mv: bool, probs: &mut CompressedHeaderProbs) {
     for prob in probs.mv_joint_probs.iter_mut() {
         *prob = update_mv_prob(r, *prob);
@@ -494,11 +498,12 @@ fn mv_probs(r: &mut BoolDecoder, allow_high_precision_mv: bool, probs: &mut Comp
     }
 }
 
-/// `compressed_header()`（仕様 6.3 節）をパースする（キーフレーム専用の簡易ラッパー）。
+/// Parses `compressed_header()` (spec §6.3) (a simplified key-frame-only wrapper).
 ///
-/// `data` は `header_size_in_bytes` バイト分のスライス。`lossless` は非圧縮ヘッダの
-/// `quantization_params()` から得られる `Lossless` フラグ。`FrameIsIntra == 1` として
-/// [`parse_compressed_header_ex`] を呼び出す（開始確率は常にデフォルト値）。
+/// `data` is the `header_size_in_bytes`-byte slice. `lossless` is the
+/// `Lossless` flag obtained from the uncompressed header's
+/// `quantization_params()`. Calls [`parse_compressed_header_ex`] with
+/// `FrameIsIntra == 1` (starting probabilities are always the default values).
 pub fn parse_compressed_header(
     data: &[u8],
     lossless: bool,
@@ -514,16 +519,16 @@ pub fn parse_compressed_header(
     )
 }
 
-/// `compressed_header()`（仕様 6.3 節）をパースする（インターフレーム対応の完全版）。
+/// Parses `compressed_header()` (spec §6.3) (the full version, supporting inter frames).
 ///
-/// - `frame_is_intra`: `FrameIsIntra`。真の場合、インター関連のシンタックス
-///   （仕様 6.3.9〜6.3.18 節）は一切読まれない。
-/// - `interpolation_filter`: 非圧縮ヘッダの `interpolation_filter`
-///   （`FrameIsIntra == 1` の場合は無視される）。
-/// - `ref_frame_sign_bias`: 非圧縮ヘッダの `ref_frame_sign_bias`（添字は `ref_frame` の値）。
-/// - `allow_high_precision_mv`: 非圧縮ヘッダの同名フィールド。
-/// - `starting_probs`: `load_probs( frame_context_idx )` に相当する開始時点の確率テーブル
-///   （[`FrameContextStore::load`] で取得する）。
+/// - `frame_is_intra`: `FrameIsIntra`. When true, none of the inter-related
+///   syntax (spec §6.3.9-6.3.18) is read at all.
+/// - `interpolation_filter`: the uncompressed header's `interpolation_filter`
+///   (ignored when `FrameIsIntra == 1`).
+/// - `ref_frame_sign_bias`: the uncompressed header's `ref_frame_sign_bias` (indexed by `ref_frame` value).
+/// - `allow_high_precision_mv`: the uncompressed header's field of the same name.
+/// - `starting_probs`: the starting probability table equivalent to
+///   `load_probs( frame_context_idx )` (obtained via [`FrameContextStore::load`]).
 #[allow(clippy::too_many_arguments)]
 pub fn parse_compressed_header_ex(
     data: &[u8],
@@ -583,9 +588,10 @@ mod tests {
 
     #[test]
     fn lossless_frame_forces_only_4x4_and_reads_no_extra_bit() {
-        // lossless == true の場合 tx_mode は常に ONLY_4X4 で、ビットストリームからは
-        // 何も読まない（read_tx_mode の if 分岐が丸ごとスキップされる）ため、
-        // 直後の read_coef_probs (txSz は TX_4X4 のみ) と read_skip_prob だけをエンコードする。
+        // When lossless == true, tx_mode is always ONLY_4X4 and nothing is
+        // read from the bitstream (read_tx_mode's if branch is skipped
+        // entirely), so only the subsequent read_coef_probs (txSz is TX_4X4
+        // only) and read_skip_prob are encoded.
         let mut enc = BoolEncoder::new();
         enc.write_literal(0, 1); // read_coef_probs: txSz=TX_4X4, update_probs=0
         enc.write_bool(false, 252); // read_skip_prob[0]: update_prob=0
@@ -600,8 +606,8 @@ mod tests {
 
     #[test]
     fn non_lossless_reads_two_bit_tx_mode_without_select() {
-        // tx_mode = ALLOW_16X16 (=2) を読み、ALLOW_32X32 でないため追加ビットは読まない。
-        // maxTxSize = TX_16X16 なので read_coef_probs は TX_4X4, TX_8X8, TX_16X16 の 3 回。
+        // Reads tx_mode = ALLOW_16X16 (=2); since it's not ALLOW_32X32, no extra bit is read.
+        // maxTxSize = TX_16X16, so read_coef_probs runs 3 times for TX_4X4, TX_8X8, TX_16X16.
         let mut enc = BoolEncoder::new();
         enc.write_literal(2, 2); // tx_mode = ALLOW_16X16
         enc.write_literal(0, 1); // txSz=TX_4X4 update_probs=0
@@ -623,11 +629,11 @@ mod tests {
         let mut enc = BoolEncoder::new();
         enc.write_literal(3, 2); // tx_mode raw = ALLOW_32X32
         enc.write_literal(1, 1); // tx_mode_select = 1 -> tx_mode = TX_MODE_SELECT
-                                 // tx_mode_probs(): 8x8(2*1) + 16x16(2*2) + 32x32(2*3) = 12 回の diff_update_prob
+                                 // tx_mode_probs(): 8x8(2*1) + 16x16(2*2) + 32x32(2*3) = 12 calls to diff_update_prob
         for _ in 0..12 {
             enc.write_bool(false, 252);
         }
-        // read_coef_probs: maxTxSize = TX_32X32 なので txSz = 0..=3 の 4 回
+        // read_coef_probs: maxTxSize = TX_32X32, so txSz = 0..=3, 4 iterations
         for _ in 0..4 {
             enc.write_literal(0, 1);
         }
@@ -643,8 +649,8 @@ mod tests {
 
     #[test]
     fn diff_update_prob_actually_changes_skip_prob() {
-        // skip_prob[0] を更新する: update_prob=1, decode_term_subexp() の最初の分岐
-        // (bit=0 -> sub_exp_val (L(4))) で deltaProb=5 を得て、inv_remap_prob(5, 192) を適用する。
+        // Updates skip_prob[0]: update_prob=1, decode_term_subexp()'s first
+        // branch (bit=0 -> sub_exp_val (L(4))) yields deltaProb=5, and inv_remap_prob(5, 192) is applied.
         let mut enc = BoolEncoder::new();
         enc.write_literal(0, 1); // read_coef_probs: txSz=TX_4X4, update_probs=0
         enc.write_bool(true, 252); // skip_prob[0]: update_prob=1
@@ -664,11 +670,11 @@ mod tests {
 
     #[test]
     fn inv_recenter_nonneg_matches_spec_cases() {
-        // v > 2m -> v をそのまま返す
+        // v > 2m -> returns v as-is
         assert_eq!(inv_recenter_nonneg(10, 3), 10);
-        // v が奇数 -> m - (v+1)/2
+        // v is odd -> m - (v+1)/2
         assert_eq!(inv_recenter_nonneg(3, 5), 5 - 2);
-        // v が偶数 -> m + v/2
+        // v is even -> m + v/2
         assert_eq!(inv_recenter_nonneg(4, 5), 5 + 2);
     }
 

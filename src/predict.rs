@@ -1,15 +1,20 @@
-//! イントラ予測処理（仕様 8.5.1 節 "Intra prediction process"）。
+//! Intra prediction process (spec §8.5.1 "Intra prediction process").
 //!
-//! VP9 のイントラ予測は 10 モード（`DC_PRED`〜`TM_PRED`）を持つ。VP8 以前や AV1 と異なり
-//! smooth 系フィルタは存在しないため、ここではその 10 モードのみを実装する。
+//! VP9 intra prediction has 10 modes (`DC_PRED` through `TM_PRED`). Unlike
+//! VP8 and earlier, or AV1, there are no smooth-style filters, so only these
+//! 10 modes are implemented here.
 //!
-//! 呼び出し側（[`crate::tile::TileDecoder`]）は変換ブロック単位で以下を渡す:
-//! - `plane` の該当領域を含む [`crate::framebuffer::Plane`]（予測結果はここに書き込む）
-//! - 予測対象ブロックの左上座標 `(x, y)`
-//! - `have_left`/`have_above`/`not_on_right`（フレーム端・ブロック端の可用性）
-//! - `tx_size`（`TX_4X4`=0 〜 `TX_32X32`=3）
-//! - イントラ予測モード（`DC_PRED`〜`TM_PRED`）
-//! - クリップ境界 `max_x`/`max_y`（= 仕様の `maxX`/`maxY`、プレーンごとに異なる）
+//! The caller ([`crate::tile::TileDecoder`]) passes the following per
+//! transform block:
+//! - The [`crate::framebuffer::Plane`] containing the relevant region of
+//!   `plane` (the prediction result is written here)
+//! - The top-left coordinates `(x, y)` of the block to predict
+//! - `have_left`/`have_above`/`not_on_right` (availability at frame/block
+//!   edges)
+//! - `tx_size` (`TX_4X4`=0 through `TX_32X32`=3)
+//! - The intra prediction mode (`DC_PRED` through `TM_PRED`)
+//! - The clip bounds `max_x`/`max_y` (= the spec's `maxX`/`maxY`, which
+//!   differ per plane)
 
 use crate::framebuffer::Plane;
 use crate::mv::Mv;
@@ -36,10 +41,11 @@ fn clip3(low: i32, high: i32, v: i32) -> i32 {
     v.clamp(low, high)
 }
 
-/// 仕様 8.5.1 節の `predict_intra` プロセス。
+/// Spec §8.5.1's `predict_intra` process.
 ///
-/// `x`/`y` は `plane` 内の絶対ピクセル座標、`max_x`/`max_y` は仕様の `maxX`/`maxY`
-/// （= プレーン内で参照してよい最大座標）。
+/// `x`/`y` are absolute pixel coordinates within `plane`; `max_x`/`max_y` are
+/// the spec's `maxX`/`maxY` (= the maximum coordinates that may be
+/// referenced within the plane).
 #[allow(clippy::too_many_arguments)]
 pub fn predict_intra(
     plane: &mut Plane,
@@ -58,7 +64,7 @@ pub fn predict_intra(
     let size = 1usize << log2_size;
     let base = 1i32 << (bit_depth - 1);
 
-    // aboveRow は仕様の添字 -1..=2*size-1 を、+1 オフセットして 0..=2*size の配列で持つ。
+    // above_row holds the spec's indices -1..=2*size-1, offset by +1 into a 0..=2*size array.
     let mut above_row = vec![0i32; 2 * size + 1];
     for i in 0..size {
         above_row[i + 1] = if have_above {
@@ -84,7 +90,7 @@ pub fn predict_intra(
     } else {
         base - 1
     };
-    // above_row[i+1] は仕様の aboveRow[i] に対応する。aboveRow[-1] は above_row[0]。
+    // above_row[i+1] corresponds to the spec's aboveRow[i]; aboveRow[-1] is above_row[0].
     let above = |i: i32| -> i32 { above_row[(i + 1) as usize] };
 
     let mut left_col = vec![0i32; size];
@@ -258,7 +264,7 @@ pub fn predict_intra(
             };
             pred.fill(value);
         }
-        _ => unreachable!("predict_intra: 未知のイントラ予測モード {mode}"),
+        _ => unreachable!("predict_intra: unknown intra prediction mode {mode}"),
     }
 
     for i in 0..size {
@@ -268,11 +274,13 @@ pub fn predict_intra(
     }
 }
 
-/// 参照フレーム 1 プレーン分のビュー（仕様の `FrameStore[ refIdx ][ plane ]` +
-/// `RefFrameWidth`/`RefFrameHeight` 相当）。`width`/`height` は輝度（プレーン 0）基準の
-/// フレーム全体サイズ（仕様 8.5.2.3 節のスケーリング計算で使う `RefFrameWidth[refIdx]` そのもの。
-/// クロマプレーンでも輝度サイズを渡すこと）。`plane` は該当プレーンぶんクロップ済みの参照
-/// ピクセルデータ（`Plane::width`/`height` がそのまま仕様の `lastX+1`/`lastY+1` になる）。
+/// A view over one plane of a reference frame (equivalent to the spec's
+/// `FrameStore[ refIdx ][ plane ]` + `RefFrameWidth`/`RefFrameHeight`).
+/// `width`/`height` are the overall frame size based on luma (plane 0) — this
+/// is exactly the `RefFrameWidth[refIdx]` used in the scaling computation of
+/// spec §8.5.2.3 (pass the luma size even for chroma planes). `plane` is the
+/// reference pixel data already cropped to the relevant plane (`Plane::width`/
+/// `height` are directly the spec's `lastX+1`/`lastY+1`).
 pub struct RefPlaneView<'a> {
     pub plane: &'a Plane,
     pub width: u32,
@@ -297,13 +305,13 @@ fn round_mv_comp_q4(value: i32) -> i32 {
     }
 }
 
-/// `clip1(x)` = `Clip3( 0, (1<<BitDepth)-1, x )`（仕様 4 節）。
+/// `clip1(x)` = `Clip3( 0, (1<<BitDepth)-1, x )` (spec §4).
 #[inline]
 fn clip1(x: i32, bit_depth: u8) -> i32 {
     clip3(0, (1i32 << bit_depth) - 1, x)
 }
 
-/// 動きベクトル選択処理（仕様 8.5.2.1 節 "Motion vector selection process"）。
+/// Motion vector selection process (spec §8.5.2.1 "Motion vector selection process").
 fn select_mv(
     plane: usize,
     ref_list: usize,
@@ -334,7 +342,7 @@ fn select_mv(
     }
 }
 
-/// 動きベクトルクランプ処理（仕様 8.5.2.2 節 "Motion vector clamping process"）。
+/// Motion vector clamping process (spec §8.5.2.2 "Motion vector clamping process").
 #[allow(clippy::too_many_arguments)]
 fn clamp_mv_for_plane(
     plane: usize,
@@ -383,8 +391,8 @@ fn clamp_mv_for_plane(
     ]
 }
 
-/// 動きベクトルスケーリング処理（仕様 8.5.2.3 節 "Motion vector scaling process"）。
-/// 戻り値は `(startX, startY, stepX, stepY)`（1/16 ペル単位）。
+/// Motion vector scaling process (spec §8.5.2.3 "Motion vector scaling process").
+/// Returns `(startX, startY, stepX, stepY)` (in 1/16 pel units).
 #[allow(clippy::too_many_arguments)]
 fn scale_mv_for_plane(
     plane: usize,
@@ -423,8 +431,8 @@ fn scale_mv_for_plane(
     (start_x, start_y, step_x, step_y)
 }
 
-/// ブロック単位のインター予測処理（仕様 8.5.2.4 節 "Block inter prediction process"）。
-/// 戻り値は `pred[r][c]`（`r`=0..h-1, `c`=0..w-1）の行優先 `Vec<i32>`。
+/// Per-block inter prediction process (spec §8.5.2.4 "Block inter prediction process").
+/// Returns `pred[r][c]` (`r`=0..h-1, `c`=0..w-1) as a row-major `Vec<i32>`.
 #[allow(clippy::too_many_arguments)]
 fn block_inter_predict(
     ref_plane: &Plane,
@@ -473,11 +481,13 @@ fn block_inter_predict(
     pred
 }
 
-/// `predict_inter()`（仕様 8.5.2 節 "Inter prediction process"）。
+/// `predict_inter()` (spec §8.5.2 "Inter prediction process").
 ///
-/// `dst` の `(x, y)` を左上とする `w x h` の領域に、動き補償・サブピクセル補間済みの
-/// インター予測サンプルを書き込む。`block_idx` は仕様の `blockIdx`（4x4 単位で、この
-/// ブロックまでにどれだけ予測済みかを表す。`MiSize < BLOCK_8X8` のときのみ意味を持つ）。
+/// Writes motion-compensated, sub-pixel-interpolated inter prediction
+/// samples into the `w x h` region of `dst` with top-left corner `(x, y)`.
+/// `block_idx` is the spec's `blockIdx` (in 4x4 units, representing how much
+/// of this block has been predicted so far; only meaningful when
+/// `MiSize < BLOCK_8X8`).
 #[allow(clippy::too_many_arguments)]
 pub fn predict_inter(
     dst: &mut Plane,
@@ -528,7 +538,7 @@ pub fn predict_inter(
             subsampling_x,
             subsampling_y,
         );
-        let view = refs[ref_list].expect("参照フレームスロットが存在しない（DPB 未初期化）");
+        let view = refs[ref_list].expect("reference frame slot is missing (DPB not initialized)");
         let (start_x, start_y, step_x, step_y) = scale_mv_for_plane(
             plane,
             x,
@@ -626,7 +636,7 @@ mod tests {
         }
         plane.set(3, 3, 0);
         predict_intra(&mut plane, 4, 4, true, true, false, TX4, TM_PRED, 7, 7, 8);
-        // 255 + 255 - 0 は 255 にクリップされる。
+        // 255 + 255 - 0 is clipped to 255.
         assert_eq!(plane.get(4, 4), 255);
     }
 }
