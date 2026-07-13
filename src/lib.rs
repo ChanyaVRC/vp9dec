@@ -28,6 +28,7 @@ pub mod predict;
 pub mod prob_tables;
 pub mod quant;
 pub mod scan;
+pub mod superframe;
 pub mod tile;
 pub mod transform;
 
@@ -141,6 +142,26 @@ fn build_ref_frame_data(
     }
 }
 
+/// Read-only per-frame decode statistics, recorded purely for observation (e.g. test
+/// assertions that a stream actually exercised a given decode path). Has no effect on
+/// decode behavior. See [`Decoder::last_frame_info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameDecodeInfo {
+    /// `intra_only` (spec §6.2). `false` for key frames.
+    pub intra_only: bool,
+    /// `FrameIsIntra` (spec §6.2). `true` for key frames and intra-only frames.
+    pub frame_is_intra: bool,
+    /// `reset_frame_context` (spec §7.2). Always 0 for key frames and when
+    /// `error_resilient_mode == 1`.
+    pub reset_frame_context: u8,
+    /// `segmentation_enabled` (spec §6.2.11).
+    pub segmentation_enabled: bool,
+    /// Indexed by `header::SEG_LVL_*`. `seg_features_active[level]` is `true` if
+    /// `segmentation_enabled` and `FeatureEnabled[segment][level]` is set for any of
+    /// the `MAX_SEGMENTS` segments in this frame.
+    pub seg_features_active: [bool; header::SEG_LVL_MAX],
+}
+
 fn ref_frame_data_to_frame(data: &RefFrameData) -> Frame {
     Frame {
         width: data.width,
@@ -243,6 +264,10 @@ pub struct Decoder {
     prev_segment_ids: Vec<u8>,
     /// `LastFrameType` (spec §7.2). Not updated on `show_existing_frame` frames.
     last_frame_type: Option<FrameType>,
+    /// Observation-only stats from the most recently decoded frame (see
+    /// [`FrameDecodeInfo`]). Not updated on `show_existing_frame` frames (there is no
+    /// new uncompressed header to read the values from).
+    last_frame_info: Option<FrameDecodeInfo>,
 }
 
 impl Default for Decoder {
@@ -272,7 +297,16 @@ impl Decoder {
             ),
             prev_segment_ids: Vec::new(),
             last_frame_type: None,
+            last_frame_info: None,
         }
+    }
+
+    /// Observation-only stats from the most recently decoded frame, for tests to
+    /// confirm a stream actually exercised a given decode path. `None` before the
+    /// first call to [`Decoder::decode_frame`] (and unchanged by
+    /// `show_existing_frame` frames, which parse no new uncompressed header).
+    pub fn last_frame_info(&self) -> Option<FrameDecodeInfo> {
+        self.last_frame_info
     }
 
     /// Resets `PrevSegmentIds` to all-zero when the spec requires it, before tile decode
@@ -293,15 +327,41 @@ impl Decoder {
         }
     }
 
-    /// Decodes one frame's worth of VP9 bitstream. Callers must pass frames extracted
-    /// from an IVF or similar container in bitstream order (decode order), not display order.
+    /// Decodes one container chunk (one IVF frame, one WebM block, etc.). Callers must pass
+    /// chunks extracted from an IVF or similar container in bitstream order (decode order),
+    /// not display order.
     ///
-    /// The return value indicates whether a displayable frame was produced: `Some(Frame)`
-    /// if `show_existing_frame == 1` or `show_frame == 1`, otherwise (a hidden frame with
+    /// A chunk may pack more than one VP9 frame via the "superframe" mechanism -- see
+    /// [`superframe`] -- so this splits it with [`superframe::split_superframe`] and decodes
+    /// each contained VP9 frame in turn through [`Decoder::decode_one_frame`].
+    /// `show_existing_frame` chunks (which never carry a superframe index) pass through as
+    /// their own single frame.
+    ///
+    /// The return value indicates whether the chunk produced a displayable frame: `Some(Frame)`
+    /// if one of its constituent frames has `show_existing_frame == 1` or `show_frame == 1`
+    /// (a VP9 superframe has at most one such frame), otherwise (every constituent frame is
+    /// hidden, i.e. a droppable/altref frame) `None`. Internal state (reference frame buffers,
+    /// frame context, previous frame's MVs, etc.) is updated correctly in either case, and
+    /// [`Decoder::last_frame_info`] reflects the last constituent frame decoded.
+    pub fn decode_frame(&mut self, chunk: &[u8]) -> Result<Option<Frame>, DecodeError> {
+        let mut displayed = None;
+        for frame_data in superframe::split_superframe(chunk) {
+            if let Some(frame) = self.decode_one_frame(frame_data)? {
+                displayed = Some(frame);
+            }
+        }
+        Ok(displayed)
+    }
+
+    /// Decodes exactly one VP9 frame (not a container chunk -- see [`Decoder::decode_frame`],
+    /// the public entry point, which splits a chunk into these via [`superframe::split_superframe`]).
+    ///
+    /// The return value indicates whether this frame is displayable: `Some(Frame)` if
+    /// `show_existing_frame == 1` or `show_frame == 1`, otherwise (a hidden frame with
     /// `show_frame == 0`, i.e. a droppable/altref frame) `None`. Internal state
     /// (reference frame buffers, frame context, previous frame's MVs, etc.) is updated
     /// correctly in either case.
-    pub fn decode_frame(&mut self, frame_data: &[u8]) -> Result<Option<Frame>, DecodeError> {
+    fn decode_one_frame(&mut self, frame_data: &[u8]) -> Result<Option<Frame>, DecodeError> {
         let (parsed, consumed) = parse_uncompressed_header(
             frame_data,
             &self.ref_frame_sizes,
@@ -503,6 +563,16 @@ impl Decoder {
             header.segmentation.abs_or_delta_update,
         );
         self.last_frame_type = Some(header.frame_type);
+        self.last_frame_info = Some(FrameDecodeInfo {
+            intra_only: header.intra_only,
+            frame_is_intra: header.frame_is_intra,
+            reset_frame_context: header.reset_frame_context,
+            segmentation_enabled: header.segmentation.enabled,
+            seg_features_active: std::array::from_fn(|level| {
+                header.segmentation.enabled
+                    && header.segmentation.feature_enabled.iter().any(|seg| seg[level])
+            }),
+        });
 
         if header.show_frame {
             Ok(Some(crop_to_frame(
@@ -702,5 +772,55 @@ mod tests {
         for i in 0..4 {
             assert_eq!(store.load(i), FrameContext::default());
         }
+    }
+
+    /// `Decoder::last_frame_info()` (Part C observation surface): `None` before the
+    /// first decode, then reflects the uncompressed header of the frame just decoded.
+    /// Decodes the first (key) frame of an existing conformance vector rather than
+    /// building a synthetic header, so this also exercises the real parse path.
+    #[test]
+    fn last_frame_info_reflects_a_decoded_keyframe() {
+        let ivf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("vectors")
+            .join("vp90-2-12-droppable_1.ivf");
+        let ivf_bytes = match std::fs::read(&ivf_path) {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!(
+                    "[skip] test vector not found, skipping: {}",
+                    ivf_path.display()
+                );
+                return;
+            }
+        };
+
+        let mut reader = ivf::IvfReader::new(&ivf_bytes).expect("failed to parse IVF header");
+        let first_frame = reader
+            .next()
+            .expect("IVF file contains no frames")
+            .expect("failed to read first IVF frame");
+
+        let mut decoder = Decoder::new();
+        assert_eq!(
+            decoder.last_frame_info(),
+            None,
+            "last_frame_info() must be None before any frame is decoded"
+        );
+
+        decoder
+            .decode_frame(first_frame.data)
+            .expect("decode_frame failed on first frame");
+
+        let info = decoder
+            .last_frame_info()
+            .expect("last_frame_info() must be Some after decoding a frame");
+        // The first frame of any IVF stream is a key frame (spec §7.2 conformance requirement).
+        assert!(info.frame_is_intra, "key frames have FrameIsIntra == true");
+        assert!(!info.intra_only, "intra_only is only read for non-key frames");
+        assert_eq!(
+            info.reset_frame_context, 0,
+            "reset_frame_context is only read for non-key, non-error-resilient frames"
+        );
     }
 }

@@ -956,22 +956,19 @@ impl TileDecoder {
                 self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][band][ctx];
 
             if check_eob {
+                // The more_coefs (EOB) count feeds the EOB-node adaptation (spec §8.4.3, the
+                // `eob_branch` count in libvpx `decode_coefs`). It is incremented ONLY at
+                // positions where the EOB flag is actually read (checkEob == 1) — i.e. the
+                // first coefficient and every position after a non-zero token. Positions after
+                // a zero token (checkEob == 0) skip the EOB read entirely and must NOT be
+                // counted here (libvpx increments `eob_branch_count` only in the outer loop,
+                // never in its inner zero-run loop).
                 let more_coefs = r.read_bool(probs[0]);
                 self.counts.more_coefs[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
                     [more_coefs as usize] += 1;
                 if !more_coefs {
                     break;
                 }
-            } else {
-                // The "special case" at the end of spec §9.3.4 (the body text is missing from
-                // the PDF, but this is the one consistent interpretation derivable from the
-                // general rule in §9.3, "a type T syntax element always has its counting
-                // process invoked even when no bit is read" — the same pattern as
-                // partition's hasRows/hasCols==false case): even where more_coefs is not
-                // actually read because checkEob==0, count it as if the value were 1 (using
-                // the same ctx as token). Verified empirically via full-frame MD5 conformance.
-                self.counts.more_coefs[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
-                    [1] += 1;
             }
 
             let token = r.read_tree(&crate::prob_tables::TOKEN_TREE, |node| {

@@ -98,10 +98,15 @@ related to inter prediction is never read per spec, so it's unimplemented).
 
 - Only 8-bit (`BitDepth == 8`) is supported. Since `Plane` is fixed at `u8`, 10-bit/12-bit
   frames cause `decode_keyframe` to return `DecodeError::UnsupportedBitDepth`.
-- Segmentation is fully supported (segment-id decoding including temporal prediction, and
-  the SEG_LVL_ALT_Q / SEG_LVL_ALT_L / SEG_LVL_REF_FRAME / SEG_LVL_SKIP features). It is
-  unit-tested only: no official IVF-form segmentation conformance vector exists upstream
-  (the `vp90-2-15-segkey*` vectors are `.webm`-only); see `docs/implementation-notes.md`.
+- Segmentation (segment-id decoding including temporal prediction, and the
+  SEG_LVL_ALT_Q / SEG_LVL_ALT_L / SEG_LVL_REF_FRAME / SEG_LVL_SKIP features) and
+  `intra_only` frames are fully supported and now conformance-tested end-to-end against
+  official vectors remuxed from `.webm` (see "Verification with real data" below):
+  segment-id decode and `SEG_LVL_ALT_Q` via `vp90-2-15-segkey`/`vp90-2-15-segkey_adpq`
+  (150 frames), and `intra_only` frames plus `reset_frame_context` values 0 and 2 via
+  `vp90-2-16-intra-only`. `SEG_LVL_ALT_L` / `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` remain
+  unit-test-only: no official (or readily-encodable) IVF vector exercises them; see
+  `docs/implementation-notes.md`.
 - The judgment call regarding the known erratum in how spec section 9.3.2 describes the
   probability selection process for `partition` is unchanged from M1. See the comment on
   `read_partition` in `src/tile.rs` for details.
@@ -386,6 +391,25 @@ curl -o tests/vectors/vp90-2-09-subpixel-00.ivf.md5 \
 
 (On PowerShell, use `Invoke-WebRequest -Uri <URL> -OutFile <path>` instead.)
 
+Three more official vectors (`vp90-2-15-segkey`, `vp90-2-15-segkey_adpq`,
+`vp90-2-16-intra-only`) exercise segmentation and `intra_only` frames end-to-end, but
+upstream ships them only in `.webm` container form (no `.ivf` variant). Download the
+`.webm` + `.webm.md5`, remux to `.ivf` with `examples/webm_to_ivf.rs` (a container
+change only, no re-encode -- see its module doc), then copy the `.webm.md5` alongside
+it as `.ivf.md5` (the MD5s are of the decoded pixel output, not the container, so they
+carry over unchanged):
+
+```sh
+for name in vp90-2-15-segkey vp90-2-15-segkey_adpq vp90-2-16-intra-only; do
+  curl -o tests/vectors/$name.webm \
+    https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/$name.webm
+  curl -o tests/vectors/$name.webm.md5 \
+    https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/$name.webm.md5
+  cargo run --example webm_to_ivf -- tests/vectors/$name.webm tests/vectors/$name.ivf
+  cp tests/vectors/$name.webm.md5 tests/vectors/$name.ivf.md5
+done
+```
+
 `.ivf.md5` is in `md5sum`-compatible format (`<32-char hex>␠␠<filename>`), recording one MD5
 per line for each output (displayed) frame (the Y->U->V concatenated I420 byte string).
 Hidden frames with `show_frame == 0` have no line. `*_first_keyframe_matches_official_md5`
@@ -426,6 +450,12 @@ footage). `vp90-2-09-subpixel-00` is a synthetic test vector that looks like pse
 noise on every frame by design, so it still looks like noise after motion compensation as
 well (correctness is separately confirmed via the MD5 match; see also the existing note in
 the "M2b" section).
+
+For pixel-level debugging beyond visual inspection of a PNG dump (e.g. diffing against a
+known-correct decode when an MD5 mismatches), ffmpeg's `libvpx-vp9` decoder can serve as an
+independent reference decoder to produce ground-truth raw YUV for a byte-level diff. This is
+a debugging aid only -- ffmpeg is not a project dependency, and nothing in `src/`/`examples/`
+links against it.
 
 ## License
 
