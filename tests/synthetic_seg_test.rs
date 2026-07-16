@@ -75,8 +75,12 @@ fn decode_single(decoder: &mut Decoder, chunk: &[u8], what: &str) -> DecodedFram
 /// tests) and the external-cross-decode dump harness, so both decode exactly the same bytes.
 fn build_skip_ref_frames() -> Vec<Vec<u8>> {
     let keyframe_compressed = build_keyframe_compressed_header();
-    let keyframe_header =
-        build_keyframe_header(0, &SegSpec::disabled(), header_size(&keyframe_compressed));
+    let keyframe_header = build_keyframe_header(
+        0,
+        false,
+        &SegSpec::disabled(),
+        header_size(&keyframe_compressed),
+    );
     let keyframe_tile = encode_keyframe_tile(
         [
             kb(None, V_PRED),
@@ -176,8 +180,12 @@ fn seg_lvl_ref_frame_selects_the_forced_reference_without_reading_bits() {
 /// dump harness, so both decode exactly the same bytes.
 fn build_steering_frames() -> Vec<Vec<u8>> {
     let keyframe_compressed = build_keyframe_compressed_header();
-    let keyframe_header =
-        build_keyframe_header(0, &SegSpec::disabled(), header_size(&keyframe_compressed));
+    let keyframe_header = build_keyframe_header(
+        0,
+        false,
+        &SegSpec::disabled(),
+        header_size(&keyframe_compressed),
+    );
     let keyframe_tile = encode_keyframe_tile(
         [
             kb(None, V_PRED),
@@ -316,7 +324,7 @@ fn build_alt_l_frames(alt_l_level: i32) -> Vec<Vec<u8>> {
     // Base level 30 (nonzero, as the task asks) only ever applies to segment 0's own edges
     // (none of which this test examines): segment 1's `abs_or_delta_update = true` override
     // replaces the base level outright wherever segment 1 is looked up.
-    let header = build_keyframe_header(30, &seg, header_size(&compressed));
+    let header = build_keyframe_header(30, false, &seg, header_size(&compressed));
     let tile = encode_keyframe_tile(
         [
             kb(Some(0), V_PRED),
@@ -415,6 +423,67 @@ fn seg_lvl_alt_l_loop_filter_level_change_is_observable() {
             filtered.y[10 * WIDTH as usize + x],
             129,
             "row10, alt_l=63: must stay untouched"
+        );
+    }
+}
+
+// ===========================================================================================
+// Test: frame-level loop_filter_level == 0 must skip the loop filter outright (spec §8.1 step
+// 2), even though loop_filter_delta_enabled can still make build_lvl_lookup's per-block level
+// (spec §8.8.1) nonzero via loop_filter_ref_deltas. See docs/implementation-notes.md's "M4 wave
+// 2" entry for the full root-cause writeup (this pins the fix for a real category-A sweep
+// failure, `vp90-2-00-quantizer-00..07`/`vp90-2-13-largescaling`).
+// ===========================================================================================
+
+/// Same V_PRED/H_PRED 127/129-edge key frame as `build_skip_ref_frames`'s keyframe (segmentation
+/// disabled), but with `loop_filter_delta_enabled = true` and `loop_filter_level = 0`. A key
+/// frame's `ref_deltas` are always the spec §7.2 default `[1, 0, -1, -1]`
+/// (`setup_past_independence`), so `loop_filter_ref_deltas[INTRA_FRAME] == 1` here.
+fn build_delta_enabled_zero_level_frame() -> Vec<u8> {
+    let compressed = build_keyframe_compressed_header();
+    let header = build_keyframe_header(0, true, &SegSpec::disabled(), header_size(&compressed));
+    let tile = encode_keyframe_tile(
+        [
+            kb(None, V_PRED),
+            kb(None, V_PRED),
+            kb(None, H_PRED),
+            kb(None, H_PRED),
+        ],
+        [128; 7],
+    );
+    assemble_frame(header, compressed, tile)
+}
+
+#[test]
+fn loop_filter_level_zero_skips_filtering_despite_nonzero_ref_delta() {
+    let mut decoder = Decoder::new();
+    let frame_bytes = build_delta_enabled_zero_level_frame();
+    let frame = decode_single(
+        &mut decoder,
+        &frame_bytes,
+        "delta-enabled, level-0 key frame",
+    )
+    .frame
+    .expect("key frame has show_frame = 1");
+
+    // Same edge and narrow_filter math as the ALT_L test above: with lvlSeg=0 and nShift=0,
+    // `build_lvl_lookup` computes intraLvl = 0 + (ref_deltas[INTRA_FRAME]=1 << 0) = 1, a
+    // nonzero per-block level. If `Decoder` still invoked the loop filter on that level (the
+    // bug this test pins), the identical hev_mask=false/filter=6/filter1=filter2=1 derivation
+    // from the ALT_L test would flatten rows 6-9 to 128 regardless of the level being only 1
+    // instead of 63 (the narrow filter's output magnitude doesn't scale with lvl once the
+    // filter_mask/flat_mask gates pass) -- so seeing 127/129 here can only mean the whole
+    // process was skipped per spec §8.1 step 2, not that it ran and produced a no-op delta.
+    for x in 0..WIDTH as usize {
+        assert_eq!(
+            frame.y[7 * WIDTH as usize + x],
+            127,
+            "row7: must stay unfiltered"
+        );
+        assert_eq!(
+            frame.y[8 * WIDTH as usize + x],
+            129,
+            "row8: must stay unfiltered"
         );
     }
 }

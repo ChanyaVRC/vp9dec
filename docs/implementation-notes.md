@@ -25,6 +25,10 @@ the same topic may describe a since-fixed bug; read forward from here, not top-t
 - **Design-debt redesign** (current architecture -- see README.md's "Current architecture"
   section for the end state): "Wave 1" through "Wave 6" below, in date order; "Design-debt
   redesign: closing summary" at the very end ties all six together.
+- **Official-vector sweep triage/fixes**: "M4 wave 1: full official-vector sweep
+  infrastructure + first honest triage" (2026-07-16, triage only, no fix); "M4 wave 2: loop
+  filter frame-level `loop_filter_level == 0` gate" (fixed 2026-07-16) -- the latter resolved
+  category A entirely plus 19 of the wave-1 triage's B/C/D/E vectors as a side effect.
 
 Append-only from here on: when a later fix or discovery corrects a claim an earlier entry
 made, add a new dated entry describing the correction and cross-link the entry it
@@ -1973,3 +1977,149 @@ a single transform/clamp site) → **B** (well-bounded to the tiny-size regime) 
   `scripts/fetch-vectors.ps1`, and the new `tests/sweep_test.rs`, plus this notes section.
   **Zero `src/` changes.** (`tests/vectors/*` and `target/` are gitignored, so the downloaded
   vectors and `target/sweep-report.txt` don't appear in the diff.)
+
+## M4 wave 2: loop filter frame-level `loop_filter_level == 0` gate (fixed 2026-07-16)
+
+### Scope
+
+Wave 1 above triaged category A (9 vectors: `vp90-2-00-quantizer-00`..`-07`,
+`vp90-2-13-largescaling`, all failing `md5-mismatch@frame 0`) as a hypothesized
+inverse-transform/dequant precision or clamping bug. That hypothesis turned out to be wrong;
+the actual defect is a single missing frame-level gate on the loop filter, unrelated to
+transform/dequant precision.
+
+### Repro and evidence chain
+
+`vp90-2-00-quantizer-00.ivf` frame 0 (a keyframe, `lossless == true`, `base_q_idx == 0`) was
+decoded with this crate and independently with ffmpeg 8.1.2's `libvpx-vp9` decoder
+(`-c:v libvpx-vp9 ... -f rawvideo -pix_fmt yuv420p`), then byte-diffed against the crate's own
+I420 output (throwaway probe, `examples/probe_quantizer.rs`, deleted before finishing; a
+Python diff script under the session scratchpad, not committed).
+
+- **Symptom, not the hypothesized one**: only 1.82% of bytes differed (2765 / 152064), every
+  diff magnitude was exactly ±1 or ±2, and the diffs were scattered across 898 of ~1584 8x8
+  blocks frame-wide -- the signature of a *rounding* discrepancy applied almost everywhere, not
+  a large-coefficient overflow (which would produce large, localized errors) or an arithmetic-
+  decoder desync (which would produce catastrophic, spatially-scrambled corruption from some
+  point onward, not one keyframe 98% byte-identical to ground truth).
+- **Ruled out by direct spec comparison** (fetched the actual VP9 Bitstream & Decoding Process
+  Specification v0.7 PDF and converted it to text via `pdftotext -layout`, since `WebFetch`
+  alone couldn't extract the embedded text): `src/transform.rs`'s `idct`/`iadst4/8/16`/`iwht4`
+  and `src/predict.rs`'s `predict_intra` were checked line-by-line against spec §8.7.1.1-8.7.2
+  and §8.5.1 respectively -- both match the spec text exactly, including the WHT's exact
+  shift-then-butterfly formula and every directional intra mode's `Round2` formula. §8.6.2
+  "Reconstruct process" was also checked: its only bit-width note ("It is a requirement of
+  bitstream conformance that the values written into the Dequant array ... are representable by
+  a signed integer with 8 + BitDepth bits") is explicitly a *bitstream conformance* requirement,
+  not a decoder-enforced clamp -- official vectors are conformant by construction, so a missing
+  clamp here cannot explain a conformance-vector failure. This eliminated the entire
+  transform/dequant/clamping hypothesis space the wave-1 triage proposed.
+- **Localization**: added temporary `VP9DEC_DEBUG_XY`-gated `eprintln!` instrumentation to
+  `TileDecoder::tokens_and_reconstruct` (`src/tile/residual.rs`, reverted before finishing) to
+  dump, per 4x4 block, the tokens/dequant/prediction values immediately before and after
+  `inverse_transform_block`. For the first differing pixel (Y-plane `(31, 0)`, ours=33,
+  ffmpeg=32), the dumped pre-loop-filter reconstruction (prediction + residual, computed by hand
+  from the dump) was exactly **32** -- matching ffmpeg, not this decoder's own final output. The
+  only code that runs between that point and the final pixel is the loop filter
+  (`TileDecoder::apply_loop_filter`, spec §8.8), so the loop filter itself was mutating a pixel
+  that both the spec's reconstruct process and ffmpeg agree should be left alone.
+- **Root cause**: `vp90-2-00-quantizer-00.ivf`'s frame 0 header has `loop_filter.level == 0`
+  *and* `loop_filter.delta_enabled == true` (confirmed by parsing the header directly in the
+  probe). Spec §8.8.1 "Loop filter frame init process" step 4 computes, when
+  `loop_filter_delta_enabled == 1`:
+  `intraLvl = lvlSeg + (loop_filter_ref_deltas[INTRA_FRAME] << nShift)`. On a key frame,
+  `setup_past_independence()` (spec §7.2) always resets `loop_filter_ref_deltas` to
+  `[1, 0, -1, -1]`, so even with `lvlSeg == loop_filter_level == 0` and `nShift == 0`,
+  `intraLvl == 1` -- a **nonzero** per-block filter level purely from the ref-frame delta,
+  despite the frame-level `loop_filter_level` being 0. `src/loop_filter.rs::build_lvl_lookup`
+  already implements this arithmetic exactly as spec'd (verified by hand: `lvl_seg=0`,
+  `n_shift=0`, `intra_lvl = 0 + 1*(1<<0) = 1`) -- that part was never wrong. The actual bug is
+  one level up: **spec §8.1 "General" step 2** states "If loop_filter_level is not equal to 0,
+  the loop filter process as specified in section 8.8 is invoked" -- the *entire* per-frame
+  process (including the §8.8.1 init that can raise `intraLvl` above 0 via ref/mode deltas) is
+  gated on the **frame-level** `loop_filter_level`, not on whatever nonzero value `lvlSeg`'s
+  delta arithmetic might separately produce. `Decoder::decode_one_frame` (`src/lib.rs`) called
+  `tile_decoder.apply_loop_filter(&header.loop_filter)` unconditionally, with no such gate, so
+  it ran the loop filter (with the spuriously nonzero `intraLvl == 1`) on every frame whose
+  header sets `loop_filter_level == 0`, narrow-filtering essentially every block edge in the
+  frame by a small amount -- exactly matching the observed ±1/±2, frame-wide, non-catastrophic
+  diff signature.
+- **Why this explains the whole of category A, not just the lossless case**: the wave-1 triage
+  noted "not purely a lossless bug (only `-00` is lossless, yet `-01..-07` fail)" as an open
+  puzzle. All 9 category-A vectors were confirmed (via the same header-dump probe) to share
+  `loop_filter.level == 0` and `delta_enabled == true` regardless of `lossless`/`base_q_idx` --
+  this is a single mechanism shared by the lossless and non-lossless-but-low-QP vectors alike,
+  because it has nothing to do with quantization; it is purely a property of what
+  `loop_filter_level` the encoder chose to signal (apparently 0, at every QP level the encoder
+  judged too clean to need deblocking). Vectors at `quantizer-08` and above evidently get a
+  nonzero `loop_filter_level` from the encoder, so the missing gate was never exercised there
+  (calling `apply_loop_filter` is harmless when `level != 0` was going to be used anyway).
+
+### Fix
+
+`src/lib.rs`, `Decoder::decode_one_frame`: guarded the existing
+`tile_decoder.apply_loop_filter(&header.loop_filter)` call with
+`if header.loop_filter.level != 0`, citing spec §8.1 step 2 in the comment. One conditional,
+8 lines including the comment, no other logic touched -- `src/loop_filter.rs` itself
+(`build_lvl_lookup`, the superblock filter, the sample-filtering math) was already spec-correct
+and needed no changes.
+
+### Verification
+
+- **All 9 category-A vectors**: re-decoded frame 0 of each via the throwaway probe and
+  byte-diffed against ffmpeg's `libvpx-vp9` decode -- all 9 are now **byte-identical** (0
+  diffs), including `vp90-2-13-largescaling` (19200x108, the largest of the 9).
+- **Full sweep** (`RUST_MIN_STACK=16777216 cargo test --release --test sweep_test
+  official_vector_sweep -- --ignored --nocapture`): **303 / 304 pass** (up from the wave-1
+  baseline of 275/304), zero decode-errors/panics/count-mismatches. Every vector from all of
+  wave 1's categories A/B/D/E now passes, plus 3 of category C's 4 (`18-resize`,
+  `14-resize-10frames-fp-tiles-1-2-4-8`, `14-...-8-4-2-1`) -- 28 of the 29 original failures
+  fixed by this one change. Cross-checked every one of the 29 originally-failing vector names
+  by name against the new report: none regressed, and the only vector still failing
+  (`vp90-2-22-svc_1280x720_3.ivf`, `md5-mismatch@frame 0`) was already failing in wave 1's
+  triage (category C, SVC-specific) -- out of this wave's scope per the task's "fix category A
+  only" instruction, left unfixed and unchased.
+- **New unit test**: `tests/synthetic_seg_test.rs::loop_filter_level_zero_skips_filtering_despite_nonzero_ref_delta`,
+  a synthetic keyframe (`loop_filter_level = 0`, `loop_filter_delta_enabled = true`,
+  segmentation disabled) reusing the same V_PRED/H_PRED 127/129-edge layout as the existing
+  `seg_lvl_alt_l_loop_filter_level_change_is_observable` test. Asserts the edge stays exactly
+  127/129 (unfiltered). Confirmed to actually pin the bug, not just vacuously pass: temporarily
+  reverted the `src/lib.rs` fix and re-ran this one test -- it failed with `128` where `127` was
+  expected, exactly the value the ALT_L test's own hand-derived narrow-filter math predicts for
+  `lvl == 1` (the filter's output at this edge doesn't scale with `lvl` once the mask/flat gates
+  pass, so the spuriously-computed `intraLvl == 1` produces the identical fully-flattened result
+  as the ALT_L test's `alt_l_level == 63` case) -- then re-applied the fix and confirmed it
+  passes again. `tests/common/encoder.rs::build_keyframe_header` gained a
+  `loop_filter_delta_enabled: bool` parameter (previously hardcoded to `false`) to make this
+  constructible; its 3 pre-existing call sites were updated to pass `false`, preserving their
+  exact prior behavior (confirmed: all pre-existing tests still pass unchanged).
+- `cargo test`: **148 passed, 0 failed** across the same 6 binaries (119 lib + 6 `api_test` +
+  12 `conformance_test` + 7 `synthetic_seg_test` [was 6] + 4 `decode_to_png`), no regressions.
+- `VP9DEC_FFMPEG="<path-to-ffmpeg>" cargo test
+  --test synthetic_seg_test synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`: 8/8
+  `[xdecode] ... OK` lines unchanged (the existing ALT_L synthetic scenarios use
+  `loop_filter_level == 30`, a nonzero baseline, so they never exercised this gate either way;
+  confirming they still cross-decode byte-identical against both ffmpeg decoders rules out any
+  regression in the ALT_L/nonzero-level loop filter path from this change).
+- `cargo clippy --all-targets`: same 3 pre-existing baseline warnings as wave 1
+  (`header.rs` large_enum_variant, `superframe.rs` identity_op, `lib.rs`
+  field_reassign_with_default), no new ones from the touched files.
+- `rustfmt --check` on the two leaf files this wave touched: `tests/common/encoder.rs` was
+  already clean; `tests/synthetic_seg_test.rs` had drift from the parameter-count-driven
+  line-wrapping at its 3 call sites plus the new test, so `rustfmt` was run on that one file
+  (not `src/lib.rs`, never rustfmt'd here or elsewhere in this repo).
+- `git diff --stat`: `src/lib.rs` (+8/-1, the fix), `tests/common/encoder.rs` (+5/-1, the new
+  parameter), `tests/synthetic_seg_test.rs` (+76/-3, the 3 call-site updates plus the new
+  scenario/test) -- no other files. The throwaway probe (`examples/probe_quantizer.rs`) was
+  deleted before finishing.
+
+### Deviations from the task's candidate list
+
+None of the task's four candidate mechanics (dequant clamping, transform intermediate
+rounding, the lossless WHT path, cat6 extra-bit reading) were the actual defect -- all four
+were checked directly against the fetched spec text and confirmed already correct. The real
+defect was outside the areas the task pointed at (loop filter frame-level gating, spec §8.1,
+not §8.6/§8.7), discovered only by tracing the first bad pixel back through the actual
+reconstruction pipeline stage by stage per the task's own prescribed method (which is exactly
+how it surfaced: the pre-loop-filter value matched ground truth, isolating the defect to the
+one remaining stage).

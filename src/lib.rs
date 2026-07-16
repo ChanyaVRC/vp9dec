@@ -445,7 +445,14 @@ impl Decoder {
             self.prev_segment_ids.clone(),
         );
         tile_decoder.decode_tiles(tile_data)?;
-        tile_decoder.apply_loop_filter(&header.loop_filter);
+        // Spec §8.1 step 2: "If loop_filter_level is not equal to 0, the loop filter
+        // process ... is invoked" -- the whole process (including §8.8.1's frame init,
+        // which can raise a per-block level above 0 via loop_filter_ref_deltas even when
+        // the frame-level loop_filter_level is 0) is gated on this frame-level value, not
+        // just the per-edge computed level.
+        if header.loop_filter.level != 0 {
+            tile_decoder.apply_loop_filter(&header.loop_filter);
+        }
 
         // spec §8.1 step 3: PrevSegmentIds is refreshed from this frame's SegmentIds only
         // when segmentation_enabled && segmentation_update_map (not gated by show_frame).

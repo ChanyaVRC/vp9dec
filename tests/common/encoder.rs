@@ -159,6 +159,7 @@ impl SegSpec {
 
 pub fn build_keyframe_header(
     loop_filter_level: u8,
+    loop_filter_delta_enabled: bool,
     segmentation: &SegSpec,
     header_size_in_bytes: u16,
 ) -> Vec<u8> {
@@ -183,7 +184,10 @@ pub fn build_keyframe_header(
     w.push_bits(0, 2); // frame_context_idx
     w.push_bits(loop_filter_level as u32, 6);
     w.push_bits(0, 3); // sharpness
-    w.push_flag(false); // loop_filter_delta_enabled
+    w.push_flag(loop_filter_delta_enabled);
+    if loop_filter_delta_enabled {
+        w.push_flag(false); // loop_filter_delta_update: deltas stay at their reset default
+    }
     w.push_bits(0, 8); // base_q_idx = 0 -> lossless
     w.push_flag(false); // delta_q_y_dc coded?
     w.push_flag(false); // delta_q_uv_dc coded?
