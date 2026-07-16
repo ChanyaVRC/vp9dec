@@ -25,10 +25,13 @@ the same topic may describe a since-fixed bug; read forward from here, not top-t
 - **Design-debt redesign** (current architecture -- see README.md's "Current architecture"
   section for the end state): "Wave 1" through "Wave 6" below, in date order; "Design-debt
   redesign: closing summary" at the very end ties all six together.
-- **Official-vector sweep triage/fixes**: "M4 wave 1: full official-vector sweep
-  infrastructure + first honest triage" (2026-07-16, triage only, no fix); "M4 wave 2: loop
-  filter frame-level `loop_filter_level == 0` gate" (fixed 2026-07-16) -- the latter resolved
-  category A entirely plus 19 of the wave-1 triage's B/C/D/E vectors as a side effect.
+- **Official-vector sweep (M4, complete -- 304/304)**: "M4 wave 1" (2026-07-16, sweep
+  infrastructure + triage, 275/304); "M4 wave 2: loop filter frame-level
+  `loop_filter_level == 0` gate" (fixed 2026-07-16, 303/304); "M4 wave 3:
+  last-shown-frame-only output per chunk" (fixed 2026-07-16, 304/304); "M4 final wave: large
+  movie clips + docs close-out" (2026-07-17, the 12 no-MD5 tos/sintel clips cross-checked
+  against ffmpeg, 268,832/268,832 frames byte-identical). "M4 milestone: closing summary"
+  (2026-07-17, at the very end) ties the four together.
 
 Append-only from here on: when a later fix or discovery corrects a claim an earlier entry
 made, add a new dated entry describing the correction and cross-link the entry it
@@ -2249,3 +2252,146 @@ already-correctly-decoded constituent frame of a chunk is reported as *the* disp
 a policy question spec §8.9 does not fully pin down for the multi-shown-per-superframe case
 (§5.26 explicitly allows it) but that this project's ffmpeg/libvpx conformance oracle resolves
 unambiguously in practice.
+
+## M4 final wave: large movie clips + docs close-out (2026-07-17)
+
+### Scope
+
+The last deferred piece of M4: the 12 `vp90-2-tos_*`/`vp90-2-sintel_*` full-length movie clips
+wave 1 excluded from the manifest (real-content 1x2/1x4 tile columns + frame-parallel mode at
+up to 1920x800), plus the README status update and this milestone close-out. **Zero `src/` or
+`tests/` changes** -- this wave touches only `scripts/vectors.txt`, `README.md`, and this file.
+
+### Manifest + fetch/remux stats
+
+- `scripts/vectors.txt`: +12 entries (330 -> 342), grouped at the end under a dated comment.
+  All 12 are `webm`-kind (upstream ships no `.ivf` for them).
+- One `fetch-vectors.sh` run: **12 downloads ok (~1.02 GB of `.webm`), 12 remuxes ok, 0 remux
+  failures** -- the pure-std WebM remuxer handled all 12 full-length movies (the largest,
+  `sintel_1920x818`, is 253 MB / 21312 frames) without a single rejection. `tests/vectors/` is
+  now ~3.5 GB.
+- **All 12 `.webm.md5` sidecars 404 upstream.** Confirmed two ways: direct
+  `curl -I` (HTTP 404 from the storage bucket) and libvpx's own `test/test-data.sha1`, which
+  lists only the `.webm` files for the tos/sintel family -- no `.md5` entries exist at all
+  (libvpx uses these clips for its decode-perf/external-frame-buffer tests, not md5
+  conformance). They are therefore no-MD5 skips exactly like the 7 `bbb` clips from wave 1:
+  fetched and remuxed, but invisible to the sweep. 19 no-MD5 clips total.
+- Fetch-script quirk noticed while reading the failure log (recorded, deliberately not fixed
+  in this docs-only wave): the `[FAIL] download failed (curl exit N)` message always prints
+  `N == 0`, because `rc=$?` is captured after the `if curl ...; then ... fi` statement -- when
+  the condition merely fails and no branch runs, `$?` is the `if` compound's own status
+  (0), not curl's exit code. Failure *detection* and the summary counts are unaffected
+  (the failing URL is still recorded); only the printed exit code is wrong.
+
+### Sweep after the additions: 304/304 (set unchanged, by construction)
+
+`RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_sweep --
+--ignored --nocapture`: **total 304 / pass 304 / fail 0** (186.06s), zero md5-mismatch /
+count-mismatch / decode-error / panic. Since none of the 12 new clips produced an `.ivf.md5`,
+the sweep's file-driven vector set is byte-for-byte the same 304 as wave 3 -- this run
+re-confirms the wave-3 result rather than extending it.
+
+### ffmpeg cross-check of the 12 no-MD5 clips: 268,832/268,832 frames byte-identical
+
+Because the official corpus provides no ground truth for these clips, they were verified once
+against this project's established secondary oracle (ffmpeg's `libvpx-vp9` decoder, same
+policy as the synthetic-vector xdecode tests and the wave-2/3 probes):
+
+- **Reference side**: `ffmpeg -c:v libvpx-vp9 -i <clip>.ivf -f framemd5 -` -- one MD5 per
+  displayed frame over the raw `yuv420p` planes, which is byte-compatible with the layout this
+  project hashes (confirmed via framemd5's size column: e.g. 113742 = 426x178x1.5, planar
+  Y-then-U-then-V, no padding at even dimensions; all 12 clips have even dimensions).
+- **This side**: a throwaway probe example (`examples/probe_large_clips.rs`, deleted before
+  finishing, per the wave-2/3 probe precedent) that decodes each remuxed `.ivf` through one
+  `Decoder` and prints the same per-frame MD5 the sweep computes (I420 bytes of every
+  displayed frame).
+- **Result: all 12 clips match ffmpeg on every frame -- 268,832 displayed frames total, 0
+  mismatches, 0 frame-count divergences, 0 decode errors, 0 panics.** Every clip also
+  produced exactly 1 displayed frame per IVF chunk (no hidden/superframe chunks in these
+  encodes), and ffmpeg agreed on every count.
+
+| clip | frames | decode time | fps |
+| --- | --- | --- | --- |
+| `tos_426x178_tile_1x1_181kbps` | 22025 | 89.7s | 245.4 |
+| `tos_640x266_tile_1x2_336kbps` | 22025 | 178.6s | 123.3 |
+| `tos_854x356_tile_1x2_656kbps` | 22025 | 340.7s | 64.7 |
+| `tos_854x356_tile_1x2_fpm_546kbps` | 17620 | 274.7s | 64.2 |
+| `tos_1280x534_tile_1x4_1306kbps` | 22025 | 790.0s | 27.9 |
+| `tos_1280x534_tile_1x4_fpm_952kbps` | 17620 | 628.3s | 28.0 |
+| `tos_1920x800_tile_1x4_fpm_2335kbps` | 17620 | 1506.6s | 11.7 |
+| `sintel_426x182_tile_1x1_171kbps` | 26640 | 107.7s | 247.2 |
+| `sintel_640x272_tile_1x2_318kbps` | 26640 | 225.5s | 118.1 |
+| `sintel_854x364_tile_1x2_621kbps` | 26640 | 434.7s | 61.3 |
+| `sintel_1280x546_tile_1x4_1257kbps` | 26640 | 937.7s | 28.4 |
+| `sintel_1920x818_tile_1x4_fpm_2279kbps` | 21312 | 1652.9s | 12.9 |
+
+(Decode times are single-threaded release-build wall clock on this machine, ~19M px/s across
+resolutions -- recorded as a performance baseline, not a pass/fail criterion. ~12 fps at
+1920x800 is well short of real-time; if HD playback becomes a goal, that is future
+optimization work, not a correctness issue.)
+
+This is a one-time local check, not a repeatable harness: the `.ours`/framemd5 intermediates
+live in the session scratchpad and the probe example is deleted. If it ever needs re-running,
+the recipe above reconstructs it in ~20 lines against the public `Decoder` API.
+
+### README update (same wave)
+
+- Status section: "M4 pending / 5 curated vectors" replaced by the 304/304 sweep result with
+  the reproduction command, plus one-line descriptions of the two M4 decoder bugs (loop-filter
+  frame-level gate, spec §8.1, wave 2; SVC last-shown-output policy, wave 3) pointing here.
+- "What's proven" table: sweep-backed rows (including reference-frame scaling, now verified
+  end-to-end by the SVC/resize/largescaling vectors); dropped the standalone
+  reference-scaling-unverified and M4-pending known-limit rows.
+- Known limits: added the 19 no-MD5-clips row (with the cross-check result above); 8-bit-only
+  row unchanged.
+- Tests section: binary count corrected to 8 (sweep_test and synthetic_superframe_test were
+  missing), sweep harness documented, fetch-section wording updated from "the three vectors
+  libvpx only ships as .webm" (stale since wave 1) to the manifest-driven reality (342
+  entries) plus the continue-on-error behavior.
+
+### Verification
+
+- Full sweep: 304/304 (above).
+- `cargo test`: **150 passed, 0 failed** across 8 binaries (119 lib + 6 api +
+  12 conformance + 7 synthetic_seg + 2 synthetic_superframe + 4 decode_to_png; sweep binary
+  0 passed / 1 ignored) -- unchanged from wave 3.
+- `VP9DEC_FFMPEG=... cargo test --test synthetic_seg_test
+  synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`: 8/8 `[xdecode] ... OK`,
+  unchanged.
+- `git diff --stat`: `scripts/vectors.txt`, `README.md`, `docs/implementation-notes.md` only.
+  Zero `src/`/`tests/` changes; the throwaway probe was deleted before finishing.
+
+## M4 milestone: closing summary (2026-07-17)
+
+M4's goal was to take the decoder from "5 curated conformance vectors pass" to "the full
+official libvpx `vp90-2-*` corpus passes, bit-exact". Four waves, all 2026-07-16/17:
+
+1. **Wave 1 -- infrastructure + honest triage** (no fixes): manifest expanded 5 -> 330
+   vectors, fetch scripts made continue-on-error, `tests/sweep_test.rs` added (catch-all
+   per-vector failure recording, report to `target/sweep-report.txt`). First full sweep:
+   **275/304**, all 29 failures plain md5-mismatches (zero decode errors/panics), triaged
+   into 5 evidence-based categories.
+2. **Wave 2 -- loop filter frame-level gate** (spec §8.1 step 2): the entire per-frame loop
+   filter process must be gated on `loop_filter_level != 0`; this decoder ran it
+   unconditionally, and on `level == 0` + `delta_enabled` frames the INTRA_FRAME ref delta
+   spuriously produced per-block level 1, narrow-filtering nearly every edge by +/-1-2.
+   One 8-line conditional in `Decoder::decode_one_frame`: **275 -> 303/304** (28 of the 29
+   failures shared this one root cause -- the wave-1 triage's categories were symptoms of a
+   single defect, not five).
+3. **Wave 3 -- SVC last-shown output policy**: a superframe whose constituents each set
+   `show_frame == 1` (the 3-spatial-layer SVC vector, the only such stream in the corpus)
+   must surface only the *last* shown constituent as display output, matching libvpx/ffmpeg
+   (spec §8.9 taken literally would output all three; §5.26 permits either reading). 15 lines
+   in `Decoder::decode_frame`, the per-pixel pipeline was already bit-exact: **303 ->
+   304/304**.
+4. **Final wave -- large movie clips + docs** (this entry, above): the 12 deferred tos/sintel
+   full-length clips fetched/remuxed (all lack upstream `.md5`, like the 7 bbb clips), sweep
+   re-confirmed at **304/304**, and the 12 clips verified against ffmpeg per-frame MD5s
+   instead: **268,832/268,832 frames byte-identical**. README brought current.
+
+End state: every MD5-checkable vector in the official corpus decodes bit-exact (304/304), and
+every no-MD5 movie clip decodes byte-identical to ffmpeg's libvpx-vp9 across its full length.
+The two decoder defects the corpus surfaced were both output-policy/gating bugs one level
+above the pixel pipeline -- transforms, prediction, dequant, tiles, MC (scaled and unscaled),
+and probability adaptation needed no changes at any point in M4. Out of scope and still open:
+10-bit/12-bit (profiles 2/3) and 4:2:2/4:4:4 (profiles 1/3) -- see README "Known limits".

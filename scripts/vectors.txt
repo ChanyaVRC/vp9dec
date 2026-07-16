@@ -10,6 +10,10 @@
 # libvpx's own corrupted-stream tests, not video containers, so they don't fit this file's
 # ivf/webm "kind" schema). See docs/implementation-notes.md "M4 wave 1" for the full
 # derivation and the resulting sweep triage.
+#
+# M4 final wave (2026-07-17): the 12 vp90-2-tos_*/vp90-2-sintel_* entries deferred above are
+# added below (full-length Tears of Steel / Sintel clips, up to 1920x800, real-content
+# 1x2/1x4 tile columns + frame-parallel). See docs/implementation-notes.md "M4 final wave".
 vp90-2-00-quantizer-00 webm
 vp90-2-00-quantizer-00.webm.ivf.s5861_r01-05_b6-.v2 ivf
 vp90-2-00-quantizer-01 webm
@@ -340,3 +344,18 @@ vp90-2-bbb_1920x1080_tile_1x4_fpm_2304kbps webm
 vp90-2-bbb_426x240_tile_1x1_180kbps webm
 vp90-2-bbb_640x360_tile_1x2_337kbps webm
 vp90-2-bbb_854x480_tile_1x2_651kbps webm
+
+# Large-clip set (M4 final wave, 2026-07-17): the 12 vp90-2-tos_*/vp90-2-sintel_* full-length
+# movie clips deferred by M4 wave 1 above. All webm-only upstream.
+vp90-2-sintel_1280x546_tile_1x4_1257kbps webm
+vp90-2-sintel_1920x818_tile_1x4_fpm_2279kbps webm
+vp90-2-sintel_426x182_tile_1x1_171kbps webm
+vp90-2-sintel_640x272_tile_1x2_318kbps webm
+vp90-2-sintel_854x364_tile_1x2_621kbps webm
+vp90-2-tos_1280x534_tile_1x4_1306kbps webm
+vp90-2-tos_1280x534_tile_1x4_fpm_952kbps webm
+vp90-2-tos_1920x800_tile_1x4_fpm_2335kbps webm
+vp90-2-tos_426x178_tile_1x1_181kbps webm
+vp90-2-tos_640x266_tile_1x2_336kbps webm
+vp90-2-tos_854x356_tile_1x2_656kbps webm
+vp90-2-tos_854x356_tile_1x2_fpm_546kbps webm

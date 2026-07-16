@@ -111,24 +111,36 @@ See the status table below for what's verified against an external oracle vs. un
 
 ## Status / limitations
 
+M4 (full official-vector sweep) is complete: **304/304 MD5-checkable vectors in the official
+libvpx `vp90-2-*` conformance corpus decode bit-exact**. To reproduce: fetch the corpus with
+`scripts/fetch-vectors.{sh,ps1}`, then run the sweep harness --
+`RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_sweep --
+--ignored --nocapture`. The sweep surfaced two decoder bugs, both fixed (full analyses in
+[docs/implementation-notes.md](docs/implementation-notes.md), "M4 wave 2" / "M4 wave 3"):
+
+- The loop filter ran even when the frame-level `loop_filter_level` is 0; spec §8.1 gates the
+  entire per-frame filter process on it (ref-frame deltas can otherwise raise the per-block
+  level above 0 and filter a frame that signaled "no filtering").
+- A superframe with more than one `show_frame == 1` constituent (the 3-spatial-layer SVC
+  vector) reported every shown constituent as display output; the libvpx/ffmpeg oracle
+  surfaces only the last one per chunk.
+
 ### What's proven (verified against an external oracle, not just this crate's own tests)
 
 | Area | Evidence |
 | --- | --- |
-| Key frame + inter frame decode, motion compensation, probability adaptation, DPB, loop filter | 5 official libvpx conformance vectors, every displayed frame bit-exact against the official `.ivf.md5`: `vp90-2-12-droppable_1` (99/99 frames), `vp90-2-09-subpixel-00` (20/20), `vp90-2-15-segkey` (1/1), `vp90-2-15-segkey_adpq` (150/150), `vp90-2-16-intra-only` (7/7) |
-| Segmentation: seg-id decode, `SEG_LVL_ALT_Q` | Included in the `vp90-2-15-segkey*` bit-exact matches above |
-| `intra_only` frames, `reset_frame_context` values 0 and 2, superframe splitting | Included in the `vp90-2-16-intra-only` bit-exact match above (a real 4-frame superframe) |
+| Key frame + inter frame decode, motion compensation, probability adaptation, DPB, loop filter, tiles (1x1 through 4x4), superframes, `show_existing_frame`, frame-parallel-mode streams, mid-stream resize, intra-only frames, SVC | The full official sweep: 304/304 vectors, every displayed frame bit-exact against the official `.ivf.md5` |
+| Reference-frame scaling (spec §8.5.2.3, a reference whose size differs from the current frame) | Verified end-to-end by the sweep: the SVC vectors (`vp90-2-22-svc_1280x720_*`, 2:1 inter-layer scaling), the resize families (`vp90-2-05/14/18/21-*resize*`, scaling across mid-stream size changes), and `vp90-2-13-largescaling` all decode bit-exact |
+| Segmentation: seg-id decode, `SEG_LVL_ALT_Q` | Included in the `vp90-2-15-segkey*` bit-exact matches in the sweep |
 | Segmentation: `SEG_LVL_ALT_L`, `SEG_LVL_REF_FRAME`, `SEG_LVL_SKIP` (no official vector exists for these -- see below) | Synthetic round-trip vectors (`tests/synthetic_seg_test.rs`) cross-decoded byte-identically by two independent third-party VP9 decoders (ffmpeg's `libvpx-vp9` and its native `vp9`), 8/8 `[xdecode]` checks (4 scenarios x 2 decoders) |
-| Loop filter, including the `SEG_LVL_ALT_L` level-override path | Exercised by every vector above; the `SEG_LVL_ALT_L` synthetic vectors additionally pin an exact hand-derived pixel value (not just "output changed") that matches both ffmpeg decoders |
-| Motion compensation, including the reference-scaling bound derivation (`MAX_INTERMEDIATE_HEIGHT`, the largest intermediate buffer a scaled reference can require per spec §8.5.2.3) | Derived from the spec's integer arithmetic and guarded by `debug_assert!`s; exercised (unscaled case) by every vector above |
+| Loop filter, including the `SEG_LVL_ALT_L` level-override path and the frame-level `loop_filter_level == 0` gate | Exercised by the whole sweep; the `SEG_LVL_ALT_L` and level-0-gate synthetic vectors additionally pin exact hand-derived pixel values (not just "output changed") that match both ffmpeg decoders |
 
 ### Known limits
 
 | Limit | Detail |
 | --- | --- |
 | 8-bit only | `Plane` (`src/framebuffer.rs`) is fixed to `u8`; a 10-bit/12-bit stream returns `DecodeError::UnsupportedBitDepth` rather than decoding |
-| Reference-frame scaling unverified end-to-end | `scale_mv_for_plane` (spec §8.5.2.3) is implemented generically per the spec formula, and its buffer-sizing bound is derived and `debug_assert!`-checked (see above), but no available test vector has a reference frame whose size actually differs from the current frame, so the scaling *path itself* has never produced a bit-exact match against an external decoder |
-| M4 (full official vector sweep) pending | Only 5 of the full libvpx `vp90-2-*` vector set are exercised so far (see `scripts/fetch-vectors.{sh,ps1}` to fetch more) |
+| 19 corpus clips ship no upstream `.md5` | The 7 `vp90-2-bbb_*` and 12 `vp90-2-tos_*`/`vp90-2-sintel_*` movie clips ship only a `.webm` upstream (no `.md5` -- libvpx uses them for its own perf tests, not md5 conformance), so the sweep cannot MD5-check them; the fetch scripts still download/remux them, and they are excluded from the sweep's 304. The 12 tos/sintel clips (full-length movies, up to 1920x800, real-content 1x2/1x4 tile columns + frame-parallel) were instead cross-checked once against ffmpeg's `libvpx-vp9` per-frame MD5s: all 268,832 displayed frames byte-identical (see docs/implementation-notes.md "M4 final wave") |
 
 ## Tests & verification
 
@@ -138,20 +150,31 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
-`cargo test` runs 6 binaries: the library's own unit tests (`src/`, colocated `#[cfg(test)]
+`cargo test` runs 8 binaries: the library's own unit tests (`src/`, colocated `#[cfg(test)]
 mod tests` next to the code they check), `tests/api_test.rs`, `tests/conformance_test.rs`,
-`tests/synthetic_seg_test.rs`, the `decode_to_png` example's own `#[cfg(test)]` tests (PNG/CRC32/
-Adler32 encoding checks), and the (currently empty) doc-tests.
+`tests/sweep_test.rs` (whose one test is `#[ignore]`d -- see below), `tests/synthetic_seg_test.rs`,
+`tests/synthetic_superframe_test.rs`, the `decode_to_png` example's own `#[cfg(test)]` tests
+(PNG/CRC32/Adler32 encoding checks), and the (currently empty) doc-tests.
 
 - **`tests/api_test.rs`**: parse-layer probes against the two local official vectors, using
   `Decoder` and the lower-level parsing entry points directly -- IVF container + uncompressed
   header fields, `compressed_header`/`decode_tiles` read-through without panicking, and a
   plausibility check on `decode_frame`'s Y-plane output (non-degenerate variance/range).
-- **`tests/conformance_test.rs`**: the bit-exact MD5 checks in the table above, plus a
-  `[coverage]` line per segmentation/intra-only vector (via `FrameDecodeInfo`) confirming the
-  vector actually exercises the decode path it's meant to prove, not just that the output
-  happens to match; also carries the from-scratch MD5 (RFC 1321) implementation's own unit
-  tests (`mod md5_tests`).
+- **`tests/conformance_test.rs`**: bit-exact MD5 checks for 5 curated vectors with a detailed
+  diff on the first mismatch, plus a `[coverage]` line per segmentation/intra-only vector (via
+  `FrameDecodeInfo`) confirming the vector actually exercises the decode path it's meant to
+  prove, not just that the output happens to match; also carries the from-scratch MD5 (RFC
+  1321) implementation's own unit tests (`mod md5_tests`).
+- **`tests/sweep_test.rs`**: the full-corpus sweep behind the 304/304 result in the status
+  section -- decodes every `tests/vectors/*.ivf` that has a matching `.ivf.md5` and MD5-checks
+  every displayed frame, collecting all failures (with per-vector reasons written to
+  `target/sweep-report.txt`) instead of stopping at the first. `#[ignore]`d because it needs
+  the downloaded corpus and a release build; run it explicitly:
+  `RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_sweep --
+  --ignored --nocapture`.
+- **`tests/synthetic_superframe_test.rs`**: pins the superframe display-output policy (only
+  the last constituent of a multi-shown superframe is display output; a single-frame chunk is
+  unaffected) with self-built two-keyframe superframes.
 - **`tests/synthetic_seg_test.rs`**: the `SEG_LVL_ALT_L`/`SEG_LVL_REF_FRAME`/`SEG_LVL_SKIP`
   synthetic round-trip vectors and their ffmpeg cross-decode check (see the status table above
   and `docs/implementation-notes.md` for what this test does and doesn't prove). Also has an
@@ -179,11 +202,15 @@ pwsh scripts/fetch-vectors.ps1
 ```
 
 Both scripts are idempotent (skip any file already present) and manifest-driven
-(`scripts/vectors.txt`): they download `<name>.ivf`/`<name>.ivf.md5` directly for vectors that
-ship as IVF, and for the three vectors libvpx only ships as `.webm`, they download the `.webm` +
-`.webm.md5` and remux to `.ivf` via `cargo run --example webm_to_ivf` (container change only, no
-re-encode), then copy the `.webm.md5` alongside it as `.ivf.md5` (the MD5s are of the decoded
-pixel output, not the container, so they carry over unchanged).
+(`scripts/vectors.txt`, the full official corpus: 342 entries, ~3.5 GB downloaded): they
+download `<name>.ivf`/`<name>.ivf.md5` directly for vectors that ship as IVF, and for the
+majority that libvpx only ships as `.webm`, they download the `.webm` + `.webm.md5` and remux
+to `.ivf` via `cargo run --example webm_to_ivf` (container change only, no re-encode), then
+copy the `.webm.md5` alongside it as `.ivf.md5` (the MD5s are of the decoded pixel output, not
+the container, so they carry over unchanged). Individual download/remux failures are recorded
+and summarized at the end of the run rather than aborting it -- some upstream files
+legitimately don't exist (see the known-limits table above and `scripts/vectors.txt`'s
+comments).
 
 ### External cross-decode (ffmpeg)
 
