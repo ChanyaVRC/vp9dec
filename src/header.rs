@@ -664,9 +664,11 @@ pub fn parse_uncompressed_header(
             interpolation_filter = parse_interpolation_filter(&mut r);
             // Profile, bit depth, and color space are not read from an inter
             // frame's bitstream (they are required to match the reference
-            // frame, spec §7.2). This decoder does not yet carry color config
-            // state across frames, so `decode_keyframe`/`Decoder` reuses the
-            // value from the preceding key frame instead.
+            // frame, spec §7.2). This parser has no access to prior frames'
+            // state, so it fabricates a placeholder here; `Decoder` (which does
+            // carry color config across frames, see `last_color_config`)
+            // overwrites it with the value from the preceding key/intra-only
+            // frame before the header is used.
             color_config = ColorConfig {
                 bit_depth: 8,
                 color_space: CS_UNKNOWN,
@@ -743,59 +745,7 @@ pub fn parse_uncompressed_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// An MSB-first bit writer for tests. Used to hand-build bitstreams.
-    struct BitWriter {
-        bytes: Vec<u8>,
-        cur: u8,
-        cur_bits: u32,
-    }
-
-    impl BitWriter {
-        fn new() -> Self {
-            Self {
-                bytes: Vec::new(),
-                cur: 0,
-                cur_bits: 0,
-            }
-        }
-
-        fn push_bits(&mut self, value: u32, n: u32) {
-            for i in (0..n).rev() {
-                let bit = ((value >> i) & 1) as u8;
-                self.cur = (self.cur << 1) | bit;
-                self.cur_bits += 1;
-                if self.cur_bits == 8 {
-                    self.bytes.push(self.cur);
-                    self.cur = 0;
-                    self.cur_bits = 0;
-                }
-            }
-        }
-
-        fn push_flag(&mut self, value: bool) {
-            self.push_bits(value as u32, 1);
-        }
-
-        /// s(n): n bits absolute value + 1 bit sign.
-        fn push_signed(&mut self, value: i32, n: u32) {
-            self.push_bits(value.unsigned_abs(), n);
-            self.push_flag(value < 0);
-        }
-
-        fn finish(mut self) -> Vec<u8> {
-            while self.cur_bits != 0 {
-                self.cur <<= 1;
-                self.cur_bits += 1;
-                if self.cur_bits == 8 {
-                    self.bytes.push(self.cur);
-                    self.cur = 0;
-                    self.cur_bits = 0;
-                }
-            }
-            self.bytes
-        }
-    }
+    use crate::test_support::BitWriter;
 
     /// Builds a minimal key frame uncompressed header.
     /// profile=0, 8x8, lossless, segmentation disabled, no tile split.

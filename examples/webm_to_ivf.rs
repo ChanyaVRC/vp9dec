@@ -404,23 +404,9 @@ fn read_string(buf: &[u8], range: std::ops::Range<usize>) -> String {
 }
 
 fn write_ivf(out_path: &str, width: u16, height: u16, payloads: &[Vec<u8>], ctx: &str) {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"DKIF");
-    out.extend_from_slice(&0u16.to_le_bytes()); // version
-    out.extend_from_slice(&32u16.to_le_bytes()); // header_length
-    out.extend_from_slice(b"VP90"); // fourcc
-    out.extend_from_slice(&width.to_le_bytes());
-    out.extend_from_slice(&height.to_le_bytes());
-    out.extend_from_slice(&1u32.to_le_bytes()); // timebase_denominator (unused by our IvfReader)
-    out.extend_from_slice(&1u32.to_le_bytes()); // timebase_numerator (unused by our IvfReader)
-    out.extend_from_slice(&(payloads.len() as u32).to_le_bytes()); // frame_count
-    out.extend_from_slice(&0u32.to_le_bytes()); // unused
-
-    for (i, data) in payloads.iter().enumerate() {
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(i as u64).to_le_bytes()); // timestamp = frame index
-        out.extend_from_slice(data);
-    }
-
-    std::fs::write(out_path, &out).unwrap_or_else(|e| fail(format!("{ctx}: failed to write {out_path}: {e}")));
+    // timebase 1/1 (unused by our IvfReader) is this example's long-standing output format;
+    // kept as-is rather than switched to a real frame rate, to not change existing output.
+    let out = vp9dec::ivf::write_ivf(b"VP90", width, height, 1, 1, payloads);
+    std::fs::write(out_path, &out)
+        .unwrap_or_else(|e| fail(format!("{ctx}: failed to write {out_path}: {e}")));
 }

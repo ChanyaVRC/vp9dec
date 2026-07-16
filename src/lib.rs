@@ -29,6 +29,8 @@ pub mod prob_tables;
 pub mod quant;
 pub mod scan;
 pub mod superframe;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tile;
 pub mod transform;
 

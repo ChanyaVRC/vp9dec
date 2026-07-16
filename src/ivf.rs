@@ -169,6 +169,37 @@ impl<'a> Iterator for IvfReader<'a> {
     }
 }
 
+/// Builds a complete IVF file from `frames`, the inverse of [`IvfReader`] (matches its layout
+/// field-for-field). Each frame's timestamp is simply its index. Useful for tests that need to
+/// hand-build an IVF file, and for M4 vector tooling.
+pub fn write_ivf(
+    fourcc: &[u8; 4],
+    width: u16,
+    height: u16,
+    timebase_den: u32,
+    timebase_num: u32,
+    frames: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(IVF_SIGNATURE);
+    buf.extend_from_slice(&0u16.to_le_bytes()); // version
+    buf.extend_from_slice(&(IVF_FILE_HEADER_SIZE as u16).to_le_bytes());
+    buf.extend_from_slice(fourcc);
+    buf.extend_from_slice(&width.to_le_bytes());
+    buf.extend_from_slice(&height.to_le_bytes());
+    buf.extend_from_slice(&timebase_den.to_le_bytes());
+    buf.extend_from_slice(&timebase_num.to_le_bytes());
+    buf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // unused
+
+    for (i, frame) in frames.iter().enumerate() {
+        buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(i as u64).to_le_bytes());
+        buf.extend_from_slice(frame);
+    }
+    buf
+}
+
 fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([buf[offset], buf[offset + 1]])
 }
@@ -192,7 +223,9 @@ fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
 mod tests {
     use super::*;
 
-    /// Hand-builds the byte sequence of an IVF file header from the given fields, for tests.
+    /// Hand-builds the byte sequence of an IVF file header from the given fields, for tests
+    /// that need a `frame_count` or per-frame timestamps independent of the actual frames
+    /// appended (unlike `write_ivf`, which always derives both from `frames`).
     fn build_file_header(
         fourcc: &[u8; 4],
         width: u16,
@@ -225,9 +258,14 @@ mod tests {
 
     #[test]
     fn parses_file_header_fields() {
-        let mut buf = build_file_header(b"VP90", 352, 288, 30, 1, 2);
-        append_frame(&mut buf, 0, &[0xAA, 0xBB, 0xCC]);
-        append_frame(&mut buf, 1, &[0x11, 0x22]);
+        let buf = write_ivf(
+            b"VP90",
+            352,
+            288,
+            30,
+            1,
+            &[vec![0xAA, 0xBB, 0xCC], vec![0x11, 0x22]],
+        );
 
         let reader = IvfReader::new(&buf).expect("valid header");
         let header = reader.header();
@@ -262,7 +300,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_signature() {
-        let mut buf = build_file_header(b"VP90", 16, 16, 30, 1, 1);
+        let mut buf = write_ivf(b"VP90", 16, 16, 30, 1, &[]);
         buf[0] = b'X'; // Corrupt the signature
         assert_eq!(IvfReader::new(&buf).unwrap_err(), IvfError::BadSignature);
     }
@@ -290,7 +328,7 @@ mod tests {
 
     #[test]
     fn handles_empty_stream() {
-        let buf = build_file_header(b"VP90", 16, 16, 30, 1, 0);
+        let buf = write_ivf(b"VP90", 16, 16, 30, 1, &[]);
         let mut reader = IvfReader::new(&buf).expect("valid header");
         assert_eq!(reader.next(), None);
     }

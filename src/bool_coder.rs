@@ -158,108 +158,10 @@ impl<'a> BoolDecoder<'a> {
     }
 }
 
-/// A bool encoder for tests only. Factored out into its own `pub(crate)` module
-/// so it can be reused from the `compressed_header`/`tile` module unit tests as
-/// well (kept out of the library's non-test code, since VP9 only implements a
-/// decoder here).
-#[cfg(test)]
-pub(crate) mod test_support {
-    /// A bool encoder for tests only.
-    ///
-    /// This is an arithmetic encoder performing the inverse operation of
-    /// [`super::BoolDecoder`], implemented solely for round-trip tests.
-    ///
-    /// Implementation approach: because this coder has the structure "the
-    /// range (BoolRange) is capped at 255 and renormalized by doubling one
-    /// bit at a time whenever it drops below 128", the encoder side has the
-    /// classic arithmetic-coding problem where a carry into not-yet-finalized
-    /// low bits can retroactively affect bits already emitted.
-    ///
-    /// This implementation does not stream; instead it receives the entire
-    /// sequence of bools to encode and emits the output all at once, holding
-    /// the internal state `low` as an "arbitrary-precision binary number" so
-    /// that carry propagation is handled as exact bignum arithmetic (no
-    /// approximation or special carry-detection logic needed).
-    pub(crate) struct BoolEncoder {
-        /// Binary representation of `low`. `bits[0]` is the most significant
-        /// bit (the first bit finalized), `bits.last()` is the least
-        /// significant bit (the most recently shifted-in bit from
-        /// renormalization). The first 8 bits are initialized to 0 as a
-        /// placeholder for the first byte, where BoolValue is stored.
-        low_bits: Vec<u8>,
-        /// The encoder-side counterpart of BoolRange. It transitions with
-        /// exactly the same update formula as the decoder (BoolRange's
-        /// transition depends only on the bool value and the probability,
-        /// not on the output bit stream).
-        range: u32,
-    }
-
-    impl BoolEncoder {
-        pub(crate) fn new() -> Self {
-            let mut enc = Self {
-                low_bits: vec![0u8; 8], // Placeholder for the first byte, used for BoolValue
-                range: 255,
-            };
-            // Encode the marker bit (always 0) that is read as part of init_bool.
-            enc.write_bool(false, 128);
-            enc
-        }
-
-        fn add_split(&mut self, split: u32) {
-            // Add split to low_bits (least significant bit at the end), propagating any carry upward.
-            let mut carry = split;
-            let mut idx = self.low_bits.len();
-            while carry != 0 {
-                if idx == 0 {
-                    self.low_bits.insert(0, 0);
-                    idx = 1;
-                }
-                idx -= 1;
-                let sum = self.low_bits[idx] as u32 + (carry & 1);
-                self.low_bits[idx] = (sum & 1) as u8;
-                carry = (carry >> 1) + (sum >> 1);
-            }
-        }
-
-        pub(crate) fn write_bool(&mut self, bit: bool, p: u8) {
-            let split = 1 + (((self.range - 1) * p as u32) >> 8);
-            if bit {
-                self.add_split(split);
-                self.range -= split;
-            } else {
-                self.range = split;
-            }
-            while self.range < 128 {
-                self.low_bits.push(0); // Placeholder for the new least significant bit (may later become 1 via a carry)
-                self.range <<= 1;
-            }
-        }
-
-        pub(crate) fn write_literal(&mut self, value: u32, n: u32) {
-            for i in (0..n).rev() {
-                let bit = (value >> i) & 1 == 1;
-                self.write_bool(bit, 128);
-            }
-        }
-
-        /// Finishes encoding and returns the byte sequence (zero-pads to the
-        /// byte boundary, corresponding to `exit_bool`).
-        pub(crate) fn finish(mut self) -> Vec<u8> {
-            while !self.low_bits.len().is_multiple_of(8) {
-                self.low_bits.push(0);
-            }
-            self.low_bits
-                .chunks(8)
-                .map(|chunk| chunk.iter().fold(0u8, |acc, &b| (acc << 1) | b))
-                .collect()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::test_support::BoolEncoder;
     use super::*;
+    use crate::test_support::BoolEncoder;
 
     /// A simple linear congruential generator (LCG) pseudo-random number generator, for tests only.
     struct Lcg {

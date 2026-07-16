@@ -583,8 +583,8 @@ pub fn parse_compressed_header_ex(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bool_coder::test_support::BoolEncoder;
     use crate::prob_tables::ONLY_4X4;
+    use crate::test_support::BoolEncoder;
 
     #[test]
     fn lossless_frame_forces_only_4x4_and_reads_no_extra_bit() {

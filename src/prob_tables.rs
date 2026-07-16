@@ -220,13 +220,8 @@ pub const PARTITION_TREE: [i32; 6] = [
     -(PARTITION_VERT as i32),
     -(PARTITION_SPLIT as i32),
 ];
-/// `cols_partition_tree[ 2 ]`. Used when hasCols == 1 && hasRows == 0.
-pub const COLS_PARTITION_TREE: [i32; 2] = [-(PARTITION_HORZ as i32), -(PARTITION_SPLIT as i32)];
-
 /// `segment_tree[ 14 ]` (spec §9.3.1). Used to decode `segment_id`.
 pub const SEGMENT_TREE: [i32; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
-/// `rows_partition_tree[ 2 ]`. Used when hasRows == 1 && hasCols == 0.
-pub const ROWS_PARTITION_TREE: [i32; 2] = [-(PARTITION_VERT as i32), -(PARTITION_SPLIT as i32)];
 
 /// `intra_mode_tree[ 18 ]`. Used to decode `default_intra_mode`/`default_uv_mode`/
 /// `intra_mode`/`sub_intra_mode`/`uv_mode`.
@@ -2161,8 +2156,6 @@ pub const SUBPEL_SHIFTS: i32 = 16;
 pub const SUBPEL_MASK: i32 = 15;
 /// `INTERP_EXTEND` (spec §3). Used in motion vector clamping.
 pub const INTERP_EXTEND: i32 = 4;
-/// `MI_SIZE` (spec §3).
-pub const MI_SIZE_PX: i32 = 8;
 
 // =============================================================================
 // Probability adaptation (spec §8.4 "Probability adaptation process").

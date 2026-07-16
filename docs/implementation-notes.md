@@ -690,3 +690,145 @@ tests), confirming the refactor is decode-output-neutral.
 4-frame superframe -- directly to `decode_frame()` with no pre-splitting) now decodes
 and dumps correctly, which it structurally could not have before this change (the
 correctness fix this section describes is specifically what makes that possible).
+
+## Wave 1 design-debt cleanup: stale comments, dead constants, shared test infra (2026-07-16)
+
+### Scope
+
+Infra/trivia wave: fixed four comments that had gone stale as the decoder progressed past
+the milestone they described, deleted two dead `pub` constants and one dead `pub` alias,
+and de-duplicated ~120 lines of hand-copied test-only encoder/writer code (a `BoolEncoder`,
+a `BitWriter`, and an IVF file writer) that had accumulated three near-identical copies
+across `src/` and `tests/` because those copies had no way to see each other's
+`#[cfg(test)]`-gated originals. No behavior change to the decoder itself.
+
+### Stale comments (verified against the current code before editing)
+
+- `src/tile.rs` module doc: no longer claims the loop filter is unimplemented --
+  `TileDecoder::apply_loop_filter` has existed in the same file since M2b.
+- `src/header.rs` (inter-frame `color_config` placeholder): reworded to state the actual
+  contract (the parser fabricates a placeholder; `Decoder::last_color_config`, added at
+  M3, overwrites it) instead of claiming the decoder still can't carry color config
+  across frames.
+- `src/superframe.rs` module doc: updated to match the 2026-07-14 change (see the section
+  above) that moved `split_superframe` splitting inside `Decoder::decode_frame` -- callers
+  no longer need to split before calling it.
+- `tests/compressed_header_test.rs`: the `decode_tiles` call's inline comment claimed
+  failure was "expected until token decoding is implemented" (done since M2); reworded to
+  match the module doc's own (already-accurate) framing that this is a panic-only smoke
+  test, full correctness being checked elsewhere.
+
+### Dead code removed
+
+`COLS_PARTITION_TREE`/`ROWS_PARTITION_TREE` (`src/prob_tables.rs`) and `MI_SIZE_PX` --
+re-verified zero uses repo-wide (`Grep`, not just within `src/`) immediately before
+deleting each, per the wave's instructions. `read_partition` (`src/tile.rs`) hand-inlines
+the two 2-node partition trees rather than using the constants, so they were dead from
+the day they were added.
+
+### `test_support` module (kills the BoolEncoder/BitWriter duplication)
+
+Moved (not copied) `BoolEncoder` out of `src/bool_coder.rs`'s `#[cfg(test)] pub(crate) mod
+test_support` and `BitWriter` out of `src/header.rs`'s `#[cfg(test)] mod tests`, into a
+new top-level `src/test_support.rs`, gated `#[cfg(any(test, feature = "test-support"))]`
+and exposed as `pub` (previously `pub(crate)`/private, since nothing outside the crate --
+nor, for `BitWriter`, outside `header.rs` -- could see them). The `test-support` feature
+is enabled for integration tests (`tests/*.rs`) via a self-referencing
+`[dev-dependencies] vp9dec = { path = ".", features = ["test-support"] }` entry in
+`Cargo.toml`; this is not an external crate (still zero `src/` dependencies) and doesn't
+affect a normal `cargo build`, confirmed by a plain `cargo build` (no features) succeeding
+without compiling `test_support` at all.
+
+`header.rs`'s other test-only helpers (`build_minimal_keyframe_header` etc.) stay in
+`header.rs` as instructed -- only the generic bit-writer moved, not the header-specific
+builders on top of it.
+
+`tests/synthetic_seg_test.rs` had its own third, hand-rolled copy of both (its module doc
+used to explain this was because the `src/` originals were `#[cfg(test)] pub(crate)` and
+therefore invisible from `tests/`); that copy is now deleted in favor of
+`use vp9dec::test_support::{BitWriter, BoolEncoder};`, and the module doc updated to
+explain the `test-support` feature instead.
+
+#### Judgment call: dropped a bit-width assert that had no equivalent upstream
+
+`synthetic_seg_test.rs`'s local `BitWriter::push_bits` had one line with no counterpart in
+`src/header.rs`'s original: `assert!(n == 32 || value >> n == 0, "{value} does not fit in
+{n} bits")`, added there specifically to fail loudly if a hand-encoded field value like an
+`ALT_L` level were to overflow its bit width and silently truncate into a different valid
+encoding. The wave's instructions describe the three copies as "verbatim" and direct
+replacing this one with the shared `vp9dec::test_support::BitWriter`, which (matching the
+`header.rs` original that was actually moved) has no such assert. Replaced as instructed
+rather than carrying the extra assert into the shared version, since none of the current
+callers in either file encode a value that overflows its field (`cargo test` stayed
+green), but flagging here because the failure mode this assert guarded against (silent
+truncation into a different, still-valid encoding) is exactly the kind of bug that fails
+far from its cause -- a future editor adding a hand-encoded field to either test file no
+longer gets that check for free.
+
+### IVF writer unification
+
+Added `pub fn write_ivf(fourcc, width, height, timebase_den, timebase_num, frames) ->
+Vec<u8>` to `src/ivf.rs` (the inverse of `IvfReader`, timestamps = frame index), and
+migrated the three existing hand-rolled writers to it:
+
+- `examples/webm_to_ivf.rs`'s `write_ivf` now calls the shared one with `1, 1` for the
+  timebase, preserving that example's existing output byte-for-byte (it was already
+  hard-coding `1/1` regardless of the source WebM's actual timebase, a pre-existing
+  behavior this wave didn't change).
+- `tests/synthetic_seg_test.rs`'s `ivf_wrap` helper is gone; its two call sites now call
+  `vp9dec::ivf::write_ivf(b"VP90", WIDTH as u16, HEIGHT as u16, 30, 1, &frames)` directly,
+  same `30/1` timebase as before.
+- `src/ivf.rs`'s own `#[cfg(test)] build_file_header`/`append_frame` helpers were only
+  *partially* retired: `parses_file_header_fields`, `rejects_bad_signature`, and
+  `handles_empty_stream` now build their input via the new `write_ivf`, but
+  `iterates_frames_in_order` (needs non-sequential timestamps `0, 33, 66` to prove
+  timestamps are read correctly, which `write_ivf`'s "timestamp = index" contract can't
+  produce) and `reports_truncated_frame_data` (deliberately appends a frame header
+  claiming more data than actually follows) still need hand-built bytes, so
+  `build_file_header`/`append_frame` stay for those two.
+
+### `Cargo.toml` / example test wiring
+
+Added `publish = false`, the `test-support` feature, the self dev-dependency, and explicit
+`[[example]]` sections for both `decode_to_png` (`test = true`) and `webm_to_ivf` (no
+`test = true` needed -- it has no `#[cfg(test)]` tests of its own). Declaring one
+`[[example]]` section did not disable auto-discovery of the other; both continued to be
+picked up and build correctly (`cargo build --examples`), which was verified rather than
+assumed. `test = true` brought `decode_to_png.rs`'s four pre-existing `#[cfg(test)]` tests
+(crc32/adler32/deflate/PNG-chunk checks) into `cargo test` for the first time; confirmed
+via `cargo test` output that all four actually ran and passed, raising the total from 146
+to 150.
+
+### Judgment call: `rustfmt <file>` on the crate root reformats the whole crate
+
+The wave's instructions say to format only touched files via `rustfmt <file>` rather than
+bare `cargo fmt` (which reformats pre-existing drift in unrelated files -- a known
+incident). Running `rustfmt --check` file-by-file surfaced a sharp edge in that plan:
+`src/lib.rs` is the crate root, and rustfmt follows `mod` declarations from whichever file
+it's given, so `rustfmt src/lib.rs` reports (and, run for real, would rewrite) diffs
+across every module reachable from it -- functionally identical to bare `cargo fmt` for
+this crate, just invoked differently. Resolution: `rustfmt --check` was run per touched
+file to *detect* issues, but only applied by hand (via targeted edits, not `rustfmt` as a
+formatter) to the specific hunks that trace to this wave's own edits -- an import-order
+fix each in `src/compressed_header.rs` and `src/tile.rs` (inserting `use
+crate::test_support::BoolEncoder;` out of alphabetical order), and a line-wrap each in
+`examples/webm_to_ivf.rs` and `tests/synthetic_seg_test.rs` (lines that grew past the
+column limit). Pre-existing drift the `--check` run also reported in these and other
+touched files (`src/header.rs`, `src/lib.rs`, `src/prob_tables.rs`, `src/tile.rs`,
+`tests/compressed_header_test.rs`, and the bulk of `examples/webm_to_ivf.rs`) was left
+untouched, matching "surgical changes" over the letter of "format files you touched."
+`src/lib.rs`'s own one-line diff addition (`pub mod test_support;`) was verified by
+inspection to already match rustfmt's expected style, so no reformatting was needed there
+in any form.
+
+### Verification
+
+`cargo test`: 150 passed (125 lib unit + 2 + 7 + 2 + 2 + 2 + 6 integration + 4 example),
+0 failed, across all 9 binaries. `cargo test --test synthetic_seg_test -- --nocapture`:
+6/6, only the two expected `[skip]` lines (`VP9DEC_DUMP_DIR` unset, ffmpeg not on PATH).
+`cargo build` (no features): succeeds without compiling `test_support`. `cargo clippy
+--all-targets`: only the same 3 pre-existing warnings (`src/header.rs`
+`large_enum_variant`, `src/superframe.rs` `identity_op`, `src/lib.rs`
+`field_reassign_with_default`); the two `new_without_default` warnings clippy raised
+against the newly-`pub` `BoolEncoder`/`BitWriter` were fixed by adding `Default` impls
+(delegating to `new()`) rather than suppressed.

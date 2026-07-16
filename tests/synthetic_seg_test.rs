@@ -4,8 +4,8 @@
 //! coverage" section, and its 2026-07-14 follow-up entry for the full writeup).
 //!
 //! This file is its own tiny VP9 *encoder* (bool coder + uncompressed-header bit writer,
-//! both hand-rolled since `src/bool_coder.rs`/`src/header.rs`'s equivalents are
-//! `#[cfg(test)] pub(crate)` and not visible from `tests/`). It builds just enough
+//! imported from `vp9dec::test_support` via the crate's `test-support` feature -- see
+//! `Cargo.toml`'s self-referencing `[dev-dependencies]` entry). It builds just enough
 //! bitstream -- a handful of skip=1 intra blocks and one all-forced-fields inter frame --
 //! to drive the three features through `vp9dec::Decoder`, then checks the decoded output.
 //!
@@ -29,126 +29,11 @@ use vp9dec::prob_tables::{
     KF_PARTITION_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, LAST_FRAME, PARTITION_NONE,
     PARTITION_SPLIT, PARTITION_TREE, SEGMENT_TREE, V_PRED,
 };
+use vp9dec::test_support::{BitWriter, BoolEncoder};
 use vp9dec::Decoder;
 
 const WIDTH: u32 = 16;
 const HEIGHT: u32 = 16;
-
-// ===========================================================================================
-// Bit-level encoding infrastructure (hand-rolled; see module doc comment for why).
-// ===========================================================================================
-
-/// MSB-first raw bit writer for the uncompressed header. Mirrors `src/header.rs`'s
-/// `#[cfg(test)] struct BitWriter` (not visible from here) bit-for-bit.
-struct BitWriter {
-    bytes: Vec<u8>,
-    cur: u8,
-    cur_bits: u32,
-}
-
-impl BitWriter {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            cur: 0,
-            cur_bits: 0,
-        }
-    }
-
-    fn push_bits(&mut self, value: u32, n: u32) {
-        // A value wider than the field would otherwise be silently truncated into a *different*
-        // valid encoding (e.g. ALT_L level 64 in its 6-bit field becomes 0), failing far away.
-        assert!(
-            n == 32 || value >> n == 0,
-            "{value} does not fit in {n} bits"
-        );
-        for i in (0..n).rev() {
-            let bit = ((value >> i) & 1) as u8;
-            self.cur = (self.cur << 1) | bit;
-            self.cur_bits += 1;
-            if self.cur_bits == 8 {
-                self.bytes.push(self.cur);
-                self.cur = 0;
-                self.cur_bits = 0;
-            }
-        }
-    }
-
-    fn push_flag(&mut self, value: bool) {
-        self.push_bits(value as u32, 1);
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        while self.cur_bits != 0 {
-            self.cur <<= 1;
-            self.cur_bits += 1;
-            if self.cur_bits == 8 {
-                self.bytes.push(self.cur);
-                self.cur = 0;
-                self.cur_bits = 0;
-            }
-        }
-        self.bytes
-    }
-}
-
-/// Arithmetic (bool) encoder, the inverse of `src/bool_coder.rs`'s `BoolDecoder`. Copied
-/// from that file's `#[cfg(test)] pub(crate) mod test_support` (not visible from `tests/`);
-/// see the original for the carry-propagation rationale.
-struct BoolEncoder {
-    low_bits: Vec<u8>,
-    range: u32,
-}
-
-impl BoolEncoder {
-    fn new() -> Self {
-        let mut enc = Self {
-            low_bits: vec![0u8; 8],
-            range: 255,
-        };
-        enc.write_bool(false, 128); // marker bit read by init_bool.
-        enc
-    }
-
-    fn add_split(&mut self, split: u32) {
-        let mut carry = split;
-        let mut idx = self.low_bits.len();
-        while carry != 0 {
-            if idx == 0 {
-                self.low_bits.insert(0, 0);
-                idx = 1;
-            }
-            idx -= 1;
-            let sum = self.low_bits[idx] as u32 + (carry & 1);
-            self.low_bits[idx] = (sum & 1) as u8;
-            carry = (carry >> 1) + (sum >> 1);
-        }
-    }
-
-    fn write_bool(&mut self, bit: bool, p: u8) {
-        let split = 1 + (((self.range - 1) * p as u32) >> 8);
-        if bit {
-            self.add_split(split);
-            self.range -= split;
-        } else {
-            self.range = split;
-        }
-        while self.range < 128 {
-            self.low_bits.push(0);
-            self.range <<= 1;
-        }
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        while !self.low_bits.len().is_multiple_of(8) {
-            self.low_bits.push(0);
-        }
-        self.low_bits
-            .chunks(8)
-            .map(|chunk| chunk.iter().fold(0u8, |acc, &b| (acc << 1) | b))
-            .collect()
-    }
-}
 
 /// Finds the `(node, bit)` sequence that `BoolDecoder::read_tree` (`src/bool_coder.rs`)
 /// would read, in order, to arrive at `leaf`, by walking the tree structure the same way
@@ -963,29 +848,6 @@ fn seg_lvl_alt_l_loop_filter_level_change_is_observable() {
 // independently confirm this decoder's interpretation of SEG_LVL_ALT_L/REF_FRAME/SKIP.
 // ===========================================================================================
 
-/// Writes `frames` as an IVF file. Mirrors `src/ivf.rs`'s reader layout exactly (field-for-field
-/// the inverse of that module's `#[cfg(test)] build_file_header`/`append_frame` helpers).
-fn ivf_wrap(frames: &[Vec<u8>]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"DKIF");
-    buf.extend_from_slice(&0u16.to_le_bytes()); // version
-    buf.extend_from_slice(&32u16.to_le_bytes()); // header_len
-    buf.extend_from_slice(b"VP90");
-    buf.extend_from_slice(&(WIDTH as u16).to_le_bytes());
-    buf.extend_from_slice(&(HEIGHT as u16).to_le_bytes());
-    buf.extend_from_slice(&30u32.to_le_bytes()); // timebase_den
-    buf.extend_from_slice(&1u32.to_le_bytes()); // timebase_num
-    buf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes()); // unused/reserved
-
-    for (i, frame) in frames.iter().enumerate() {
-        buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&(i as u64).to_le_bytes());
-        buf.extend_from_slice(frame);
-    }
-    buf
-}
-
 /// The four synthetic scenarios plus the shown-frame count each must produce. The single source
 /// of truth for both the dump harness and the ffmpeg cross-decode test, so the dumped set can
 /// never silently diverge from the cross-checked set.
@@ -1023,7 +885,8 @@ fn dump_synthetic_ivf_for_external_cross_decode() {
         let _ = std::fs::remove_file(&ivf_path);
         let _ = std::fs::remove_file(&yuv_path);
 
-        let ivf_bytes = ivf_wrap(&frames);
+        let ivf_bytes =
+            vp9dec::ivf::write_ivf(b"VP90", WIDTH as u16, HEIGHT as u16, 30, 1, &frames);
         std::fs::write(&ivf_path, &ivf_bytes).expect("write .ivf");
 
         let mut decoder = Decoder::new();
@@ -1167,7 +1030,11 @@ fn synthetic_streams_cross_decode_against_ffmpeg() {
         );
 
         let ivf_path = tmp_dir.join(format!("{name}.ivf"));
-        std::fs::write(&ivf_path, ivf_wrap(&frames)).expect("write .ivf");
+        std::fs::write(
+            &ivf_path,
+            vp9dec::ivf::write_ivf(b"VP90", WIDTH as u16, HEIGHT as u16, 30, 1, &frames),
+        )
+        .expect("write .ivf");
 
         for &decoder_name in &decoders {
             let out_path = tmp_dir.join(format!("{name}.{decoder_name}.yuv"));

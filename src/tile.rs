@@ -13,8 +13,8 @@
 //! ([`TileDecoder::tokens_and_reconstruct`], spec §6.4.24-6.4.26) -> inverse quantization,
 //! inverse transform, and reconstruction (spec §8.6.2), writing the result into the frame
 //! buffers in [`TileDecoder::planes`].
-//! The loop filter (spec §8.8) is planned for M2b and is not yet applied (blocking artifacts
-//! may remain).
+//! The loop filter (spec §8.8) is applied separately, via [`TileDecoder::apply_loop_filter`],
+//! after all tiles in the frame have been decoded.
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
 use crate::compressed_header::{CompressedHeader, CompressedHeaderProbs};
@@ -2260,11 +2260,11 @@ struct NeighborRefInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bool_coder::test_support::BoolEncoder;
     use crate::header::{
         ColorConfig, FrameType, LoopFilterParams, NewFrameHeader, QuantizationParams,
     };
     use crate::prob_tables::{BLOCK_4X4, BLOCK_64X64 as B64, ONLY_4X4};
+    use crate::test_support::BoolEncoder;
 
     /// A disabled `SegmentationParams` (the M2 default / most existing tests).
     fn no_segmentation() -> crate::header::SegmentationParams {

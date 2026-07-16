@@ -5,3 +5,6 @@ version = 4
 [[package]]
 name = "vp9dec"
 version = "0.1.0"
+dependencies = [
+ "vp9dec",
+]

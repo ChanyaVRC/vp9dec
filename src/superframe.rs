@@ -10,9 +10,9 @@
 //! frame's byte size (least-significant byte first), and the chunk's payload up to the index
 //! is exactly the concatenation of that many consecutive VP9 frames, in decode order.
 //!
-//! A container reader (e.g. [`crate::ivf::IvfReader`]) hands back one chunk at a time; callers
-//! must run each chunk through [`split_superframe`] before feeding the result to
-//! [`crate::Decoder::decode_frame`], which itself decodes exactly one VP9 frame.
+//! A container reader (e.g. [`crate::ivf::IvfReader`]) hands back one chunk at a time;
+//! [`crate::Decoder::decode_frame`] takes such a chunk directly and runs it through
+//! [`split_superframe`] internally, decoding each contained VP9 frame in turn.
 
 /// Splits one container chunk into the VP9 frame(s) it contains, in decode order.
 ///

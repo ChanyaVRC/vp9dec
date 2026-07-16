@@ -139,13 +139,14 @@ fn check_vector(relative_path: &str) {
     );
 
     // Attempt decode_tiles on the tile data (from right after the compressed header to the
-    // end of the frame data). This isn't guaranteed to succeed since token decoding isn't
-    // implemented, but we confirm it doesn't panic (either Ok or Err is fine).
+    // end of the frame data). As noted in the module doc, this test only confirms the call
+    // doesn't panic (either Ok or Err is fine); full pixel/statistical correctness is checked
+    // elsewhere.
     let tile_data = &first_frame.data[compressed_end..];
     let mut tile_decoder = TileDecoder::new(&header, &compressed);
     match tile_decoder.decode_tiles(tile_data) {
         Ok(()) => eprintln!("[ok] {}: decode_tiles completed fully", path.display()),
-        Err(e) => eprintln!("[info] {}: decode_tiles stopped with {e:?} (expected until token decoding is implemented)", path.display()),
+        Err(e) => eprintln!("[info] {}: decode_tiles stopped with {e:?}", path.display()),
     }
 }
 

@@ -4,5 +4,19 @@ version = "0.1.0"
 edition = "2021"
 description = "Fully from-scratch VP9 decoder (zero dependencies, built for future integration into Noiria)"
 license = "MIT"
+publish = false
 
 [dependencies]
+
+[dev-dependencies]
+vp9dec = { path = ".", features = ["test-support"] }
+
+[features]
+test-support = []
+
+[[example]]
+name = "decode_to_png"
+test = true
+
+[[example]]
+name = "webm_to_ivf"
