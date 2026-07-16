@@ -1,0 +1,9 @@
+# Manifest for scripts/fetch-vectors.sh / scripts/fetch-vectors.ps1.
+# One "<name> <kind>" pair per line; kind is "ivf" (vector ships as .ivf upstream) or "webm"
+# (vector ships only as .webm upstream, and gets remuxed to .ivf via examples/webm_to_ivf.rs).
+# Blank lines and lines starting with # are ignored.
+vp90-2-12-droppable_1 ivf
+vp90-2-09-subpixel-00 ivf
+vp90-2-15-segkey webm
+vp90-2-15-segkey_adpq webm
+vp90-2-16-intra-only webm

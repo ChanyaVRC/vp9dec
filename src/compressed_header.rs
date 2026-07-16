@@ -150,7 +150,7 @@ pub type FrameContext = CompressedHeaderProbs;
 /// frames, and then (under conditions such as `frame_type == KEY_FRAME`) calls
 /// `save_probs(i)` for all 4 slots. For non-key frames, `load_probs` is
 /// performed from the slot pointed to by `frame_context_idx` (the
-/// `starting_probs` argument of `parse_compressed_header_ex` in this decoder),
+/// `starting_probs` argument of `parse_compressed_header` in this decoder),
 /// and if `refresh_frame_context == 1`, the result is written back to the same
 /// slot via `save_probs`.
 ///

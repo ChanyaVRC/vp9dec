@@ -3,6 +3,34 @@
 Records spec-external judgment calls, tradeoffs, and known gaps that aren't obvious
 from reading the code/comments alone. Update this file as such decisions are made.
 
+## Current state index
+
+Quick pointers from topic to the entry reflecting *current* behavior -- earlier entries on
+the same topic may describe a since-fixed bug; read forward from here, not top-to-bottom.
+
+- **Segmentation** (seg-id decode, all 4 `SEG_LVL_*` features): "Full segmentation support"
+  (2026-07-12); coverage detail in "Conformance coverage" (2026-07-13) and "Synthetic
+  round-trip coverage for SEG_LVL_ALT_L / SEG_LVL_REF_FRAME / SEG_LVL_SKIP" (2026-07-14).
+- **Frame-context reset** (`reset_frame_context` handling): "Frame-context store over-reset
+  for intra_only frames" (fixed 2026-07-12).
+- **Superframe splitting**: "missing VP9 superframe splitting" (2026-07-13), superseded by
+  "Superframe splitting moved into the public `decode_frame` API" (2026-07-14) -- the latter
+  is the current public API contract.
+- **Coefficient EOB-branch counting**: "Coefficient EOB-branch over-counting corrupts
+  adapted coef context" (fixed 2026-07-14).
+- **Synthetic round-trip + external cross-decode harness**: "Synthetic round-trip coverage
+  for SEG_LVL_ALT_L / SEG_LVL_REF_FRAME / SEG_LVL_SKIP" (2026-07-14).
+- **WebM remux tooling**: "WebM remux for official segmentation/intra-only vectors"
+  (2026-07-13, pure-std since 2026-07-14).
+- **Design-debt redesign** (current architecture -- see README.md's "Current architecture"
+  section for the end state): "Wave 1" through "Wave 6" below, in date order; "Design-debt
+  redesign: closing summary" at the very end ties all six together.
+
+Append-only from here on: when a later fix or discovery corrects a claim an earlier entry
+made, add a new dated entry describing the correction and cross-link the entry it
+supersedes (as this index and several entries below already do) -- do not edit old entries
+in place, even to fix a claim now known to be wrong.
+
 ## Full segmentation support (2026-07-12)
 
 ### Scope
@@ -1688,3 +1716,162 @@ multi-line wrapping) -- `tile.rs` itself (pre-existing, not new) was never run t
 (125 lines); new `common.rs` (25) / `subpel.rs` (98) / `mv_ref_tables.rs` (151); `quant.rs`,
 `predict.rs`, `loop_filter.rs`, `header.rs`, `compressed_header.rs`, `bool_coder.rs`, `lib.rs`
 (mod decls) all touched as described above; no changes to any file under `tests/`.
+
+## Wave 6: docs + tooling (2026-07-16)
+
+### Scope
+
+Final wave of the design-debt plan: brought README.md, this notes file, and the vector-fetch
+tooling in line with the architecture Waves 1-5 actually produced (public API shape, module
+layout, test-file names), none of which README.md had caught up to (it still described
+`decode_keyframe()`, the pre-Wave-2b `decode_frame` signature, and the pre-Wave-3 test files).
+No behavior change: docs and shell/PowerShell scripts only.
+
+### README.md restructure
+
+Replaced the M1 -> M3-second-half changelog narrative with five present-tense sections:
+Purpose (updated: `test-support` is currently the *only* dev-dependency, spelled out by name
+rather than left as a hypothetical "may use dev-dependencies where useful"); Current
+architecture (the public API surface -- `Decoder`/`DecodedFrame`/`Frame`/`FrameDecodeInfo`/
+`DecodeError`/`ivf` -- and a module map grouped by pipeline stage, one paragraph per stage,
+written from the current module docs and `pub`/`#[doc(hidden)]` structure rather than
+transcribed from memory of the old text); a Status/limitations table split into "proven
+against an external oracle" vs. "known limits" (the reference-scaling caveat and the 8-bit
+limit are now a table, not prose buried in a milestone section); Tests & verification (what
+`cargo test` actually runs across its 6 binaries, per-file coverage, and the ffmpeg/
+`VP9DEC_DUMP_DIR` invocation forms in both bash and PowerShell); and a two-line History
+section pointing at the two files below instead of holding the narrative itself.
+
+Every concrete number in the new README (147 tests across 6 binaries with the per-binary
+breakdown 119/6/12/6/4/0, the 5 conformance vectors' exact frame counts, the 8 `[xdecode]`
+lines from the ffmpeg cross-decode, the `[ok]`/`[coverage]` lines) was reproduced by actually
+running `cargo test`, `cargo test --test conformance_test -- --nocapture`, and
+`VP9DEC_FFMPEG=... cargo test --test synthetic_seg_test
+synthetic_streams_cross_decode_against_ffmpeg -- --nocapture` in this session rather than
+copied from an earlier wave's notes entry (those numbers can drift wave to wave, so this
+wave's own re-observation is what backs the README claims, not an assumption of continuity).
+
+### docs/history.md (new)
+
+Moved the M1/M2/M2b/M3-first-half/M3-second-half narrative sections out of README.md
+verbatim (light copy-editing only for flow, e.g. tense fixes now that they're explicitly
+framed as historical), preserving the original prose including judgment calls and the
+debugging-trail section. Added bracketed `[...]` pointers at the specific paragraphs whose
+claims were later superseded (the `decode_keyframe()`/`Decoder::decode_frame()` signatures
+across three different shapes, `src/mv.rs`'s later absorption into `tile/mv_pred.rs`,
+`src/md5.rs`'s relocation to `tests/common/md5.rs`, the `more_coefs` counting bug, the
+`SUBPEL_FILTERS` move to `subpel.rs`, and the MV-ref-tables move to `mv_ref_tables.rs`) —
+per the task's instruction, these are pointers to the correcting notes entry, not rewrites of
+the historical text itself. Also moved the PNG-dump usage notes and the original
+`curl`/`Invoke-WebRequest` vector-download commands out of README (both superseded by
+`scripts/fetch-vectors.{sh,ps1}` below), keeping them as a "how it used to be done" appendix.
+
+### scripts/fetch-vectors.sh + scripts/fetch-vectors.ps1 + scripts/vectors.txt (new)
+
+Manifest-driven (`scripts/vectors.txt`: `<name> <kind>` per line, `kind` = `ivf`|`webm`,
+currently the same 5 vectors `tests/conformance_test.rs`/`tests/synthetic_seg_test.rs`
+already reference: `vp90-2-12-droppable_1`/`vp90-2-09-subpixel-00` as `ivf`,
+`vp90-2-15-segkey`/`vp90-2-15-segkey_adpq`/`vp90-2-16-intra-only` as `webm`). Both scripts
+download `<name>.<ext>` + `<name>.<ext>.md5` from
+`storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/` into `tests/vectors/`,
+skipping any file already present; for `webm` entries, additionally remux via `cargo run
+--example webm_to_ivf -- tests/vectors/<name>.webm tests/vectors/<name>.ivf` (skipped if the
+`.ivf` already exists) and copy `<name>.webm.md5` to `<name>.ivf.md5` (skipped likewise). The
+`.sh` uses `curl -fSL` under `set -euo pipefail` (an HTTP error or `webm_to_ivf` non-zero
+exit aborts the script immediately, satisfying "fail loudly"); the `.ps1` uses
+`Invoke-WebRequest` under `$ErrorActionPreference = "Stop"` plus an explicit `$LASTEXITCODE`
+check after the `cargo run` call (`Invoke-WebRequest` itself already throws a terminating
+`WebException` on a non-2xx response).
+
+Verified against the real (non-empty) `tests/vectors/` in this repo, without deleting
+anything: both scripts printed 16 `[skip] ... already present` lines (2 files each for the
+2 `ivf`-kind entries + 4 files each for the 3 `webm`-kind entries = 16) and exited 0 —
+`bash scripts/fetch-vectors.sh` and `pwsh -File scripts/fetch-vectors.ps1` (`pwsh` 7 is
+present on this machine) both confirmed. The download path itself (not just the skip
+branch) was additionally verified for real, outside the scripts: `curl -fSL` against
+`.../vp90-2-09-subpixel-00.ivf.md5` (the same URL pattern the scripts build) into a scratch
+directory succeeded and returned the expected `md5sum`-format content, without touching
+`tests/vectors/`. A full from-empty run of either script (which would additionally exercise
+the `webm_to_ivf` remux branch) was not performed, since that requires deleting the existing
+`.ivf`/`.ivf.md5` files the conformance suite depends on — out of scope per the task's "do
+NOT delete vectors to test the download path" constraint. The remux branch's underlying
+command (`cargo run --example webm_to_ivf -- <in> <out>`) is unchanged from what
+`examples/webm_to_ivf.rs` already does and is already covered by that example's own history
+(see docs/history.md and the "WebM remux" notes entry above) — this wave only wraps it in a
+skip-if-present shell/PowerShell loop, so re-deriving fresh confidence in `webm_to_ivf.rs`
+itself was judged unnecessary.
+
+### One permitted src/ comment fix
+
+`src/compressed_header.rs`'s `FrameContextStore` doc comment referenced
+`parse_compressed_header_ex` — a name deleted in Wave 2a when `parse_compressed_header`/`_ex`
+were collapsed into one 3-argument `parse_compressed_header` (see that wave's entry above).
+Reworded the one line to say `parse_compressed_header` (confirmed via `grep` that
+`starting_probs` is still the correct parameter name on the current function signature). No
+other line in that comment, or anywhere else in `src/`, needed changing — grepped the whole
+of `src/` for `decode_keyframe`/`last_frame_info`/`SegQIndexOverride`/
+`parse_compressed_header_ex`/`src/mv.rs`/`src/md5.rs` first; the only other hits
+(`src/quant.rs`'s `SegQIndexOverride` mention, `src/tile.rs`'s and
+`src/tile/mv_pred.rs`'s `src/mv.rs` mentions) already correctly describe those as no-longer-
+existing (past tense / "former standalone"), so were left alone.
+
+### Consistency sweep
+
+Grepped README.md (before this wave's rewrite) for the deleted/renamed names the task
+listed; after the rewrite, every one of those strings appears only inside
+`docs/history.md` (the historical record, where they're expected) or not at all in
+README.md itself. See the parent task's report for the exact before/after counts.
+
+### Verification
+
+`cargo test`: 147 passed, 0 failed, across the same 6 binaries as the Wave 5 baseline (119
+lib unit + 6 `api_test` + 12 `conformance_test` + 6 `synthetic_seg_test` + 4
+`decode_to_png` example + 0 doc-tests) — unchanged, confirming this wave touched no
+decode-affecting code (the one `src/` edit is a comment-only line). Conformance
+(`cargo test --test conformance_test -- --nocapture`): all 5 vectors' `[ok]` lines
+unchanged (`vp90-2-12-droppable_1` 99/99, `vp90-2-09-subpixel-00` 20/20,
+`vp90-2-15-segkey` 1/1, `vp90-2-15-segkey_adpq` 150/150, `vp90-2-16-intra-only` 7/7).
+`VP9DEC_FFMPEG="<path-to-ffmpeg>" cargo test
+--test synthetic_seg_test synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`:
+8/8 `[xdecode] ... OK` lines (4 synthetic scenarios x {libvpx-vp9, vp9}), unchanged.
+`git diff --stat`: `README.md` (rewritten), `docs/history.md` (new), `docs/
+implementation-notes.md` (this section + the Current state index), `scripts/vectors.txt` /
+`scripts/fetch-vectors.sh` / `scripts/fetch-vectors.ps1` (new), and the single-line
+`src/compressed_header.rs` comment fix — nothing else in `src/` or `tests/`.
+
+## Design-debt redesign: closing summary (2026-07-16)
+
+The redesign that began with hardening fixes discovered while chasing conformance (full
+segmentation support, the `intra_only` frame-context-reset bug, the conformance-coverage
+instrumentation, the synthetic round-trip + ffmpeg cross-decode harness for the three
+`SEG_LVL_*` features with no official vector, the superframe-splitting fix, and the
+coefficient EOB-branch counting fix — the dated entries from 2026-07-12 through 2026-07-14
+above) continued into six explicitly-labeled "design-debt waves" addressing structural debt
+that had accumulated across the milestone-driven M1-M3 development: Wave 1 (stale comments,
+dead constants, shared `test_support`/`write_ivf` infra), Wave 2a (internal signature
+redesign — `PersistentState`, honest `Option<ColorConfig>`), Wave 2b (public API redesign —
+`decode_frame` -> `Vec<DecodedFrame>`, `decode_keyframe`/`last_frame_info` deleted,
+`#[doc(hidden)]` narrowing), Wave 3 (test-layer consolidation — 6 integration test files
+down to 3 plus `tests/common/`), Wave 4a (`Arc`-sharing to eliminate per-frame deep clones),
+Wave 4b (hot-path allocations removed, per-frame dequant table), Wave 5 (module boundary
+refactor — `tile.rs` split into `tile/{mode_info,ref_ctx,mv_pred,residual}.rs`, `common.rs`/
+`subpel.rs`/`mv_ref_tables.rs` extracted, `mv.rs`/`SegQIndexOverride` dissolved), and this
+Wave 6 (docs + tooling).
+
+Commits (oldest first; Wave 6 is docs/tooling-only and, per this wave's task constraints,
+was not committed as part of this work): `dd5f875` (W1), `47db20d` (W2a), `a848a00` (W2b),
+`22fc88e` (W3), `a6b8c87` (W4a), `928b605` (W4b), `5c5054d` (W5).
+
+End state, observed in this session: `cargo test` passes 147/147 across 6 binaries; 5
+official libvpx conformance vectors are bit-exact against their `.ivf.md5` on every
+displayed frame (`vp90-2-12-droppable_1` 99/99, `vp90-2-09-subpixel-00` 20/20,
+`vp90-2-15-segkey` 1/1, `vp90-2-15-segkey_adpq` 150/150, `vp90-2-16-intra-only` 7/7,
+including segmentation's `SEG_LVL_ALT_Q` and `intra_only`/`reset_frame_context`/superframe
+splitting); and the three `SEG_LVL_*` features with no official vector
+(`SEG_LVL_ALT_L`/`SEG_LVL_REF_FRAME`/`SEG_LVL_SKIP`) are confirmed byte-identical against
+two independent third-party VP9 decoders (ffmpeg's `libvpx-vp9` and its native `vp9`) — 8
+`[xdecode]` checks (4 synthetic scenarios x 2 decoders), an 8-way cross-decode. `src/`
+itself carries zero external dependencies throughout; the one dev-dependency
+(`test-support`, a self-reference) never affects a plain `cargo build`. M4 (the full
+official libvpx vector sweep beyond these 5) remains open — see README.md's Status/
+limitations table and `scripts/fetch-vectors.{sh,ps1}` for extending vector coverage.
