@@ -52,6 +52,8 @@ pub mod tile;
 #[doc(hidden)]
 pub mod transform;
 
+use std::sync::Arc;
+
 use compressed_header::{
     parse_compressed_header, CompressedHeaderError, FrameContext, FrameContextStore,
 };
@@ -234,7 +236,9 @@ pub struct Decoder {
     prev_frame_dims: Option<(u32, u32)>,
     prev_show_frame: Option<bool>,
     /// The previous frame's `Mvs`/`RefFrames` (equivalent to `PrevMvs`/`PrevRefFrames`).
-    prev_mi_grid: Option<MiGrid>,
+    /// `Arc`-wrapped so handing a read-only copy to next frame's `TileDecoder` (when
+    /// `UsePrevFrameMvs`) is a refcount bump rather than a deep clone.
+    prev_mi_grid: Option<Arc<MiGrid>>,
     /// Inter frames and intra-only frames (`Profile == 0`) don't resend
     /// `color_config` in the bitstream, so the value is carried over from the
     /// most recent keyframe/intra-only frame (spec §7.2: it's a conformance
@@ -245,8 +249,10 @@ pub struct Decoder {
     /// `PrevSegmentIds` (spec §6.4.14), row-major `MiRows x MiCols` (unpadded).
     /// Cleared to all-zero on the first frame and whenever the frame size changes
     /// (spec §7.2.6), updated after decoding only when
-    /// `segmentation_enabled && segmentation_update_map` (spec §8.1 step 3).
-    prev_segment_ids: Vec<u8>,
+    /// `segmentation_enabled && segmentation_update_map` (spec §8.1 step 3). `Arc`-wrapped
+    /// so the per-frame clone-in to `TileDecoder` (unconditional, unlike `prev_mi_grid`) is
+    /// a refcount bump rather than a deep clone.
+    prev_segment_ids: Arc<Vec<u8>>,
     /// `LastFrameType` (spec §7.2). Not updated on `show_existing_frame` frames.
     last_frame_type: Option<FrameType>,
 }
@@ -267,7 +273,7 @@ impl Decoder {
             prev_mi_grid: None,
             last_color_config: None,
             dpb: Dpb::new(),
-            prev_segment_ids: Vec::new(),
+            prev_segment_ids: Arc::new(Vec::new()),
             last_frame_type: None,
         }
     }
@@ -286,7 +292,8 @@ impl Decoder {
         setup_past_independence: bool,
     ) {
         if setup_past_independence || self.prev_frame_dims != Some(dims) {
-            self.prev_segment_ids = vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize];
+            self.prev_segment_ids =
+                Arc::new(vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize]);
         }
     }
 
@@ -411,10 +418,11 @@ impl Decoder {
 
         // Resolve the pixel data of the DPB slots this frame references, for motion
         // compensation (spec §8.5.2.3-8.5.2.4). Not referenced when `FrameIsIntra == 1`.
-        let resolved_refs: [Option<RefFrameData>; 3] = if header.frame_is_intra {
+        // `get_arc` is a refcount bump, not a deep copy of the referenced frame's pixels.
+        let resolved_refs: [Option<Arc<RefFrameData>>; 3] = if header.frame_is_intra {
             [None, None, None]
         } else {
-            std::array::from_fn(|i| self.dpb.get(header.ref_frame_idx[i]).cloned())
+            std::array::from_fn(|i| self.dpb.get_arc(header.ref_frame_idx[i]))
         };
 
         let tile_data = &frame_data[compressed_end..];
@@ -447,15 +455,19 @@ impl Decoder {
                         grid.get(row, col).segment_id;
                 }
             }
-            self.prev_segment_ids = new_map;
+            self.prev_segment_ids = Arc::new(new_map);
         }
 
         // refresh_probs() (spec §6.1.2).
         let final_probs = if !header.error_resilient_mode && !header.frame_parallel_decoding_mode {
             // load_probs( frame_context_idx ): restore all tables except tx_probs/skip_prob
             // to their pre-forward-update value (starting_probs). tx_probs/skip_prob are
-            // left at their post-forward-update value from compressed_header().
-            let mut working = starting_probs.clone();
+            // left at their post-forward-update value from compressed_header(). The two
+            // fields are copied aside (24B + 3B) before moving starting_probs into working,
+            // rather than cloning the whole multi-KB struct just to overwrite most of it.
+            let pre_update_tx_probs = starting_probs.tx_probs;
+            let pre_update_skip_prob = starting_probs.skip_prob;
+            let mut working = starting_probs;
             working.tx_probs = compressed.probs.tx_probs;
             working.skip_prob = compressed.probs.skip_prob;
 
@@ -473,8 +485,8 @@ impl Decoder {
             if !header.frame_is_intra {
                 // load_probs2( frame_context_idx ): also restore tx_probs/skip_prob to
                 // their pre-forward-update value before applying adapt_noncoef_probs.
-                working.tx_probs = starting_probs.tx_probs;
-                working.skip_prob = starting_probs.skip_prob;
+                working.tx_probs = pre_update_tx_probs;
+                working.skip_prob = pre_update_skip_prob;
                 adapt_noncoef_probs(
                     &mut working,
                     counts,
@@ -485,20 +497,22 @@ impl Decoder {
             }
             working
         } else {
-            compressed.probs.clone()
+            (*compressed.probs).clone()
         };
         if header.refresh_frame_context {
             self.frame_contexts
                 .save(header.frame_context_idx, final_probs);
         }
 
-        // Reference frame update process (spec §8.10).
-        let ref_data = build_ref_frame_data(
+        // Reference frame update process (spec §8.10). Arc-wrapped so `Dpb::update` shares
+        // this frame's pixel data across every refreshed slot instead of deep-cloning it
+        // per slot (up to 8x on a keyframe).
+        let ref_data = Arc::new(build_ref_frame_data(
             tile_decoder.planes(),
             header.width,
             header.height,
             &color_config,
-        );
+        ));
         self.dpb.update(header.refresh_frame_flags, &ref_data);
         for (slot, size) in self.persist.ref_frame_sizes.iter_mut().enumerate() {
             if (header.refresh_frame_flags >> slot) & 1 == 1 {
@@ -510,7 +524,6 @@ impl Decoder {
         // reach here it has always been called (spec §7.2.6). Recorded for UsePrevFrameMvs.
         self.prev_frame_dims = Some((header.width, header.height));
         self.prev_show_frame = Some(header.show_frame);
-        self.prev_mi_grid = Some(tile_decoder.mi_grid().clone());
         self.persist.loop_filter_deltas = LoopFilterDeltas {
             ref_deltas: header.loop_filter.ref_deltas,
             mode_deltas: header.loop_filter.mode_deltas,
@@ -546,6 +559,9 @@ impl Decoder {
         } else {
             None
         };
+        // Last use of tile_decoder: hand back its finished MiGrid by value (no clone-out)
+        // now that every other accessor (planes(), counts(), mi_grid() above) has run.
+        self.prev_mi_grid = Some(Arc::new(tile_decoder.into_mi_grid()));
         Ok(DecodedFrame {
             info: Some(info),
             frame,
@@ -654,20 +670,20 @@ mod tests {
         let seeded = || {
             let mut d = Decoder::new();
             d.prev_frame_dims = Some(dims);
-            d.prev_segment_ids = vec![5u8; 4];
+            d.prev_segment_ids = Arc::new(vec![5u8; 4]);
             d
         };
 
         // Same size, no setup_past_independence: the map is retained.
         let mut d = seeded();
         d.clear_prev_segment_ids_if_needed(dims, &image_size, false);
-        assert_eq!(d.prev_segment_ids, vec![5u8; 4]);
+        assert_eq!(*d.prev_segment_ids, vec![5u8; 4]);
 
         // setup_past_independence (FrameIsIntra || error_resilient_mode): zeroed even
         // though the size is unchanged.
         let mut d = seeded();
         d.clear_prev_segment_ids_if_needed(dims, &image_size, true);
-        assert_eq!(d.prev_segment_ids, vec![0u8; 4]);
+        assert_eq!(*d.prev_segment_ids, vec![0u8; 4]);
 
         // Size change (compute_image_size step 1): zeroed (and resized) even without
         // setup_past_independence.
@@ -675,13 +691,13 @@ mod tests {
         let new_dims = (24u32, 16u32); // MiCols = 3, MiRows = 2 -> 6 entries.
         let new_image_size = header::compute_image_size(new_dims.0, new_dims.1);
         d.clear_prev_segment_ids_if_needed(new_dims, &new_image_size, false);
-        assert_eq!(d.prev_segment_ids, vec![0u8; 6]);
+        assert_eq!(*d.prev_segment_ids, vec![0u8; 6]);
 
         // First invocation (prev_frame_dims == None): zeroed.
         let mut d = Decoder::new();
-        d.prev_segment_ids = vec![5u8; 4];
+        d.prev_segment_ids = Arc::new(vec![5u8; 4]);
         d.clear_prev_segment_ids_if_needed(dims, &image_size, false);
-        assert_eq!(d.prev_segment_ids, vec![0u8; 4]);
+        assert_eq!(*d.prev_segment_ids, vec![0u8; 4]);
     }
 
     /// A `FrameContext` distinguishable from `FrameContext::default()`, standing in for a
@@ -790,5 +806,63 @@ mod tests {
             info.reset_frame_context, 0,
             "reset_frame_context is only read for non-key, non-error-resilient frames"
         );
+    }
+
+    /// Regression test for the Wave 4a `prev_mi_grid`/`prev_segment_ids` sharing change: if a
+    /// frame's tile decode errors partway through, `decode_one_frame` returns early (via `?`)
+    /// *before* `prev_frame_dims`/`prev_show_frame`/`prev_mi_grid` are updated, so they're left
+    /// describing the last *successful* frame. A subsequent frame must still decode cleanly
+    /// off of that carried-over state instead of panicking (e.g. at the `prev_mi_grid must be
+    /// Some` expect in `TileDecoder::get_block_mv`, which a naive `Option::take()`-based
+    /// implementation could hit if the take isn't undone on the error path).
+    #[test]
+    fn decode_recovers_after_a_mid_frame_tile_error() {
+        use crate::bool_coder::BoolCoderError;
+
+        let ivf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("vectors")
+            .join("vp90-2-12-droppable_1.ivf");
+        let ivf_bytes = match std::fs::read(&ivf_path) {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!(
+                    "[skip] test vector not found, skipping: {}",
+                    ivf_path.display()
+                );
+                return;
+            }
+        };
+
+        let reader = ivf::IvfReader::new(&ivf_bytes).expect("failed to parse IVF header");
+        let frames: Vec<Vec<u8>> = reader
+            .take(3)
+            .map(|f| f.expect("failed to read IVF frame").data.to_vec())
+            .collect();
+        assert_eq!(
+            frames.len(),
+            3,
+            "test vector must have at least 3 frames for this test"
+        );
+
+        let mut decoder = Decoder::new();
+        decoder
+            .decode_frame(&frames[0])
+            .expect("first (key) frame must decode cleanly");
+
+        // Truncate the second frame to 29 bytes: long enough for the uncompressed +
+        // compressed headers to parse, but too short for decode_tiles, which fails with
+        // Tile(BoolCoder(EmptyBuffer)) (verified empirically against this vector's frame 1).
+        let truncated = &frames[1][..29];
+        let err = decoder
+            .decode_frame(truncated)
+            .expect_err("truncated tile data must be rejected, not silently accepted");
+        assert_eq!(err, DecodeError::Tile(TileError::BoolCoder(BoolCoderError::EmptyBuffer)));
+
+        // The regression check itself: a further valid frame must decode without panicking,
+        // even though the previous frame errored out mid-decode.
+        decoder
+            .decode_frame(&frames[2])
+            .expect("decode must recover after a mid-frame error on the previous frame");
     }
 }

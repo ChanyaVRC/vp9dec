@@ -1151,3 +1151,139 @@ file: only `tests/api_test.rs` needed reformatting (a line over 100 columns prod
 merge), applied; `tests/common/{mod,md5,encoder}.rs`, `tests/conformance_test.rs`, and
 `tests/synthetic_seg_test.rs` were already clean. `src/lib.rs`'s 2-line mod-declaration removal
 was not run through rustfmt (per the standing constraint) and needed no reformatting regardless.
+
+## Wave 4a: performance -- eliminate per-frame deep-clone traffic (2026-07-16)
+
+### Scope
+
+Removed the per-frame deep-clone traffic identified by the architecture review: DPB slot
+writes (up to 8x per keyframe), per-frame reference resolution, the `MiGrid`/`PrevSegmentIds`
+clone-in/clone-out, and the `CompressedHeaderProbs` clone into every `TileDecoder`. Bit-exact
+output was the hard constraint throughout -- every change is a sharing-strategy change
+(`Arc`), never a logic change.
+
+### 1. `Dpb` slots -> `Arc<RefFrameData>` (`src/dpb.rs`, `src/lib.rs`, `src/tile.rs`)
+
+`Dpb::slots` is now `[Option<Arc<RefFrameData>>; NUM_REF_FRAMES]`. `Dpb::get` (used only by
+the `show_existing_frame` path) keeps its `Option<&RefFrameData>` signature via `as_deref()`,
+so that one call site is untouched. A new `Dpb::get_arc(idx) -> Option<Arc<RefFrameData>>`
+(a refcount bump, `.clone()` on the `Option<Arc<_>>` slot) serves `Decoder::decode_one_frame`'s
+`resolved_refs` resolution, replacing `self.dpb.get(idx).cloned()`. `Dpb::update` now takes
+`data: &Arc<RefFrameData>` and stores `data.clone()` (Arc clone) per set bit in
+`refresh_frame_flags`, instead of a full `RefFrameData::clone()` per bit; the caller builds the
+frame's pixel data once (`Arc::new(build_ref_frame_data(...))`) regardless of how many slots get
+refreshed. `TileDecoder::resolved_refs` became `[Option<Arc<RefFrameData>>; 3]`; its one read
+site (building `RefPlaneView`s for `predict_inter`) switched `.as_ref()` to `.as_deref()` to keep
+producing `Option<&RefFrameData>`. `RefFrameData`'s `Clone` derive was dropped (nothing clones
+the struct itself anymore -- only the `Arc` around it), keeping `Debug`.
+
+### 2. `prev_mi_grid` / `prev_segment_ids`: stop the clone-in/clone-out (`src/lib.rs`, `src/tile.rs`)
+
+Chose approach (a) from the task (Arc-shared, not restore-on-error): `Decoder::prev_mi_grid`
+is `Option<Arc<MiGrid>>`; the clone-in (`self.prev_mi_grid.clone()` when `use_prev_frame_mvs`)
+is now an `Arc` clone. `TileDecoder::prev_mi_grid` became `Option<Arc<MiGrid>>` -- its only use
+(`get_block_mv`, spec's `usePrev` branch) is a read through `.get(row, col)`, unaffected by the
+extra indirection; verified by inspection (and by the two-argument search across the file) that
+nothing else touches `prev_mi_grid`, so no mutation-through-`Arc` hazard exists. `MiGrid`'s
+`Clone` derive was dropped (it was only ever cloned at the two sites removed here) in favor of
+just `Debug`.
+
+The clone-out (`self.prev_mi_grid = Some(tile_decoder.mi_grid().clone())`) is eliminated via a
+new consuming `TileDecoder::into_mi_grid(self) -> MiGrid` (moves `self.mi_grid` out, no copy).
+This must be the *last* thing done with `tile_decoder`, so the call was relocated from
+immediately after `decode_tiles`/`apply_loop_filter` to the very end of `decode_one_frame`,
+after the final `tile_decoder.planes()` call inside the `show_frame` branch (the only other
+remaining use of `tile_decoder` past that point). `mi_grid()` (the borrowing accessor) is
+unchanged and still serves the earlier `PrevSegmentIds`-refresh read.
+
+Per the task's explicit landmine warning, `Option::take()` was not used anywhere: the read side
+is a `clone()` (cheap now, but still non-destructional), so `self.prev_mi_grid` is left exactly
+as-is if `decode_tiles` errors out via `?` before the function reaches the write side -- there
+is no window where it's transiently `None`/stale relative to `prev_frame_dims`/`prev_show_frame`.
+See the new regression test below.
+
+`Decoder::prev_segment_ids` / `TileDecoder::prev_segment_ids` got the same treatment
+(`Arc<Vec<u8>>`): unlike `prev_mi_grid` this clone-in is unconditional every frame (not gated by
+a `use_prev_*` flag), and `TileDecoder` has exactly one read site (`get_segment_id`'s
+`prev_segment_ids[idx]`, indexing through the `Arc` via auto-deref), so it was cheap to include
+and cuts a ~`MiRows*MiCols`-byte clone every single frame regardless of segmentation being
+in use. The write side already built a fresh `Vec` (never cloned an existing one), so this is
+just a wrapping change (`Arc::new(new_map)` / `Arc::new(vec![0u8; ...])`), no restructuring.
+
+### 3. `CompressedHeaderProbs` clone reduction (`src/compressed_header.rs`, `src/lib.rs`, `src/tile.rs`)
+
+`CompressedHeader::probs` is now `Arc<CompressedHeaderProbs>` (wrapped once, at the end of
+`parse_compressed_header`). `TileDecoder::probs` followed suit (`Arc<CompressedHeaderProbs>`);
+its constructor line (`probs: compressed.probs.clone()`) is textually unchanged but now an Arc
+clone instead of a multi-KB deep clone (confirmed by inspection: zero write sites to
+`self.probs` anywhere in `tile.rs`, only field reads through the automatic `Deref`).
+
+Kept exactly as pre-validated:
+
+- `FrameContextStore::load` still returns an owned `CompressedHeaderProbs` (unrelated to the
+  `Arc`; the store's slots are still bare `CompressedHeaderProbs`, never `Arc`, so a later
+  frame's forward-update on its `load`ed copy can never alias/mutate a stored slot).
+- `starting_probs.clone()` fed into `parse_compressed_header` is untouched (it's forward-updated
+  by value inside that call; the original is still needed afterward by `refresh_probs`).
+- The error-resilient/frame-parallel branch of `refresh_probs` still does a full deep clone --
+  now spelled `(*compressed.probs).clone()` rather than `compressed.probs.clone()`, because the
+  latter would resolve to `Arc::clone` (an `Arc<CompressedHeaderProbs>`, wrong type for
+  `FrameContextStore::save`, which stores owned contexts) rather than a deep copy of the probs.
+
+Eliminated: the `let mut working = starting_probs.clone();` at the top of the normal
+`refresh_probs` branch. Since `starting_probs.tx_probs`/`starting_probs.skip_prob` are read
+again later in that same branch (`load_probs2`'s restore, only under `!frame_is_intra`), those
+two fields (24B + 3B, both `Copy`) are copied aside into locals *before* `starting_probs` is
+moved (not cloned) into `working`; the later restore reads the locals instead of `starting_probs`.
+Confirmed by full-function search that `starting_probs` has no other use after this point, so
+the move is sound. This is the one genuinely "clever" mechanic in this wave -- everything else
+is a sharing-strategy swap.
+
+### Judgment calls
+
+- `prev_segment_ids` was explicitly called optional by the task ("if cheap"); did it anyway
+  since `TileDecoder` has a single read site and the write side needed no restructuring --
+  see above.
+- Named the consuming accessor `into_mi_grid` rather than a more general `into_parts()` (which
+  the task described as a style, not a mandate): `MiGrid` is the only piece of `TileDecoder`
+  state that needs move-out-without-clone treatment (`planes()`/`counts()` etc. are all still
+  read by reference before the final call), so a single-purpose method avoids speculative
+  generality for a caller that doesn't exist yet.
+
+### Verification
+
+Added `tests::decode_recovers_after_a_mid_frame_tile_error` (`src/lib.rs`): decodes a real
+key frame from `vp90-2-12-droppable_1.ivf`, then feeds the second frame truncated to 29 bytes
+(empirically the exact byte count that leaves the uncompressed+compressed headers parseable
+but starves `decode_tiles`, which fails with `Tile(BoolCoder(EmptyBuffer))` -- verified by
+bisection before hardcoding), asserts that specific error, then decodes the (untouched) third
+frame and asserts success. This is the regression coverage for the task 2 landmine: with an
+`Arc`-clone (not `take()`) implementation there is no window where `prev_mi_grid` and
+`prev_frame_dims`/`prev_show_frame` disagree, so the third frame must decode without panicking.
+
+`cargo test`: 147/147 pass (146 from Wave 3 + 1 new regression test above; no other count
+change) across all 6 binaries/targets. Conformance: all 5 vector tests print real `[ok]` lines
+against real vector paths (unchanged bit-exact output -- this wave changes ownership, not
+values). `VP9DEC_FFMPEG=... cargo test --test synthetic_seg_test
+synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`: 8/8 `[xdecode]` OK lines.
+`cargo clippy --all-targets`: the same 3 pre-existing warnings as Wave 3 (confirmed identical
+via `git stash`), no new ones. `rustfmt --check` per touched leaf file (`dpb.rs`,
+`tile.rs`, `compressed_header.rs`; `lib.rs` deliberately never run through rustfmt, hand-
+formatted instead): only one pre-existing unrelated diff remains in `tile.rs`
+(`read_ref_frames`'s over-100-column signature, confirmed present at HEAD before this wave via
+`git stash` -- left untouched per the surgical-changes rule). `git diff --stat`: exactly the
+4 expected files (`dpb.rs`, `lib.rs`, `tile.rs`, `compressed_header.rs`; `predict.rs` needed no
+changes since its `RefPlaneView<'a>` already borrows a `&'a Plane` obtained after dereferencing,
+unaffected by the `Arc` wrapping upstream).
+
+Timing (`cargo test --release --test conformance_test 2>&1 | tail -3`, this machine, clean
+`cargo clean --release -p vp9dec` before each run to force a full rebuild+run; the number
+quoted is the suite's own "finished in Xs" line, i.e. run time, not compile time): before
+2.32s, after 2.22s. Debug profile (`cargo test --test conformance_test`): before 48.42s, after
+48.32s. Both are within noise for this suite -- the 5 conformance vectors are small test clips
+(largest is 352x288), so the per-frame `MiGrid`/`RefFrameData` clones this wave removes are on
+the order of hundreds of KB - low single-digit MB each, not enough to dominate wall time
+against bool-decoding/transform/loop-filter work at these resolutions. The wave's value is
+architectural (removing clone traffic that scales with frame area, ahead of the eventual Noiria
+integration with real-world 1080p+ sources where the same clones would cost proportionally
+more), not a measured win on today's conformance suite.

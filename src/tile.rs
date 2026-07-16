@@ -16,6 +16,8 @@
 //! The loop filter (spec §8.8) is applied separately, via [`TileDecoder::apply_loop_filter`],
 //! after all tiles in the frame have been decoded.
 
+use std::sync::Arc;
+
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
 use crate::compressed_header::{CompressedHeader, CompressedHeaderProbs};
 use crate::counts::Counts;
@@ -113,7 +115,10 @@ impl Default for MiInfo {
 /// This bundles the spec's `Skips`/`TxSizes`/`MiSizes`/`YModes`/`SegmentIds`/`SubModes`
 /// arrays into a single struct. Its size is `Sb64Cols*8 x Sb64Rows*8`
 /// (allocated to also cover the portion of edge superblocks that extends past the frame).
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: the previous frame's grid is shared into the next frame's `TileDecoder` via
+/// `Arc<MiGrid>` (see [`crate::Decoder::prev_mi_grid`]) rather than deep-cloned.
+#[derive(Debug)]
 pub struct MiGrid {
     cols: usize,
     rows: usize,
@@ -158,7 +163,8 @@ fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32 {
 /// Holds per-frame state (mode info grid, above/left partition context).
 pub struct TileDecoder {
     tx_mode: u8,
-    probs: CompressedHeaderProbs,
+    /// `Arc`-shared with the `CompressedHeader` that produced it (never mutated here).
+    probs: Arc<CompressedHeaderProbs>,
     segmentation: SegmentationParams,
     mi_cols: u32,
     mi_rows: u32,
@@ -181,8 +187,9 @@ pub struct TileDecoder {
     /// `PrevSegmentIds[ MiRow ][ MiCol ]` (spec §6.4.14 `get_segment_id`), in
     /// row-major `MiRows x MiCols` layout (unpadded, unlike `mi_grid`). Supplied
     /// by the caller ([`Decoder`](crate::Decoder)), which is responsible for the
-    /// size-change-clears-to-zero rule of spec §7.2.6.
-    prev_segment_ids: Vec<u8>,
+    /// size-change-clears-to-zero rule of spec §7.2.6. `Arc`-shared with the caller's
+    /// copy (never mutated here) to avoid a clone-in every frame.
+    prev_segment_ids: Arc<Vec<u8>>,
     // Range of the tile currently being decoded.
     mi_col_start: u32,
     mi_col_end: u32,
@@ -224,8 +231,9 @@ pub struct TileDecoder {
     /// are referenced via `prev_mi_grid`.
     use_prev_frame_mvs: bool,
     /// `MiGrid` of the most recently decoded frame (equivalent to `PrevMvs`/`PrevRefFrames`).
-    /// Not referenced when `use_prev_frame_mvs == false` (may be `None`).
-    prev_mi_grid: Option<MiGrid>,
+    /// Not referenced when `use_prev_frame_mvs == false` (may be `None`). `Arc`-shared with
+    /// the caller's copy (read-only here) to avoid a clone-in every frame.
+    prev_mi_grid: Option<Arc<MiGrid>>,
 
     // --- Additional state needed for motion compensation (spec §8.5.2). ---
     /// `FrameWidth`/`FrameHeight` (actual size used for display/scaling calculations, distinct
@@ -235,8 +243,9 @@ pub struct TileDecoder {
     /// Actual pixel data of the reference frames used to decode this frame (already resolved
     /// from the DPB by the caller using `header.ref_frame_idx`). Indexed by the `ref_frame`
     /// value `LAST_FRAME..=ALTREF_FRAME` minus `LAST_FRAME`. All elements are `None` when
-    /// `FrameIsIntra == 1`.
-    resolved_refs: [Option<RefFrameData>; 3],
+    /// `FrameIsIntra == 1`. `Arc`-shared with the DPB slot(s) they were resolved from,
+    /// rather than deep-cloned per reference.
+    resolved_refs: [Option<Arc<RefFrameData>>; 3],
 
     // --- Counter collection for probability adaptation (spec §8.4, spec §9.3.4). ---
     counts: Counts,
@@ -259,7 +268,11 @@ impl TileDecoder {
         compressed: &CompressedHeader,
     ) -> Self {
         let image_size = header::compute_image_size(header.width, header.height);
-        let zero_prev_segment_ids = vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize];
+        let zero_prev_segment_ids = Arc::new(vec![
+            0u8;
+            (image_size.mi_cols * image_size.mi_rows)
+                as usize
+        ]);
         Self::new_with_prev(
             header,
             color_config,
@@ -287,9 +300,9 @@ impl TileDecoder {
         color_config: ColorConfig,
         compressed: &CompressedHeader,
         use_prev_frame_mvs: bool,
-        prev_mi_grid: Option<MiGrid>,
-        resolved_refs: [Option<RefFrameData>; 3],
-        prev_segment_ids: Vec<u8>,
+        prev_mi_grid: Option<Arc<MiGrid>>,
+        resolved_refs: [Option<Arc<RefFrameData>>; 3],
+        prev_segment_ids: Arc<Vec<u8>>,
     ) -> Self {
         assert_eq!(
             color_config.bit_depth, 8,
@@ -372,6 +385,13 @@ impl TileDecoder {
 
     pub fn mi_grid(&self) -> &MiGrid {
         &self.mi_grid
+    }
+
+    /// Consumes `self` and hands back the finished `MiGrid` by value (no clone), for the
+    /// caller to stash as next frame's `prev_mi_grid`. Must be the last thing done with this
+    /// `TileDecoder` -- call any other accessor (`planes()`, `counts()`, etc.) first.
+    pub fn into_mi_grid(self) -> MiGrid {
+        self.mi_grid
     }
 
     /// Returns a reference to the decoded plane buffers (`CurrFrame`).
@@ -685,12 +705,12 @@ impl TileDecoder {
                 // `predict_inter()` (spec §8.5.2): motion compensation / sub-pixel interpolation.
                 let refs: [Option<&RefFrameData>; 2] = [
                     if info.ref_frame[0] > INTRA_FRAME {
-                        self.resolved_refs[(info.ref_frame[0] - LAST_FRAME) as usize].as_ref()
+                        self.resolved_refs[(info.ref_frame[0] - LAST_FRAME) as usize].as_deref()
                     } else {
                         None
                     },
                     if info.ref_frame[1] > INTRA_FRAME {
-                        self.resolved_refs[(info.ref_frame[1] - LAST_FRAME) as usize].as_ref()
+                        self.resolved_refs[(info.ref_frame[1] - LAST_FRAME) as usize].as_deref()
                     } else {
                         None
                     },
@@ -2343,7 +2363,7 @@ mod tests {
     fn default_compressed_header() -> CompressedHeader {
         CompressedHeader {
             tx_mode: ONLY_4X4,
-            probs: CompressedHeaderProbs::default(),
+            probs: Arc::new(CompressedHeaderProbs::default()),
             reference_mode: SINGLE_REFERENCE,
             comp_fixed_ref: 0,
             comp_var_ref: [0, 0],
@@ -2511,7 +2531,7 @@ mod tests {
             false,
             None,
             [None, None, None],
-            prev_segment_ids,
+            Arc::new(prev_segment_ids),
         );
         // BLOCK_32X32 at (0,0) covers the whole 4x4 region -> min is 1.
         assert_eq!(
@@ -2542,7 +2562,7 @@ mod tests {
             false,
             None,
             [None, None, None],
-            prev_segment_ids,
+            Arc::new(prev_segment_ids),
         );
 
         // seg_id_predicted = 1: only 1 bit is read (no segment_id tree read).
