@@ -1,4 +1,4 @@
-//! Integration tests for `decode_keyframe` (the M2 public API).
+//! Integration tests decoding the first key frame via the public `Decoder` API.
 //!
 //! Using real data downloaded into `tests/vectors/` (a VP9 stream containing a key frame),
 //! this verifies that the first key frame decodes through to completion and that the
@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use vp9dec::ivf::IvfReader;
-use vp9dec::{decode_keyframe, Frame};
+use vp9dec::{Decoder, Frame};
 
 struct YStats {
     min: u8,
@@ -68,12 +68,23 @@ fn check_vector(relative_path: &str, expected_width: u32, expected_height: u32) 
         .unwrap_or_else(|| panic!("{} contains no frames", path.display()))
         .unwrap_or_else(|e| panic!("failed to read first frame of {}: {e:?}", path.display()));
 
-    let frame = decode_keyframe(first_frame.data).unwrap_or_else(|e| {
-        panic!(
-            "{}: decode_keyframe failed on first frame: {e:?}",
-            path.display()
-        )
-    });
+    let mut decoder = Decoder::new();
+    let frame = decoder
+        .decode_frame(first_frame.data)
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: decode_frame failed on first frame: {e:?}",
+                path.display()
+            )
+        })
+        .into_iter()
+        .find_map(|df| df.frame)
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: first chunk produced no displayed frame (expected a shown key frame)",
+                path.display()
+            )
+        });
 
     assert_eq!(
         frame.width,

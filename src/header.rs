@@ -132,8 +132,7 @@ impl Default for SegFeaturePersist {
 /// §7.2): the reference frame slot sizes (`RefFrameWidth`/`RefFrameHeight`, used by
 /// `frame_size_with_refs()`, spec §6.2.5), and the loop filter/segmentation state that
 /// `setup_past_independence()` would otherwise reset. Callers (`Decoder`) keep one instance of
-/// this across frames instead of three separate fields; [`decode_keyframe`](crate::decode_keyframe)
-/// (which carries no state across frames) passes a fresh [`PersistentState::default`].
+/// this across frames instead of three separate fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistentState {
     pub ref_frame_sizes: [(u32, u32); NUM_REF_FRAMES],

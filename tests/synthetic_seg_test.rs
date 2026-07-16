@@ -30,7 +30,7 @@ use vp9dec::prob_tables::{
     PARTITION_SPLIT, PARTITION_TREE, SEGMENT_TREE, V_PRED,
 };
 use vp9dec::test_support::{BitWriter, BoolEncoder};
-use vp9dec::Decoder;
+use vp9dec::{DecodedFrame, Decoder};
 
 const WIDTH: u32 = 16;
 const HEIGHT: u32 = 16;
@@ -462,6 +462,20 @@ fn assemble_frame(header: Vec<u8>, compressed: Vec<u8>, tile: Vec<u8>) -> Vec<u8
     frame
 }
 
+/// Decodes one chunk that must contain exactly one constituent frame (true for every
+/// synthetic stream in this file -- none of them pack superframes).
+fn decode_single(decoder: &mut Decoder, chunk: &[u8], what: &str) -> DecodedFrame {
+    let mut decoded = decoder
+        .decode_frame(chunk)
+        .unwrap_or_else(|e| panic!("{what} should decode: {e:?}"));
+    assert_eq!(
+        decoded.len(),
+        1,
+        "{what}: expected exactly one constituent frame"
+    );
+    decoded.pop().unwrap()
+}
+
 // ===========================================================================================
 // Test 1: SEG_LVL_SKIP + SEG_LVL_REF_FRAME.
 //
@@ -516,17 +530,12 @@ fn decode_skip_ref_frame_scenario() -> (vp9dec::Frame, vp9dec::Frame, vp9dec::Fr
     let frames = build_skip_ref_frames();
 
     let mut decoder = Decoder::new();
-    let key_frame = decoder
-        .decode_frame(&frames[0])
-        .expect("keyframe should decode")
+    let key_frame = decode_single(&mut decoder, &frames[0], "keyframe")
+        .frame
         .expect("keyframe has show_frame = 1");
-    let inter_frame = decoder
-        .decode_frame(&frames[1])
-        .expect("inter frame should decode")
-        .expect("inter frame has show_frame = 1");
-    let info = decoder
-        .last_frame_info()
-        .expect("info recorded after a decode");
+    let inter = decode_single(&mut decoder, &frames[1], "inter frame");
+    let info = inter.info.expect("info recorded for a newly decoded frame");
+    let inter_frame = inter.frame.expect("inter frame has show_frame = 1");
     (key_frame, inter_frame, info)
 }
 
@@ -644,24 +653,17 @@ fn seg_lvl_ref_frame_steers_to_the_specific_slot_not_just_last() {
     let frames = build_steering_frames();
 
     let mut decoder = Decoder::new();
-    let key_frame = decoder
-        .decode_frame(&frames[0])
-        .expect("keyframe should decode")
+    let key_frame = decode_single(&mut decoder, &frames[0], "keyframe")
+        .frame
         .expect("keyframe has show_frame = 1");
-    let hidden = decoder
-        .decode_frame(&frames[1])
-        .expect("intra_only frame should decode");
+    let hidden = decode_single(&mut decoder, &frames[1], "intra_only frame");
     assert!(
-        hidden.is_none(),
+        hidden.frame.is_none(),
         "intra_only frame has show_frame = 0 -> no visible output"
     );
-    let inter_frame = decoder
-        .decode_frame(&frames[2])
-        .expect("inter frame should decode")
-        .expect("inter frame has show_frame = 1");
-    let info = decoder
-        .last_frame_info()
-        .expect("info recorded after a decode");
+    let inter = decode_single(&mut decoder, &frames[2], "inter frame");
+    let info = inter.info.expect("info recorded for a newly decoded frame");
+    let inter_frame = inter.frame.expect("inter frame has show_frame = 1");
 
     assert!(info.seg_features_active[SEG_LVL_REF_FRAME]);
     // Sanity: content A (the key frame, held by slot 0/LAST) really is flat 127 everywhere --
@@ -696,10 +698,13 @@ fn seg_lvl_ref_frame_steers_to_the_specific_slot_not_just_last() {
     let compressed = build_inter_compressed_header();
     let header = build_inter_header([0, 1, 2], 0, &seg, header_size(&compressed));
     let tile = encode_inter_tile_forced([0, 0, 0, 0], seg.tree_probs);
-    let last_steered = decoder
-        .decode_frame(&assemble_frame(header, compressed, tile))
-        .expect("LAST-steered companion frame should decode")
-        .expect("companion has show_frame = 1");
+    let last_steered = decode_single(
+        &mut decoder,
+        &assemble_frame(header, compressed, tile),
+        "LAST-steered companion frame",
+    )
+    .frame
+    .expect("companion has show_frame = 1");
     for (i, &px) in last_steered.y.iter().enumerate() {
         assert_eq!(
             px, 127,
@@ -757,9 +762,8 @@ fn decode_alt_l_frame(alt_l_level: i32) -> vp9dec::Frame {
     let frames = build_alt_l_frames(alt_l_level);
 
     let mut decoder = Decoder::new();
-    decoder
-        .decode_frame(&frames[0])
-        .expect("frame should decode")
+    decode_single(&mut decoder, &frames[0], "alt_l key frame")
+        .frame
         .expect("key frame has show_frame = 1")
 }
 
@@ -893,11 +897,13 @@ fn dump_synthetic_ivf_for_external_cross_decode() {
         let mut yuv = Vec::new();
         let mut shown_count = 0usize;
         for frame in &frames {
-            if let Some(decoded) = decoder.decode_frame(frame).expect("frame should decode") {
-                yuv.extend_from_slice(&decoded.y);
-                yuv.extend_from_slice(&decoded.u);
-                yuv.extend_from_slice(&decoded.v);
-                shown_count += 1;
+            for df in decoder.decode_frame(frame).expect("frame should decode") {
+                if let Some(decoded) = df.frame {
+                    yuv.extend_from_slice(&decoded.y);
+                    yuv.extend_from_slice(&decoded.u);
+                    yuv.extend_from_slice(&decoded.v);
+                    shown_count += 1;
+                }
             }
         }
         assert_eq!(
@@ -1012,13 +1018,15 @@ fn synthetic_streams_cross_decode_against_ffmpeg() {
         let mut decoder = Decoder::new();
         let mut shown: Vec<(usize, Vec<u8>)> = Vec::new();
         for (idx, frame) in frames.iter().enumerate() {
-            if let Some(decoded) = decoder.decode_frame(frame).expect("frame should decode") {
-                let mut i420 =
-                    Vec::with_capacity(decoded.y.len() + decoded.u.len() + decoded.v.len());
-                i420.extend_from_slice(&decoded.y);
-                i420.extend_from_slice(&decoded.u);
-                i420.extend_from_slice(&decoded.v);
-                shown.push((idx, i420));
+            for df in decoder.decode_frame(frame).expect("frame should decode") {
+                if let Some(decoded) = df.frame {
+                    let mut i420 =
+                        Vec::with_capacity(decoded.y.len() + decoded.u.len() + decoded.v.len());
+                    i420.extend_from_slice(&decoded.y);
+                    i420.extend_from_slice(&decoded.u);
+                    i420.extend_from_slice(&decoded.v);
+                    shown.push((idx, i420));
+                }
             }
         }
         // Pin our own side too: a Decoder regression that changes which frames are shown must

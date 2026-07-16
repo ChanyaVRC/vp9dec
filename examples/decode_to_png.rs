@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use vp9dec::ivf::IvfReader;
-use vp9dec::{decode_keyframe, Decoder, Frame};
+use vp9dec::{Decoder, Frame};
 
 fn main() {
     let vectors_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -79,8 +79,18 @@ fn decode_first_frame(path: &Path, out_dir: &Path) {
         .unwrap_or_else(|| panic!("{} contains no frames", path.display()))
         .unwrap_or_else(|e| panic!("failed to read first frame of {}: {e:?}", path.display()));
 
-    let frame = decode_keyframe(first_frame.data)
-        .unwrap_or_else(|e| panic!("decode_keyframe failed for {}: {e:?}", path.display()));
+    let mut decoder = Decoder::new();
+    let frame = decoder
+        .decode_frame(first_frame.data)
+        .unwrap_or_else(|e| panic!("decode_frame failed for {}: {e:?}", path.display()))
+        .into_iter()
+        .find_map(|df| df.frame)
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: first chunk produced no displayed frame (expected a shown key frame)",
+                path.display()
+            )
+        });
 
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let out_path: PathBuf = out_dir.join(format!("{stem}.png"));
@@ -112,7 +122,7 @@ fn dump_frame_at(path: &Path, out_dir: &Path, target_index: usize) {
             )
         });
         if i >= target_index {
-            if let Some(decoded) = outcome {
+            if let Some(decoded) = outcome.into_iter().find_map(|df| df.frame) {
                 result = Some((i, decoded));
                 break;
             }

@@ -987,3 +987,76 @@ lint were left untouched as instructed. `git diff --stat`: exactly the 6 intende
 `tests/header_test.rs`, `tests/compressed_header_test.rs`); `tests/synthetic_seg_test.rs`,
 `tests/decode_test.rs`, `tests/inter_frame_test.rs`, and `tests/conformance_test.rs` show
 no diff.
+
+## Wave 2b: public API redesign -- per-constituent decode results (2026-07-16)
+
+Breaking change replacing the "one chunk -> at most one visible `Frame`" contract with
+per-constituent-frame results, plus deletion of the M2-era legacy API and a narrowing of
+the public surface. Decoded pixels are unchanged (pinned by the all-frames MD5
+conformance tests and the ffmpeg cross-decode, all green before and after).
+
+### New shape
+
+- `Decoder::decode_frame(chunk) -> Result<Vec<DecodedFrame>, DecodeError>`: one element
+  per constituent VP9 frame of the chunk (superframes yield several), in bitstream
+  order. `DecodedFrame { info: Option<FrameDecodeInfo>, frame: Option<Frame> }` --
+  `info` is `None` only on the `show_existing_frame` path (no uncompressed header is
+  parsed there, so no stats exist); `frame` is `None` for hidden (`show_frame == 0`)
+  frames. A conformant chunk has at most one `frame: Some` element, deliberately not
+  enforced: the decoder reports what happened rather than policing stream conformance
+  at the API boundary.
+- Deleted: `decode_keyframe()`, `DecodeError::NotAKeyFrame`, `Decoder::last_frame_info()`
+  and its backing field. Info traveling in the return value also removes the old wart
+  where a `show_existing_frame` chunk left the *previous* frame's info observable.
+- Every `pub mod` except `ivf` is now `#[doc(hidden)]` (internal; public only so the
+  pure-std integration tests can reach them). The documented public surface is
+  `Decoder`, `DecodedFrame`, `Frame`, `FrameDecodeInfo`, `DecodeError`, and `ivf`.
+  All five types are defined in `lib.rs` itself, so no `pub use` re-exports were needed.
+
+### Test suite changes (150 -> 148 tests)
+
+- Deleted `tests/conformance_test.rs`'s `check_vector` helper and its two tests
+  (`vp90_2_12_droppable_1_first_keyframe_matches_official_md5`,
+  `vp90_2_09_subpixel_00_first_keyframe_matches_official_md5`): strictly subsumed by the
+  `*_all_frames_match_official_md5` tests over the same vectors (frame 1 is the first
+  line those tests compare anyway). Pre-authorized by the wave plan.
+- `check_all_frames_with_coverage`'s manual `split_superframe` loop (which existed only
+  because `last_frame_info()` was per-chunk) collapsed onto the per-constituent API;
+  coverage strength is preserved because every returned `DecodedFrame` contributes its
+  `info` (hidden sub-frames included -- vp90-2-16-intra-only still reports
+  `reset_frame_context values seen = {0, 2}` and its `intra_only` predicate passes on
+  the hidden constituents).
+- `src/lib.rs`'s `last_frame_info_reflects_a_decoded_keyframe` rewritten as
+  `decoded_frame_info_reflects_a_decoded_keyframe`: same three header assertions read
+  from the returned `DecodedFrame`, plus new `len() == 1` / `frame.is_some()` checks.
+  The old "None before the first decode" assertion has no equivalent (the concept of
+  pre-decode info state no longer exists) -- that is the API change itself, not a lost
+  check.
+- `tests/decode_test.rs` kept (not deleted): the Y-plane statistics plausibility test
+  adapts trivially to `Decoder` (`find_map(|df| df.frame)` on the first chunk), and it
+  is the only test asserting those statistics on real vectors.
+- `tests/inter_frame_test.rs`: minimal mechanical adaptation only (scheduled for
+  deletion in Wave 3). `hidden_count` in its log line now counts hidden *constituent*
+  frames rather than all-hidden *chunks*; its assertions never used it.
+
+### Judgment calls
+
+- `README.md` still documents `decode_keyframe()` in its M2/M2b milestone narrative
+  (~9 mentions). Left untouched: the wave's task list scoped consumers to code +
+  rustdoc, and the README sections are historical milestone descriptions. Follow-up
+  candidate for the next docs pass.
+- Stale rustdoc references fixed alongside the deletions: `src/header.rs`
+  (`PersistentState` doc), `src/tile.rs` x2 (now point at [`crate::Decoder`]),
+  `src/loop_filter.rs` (now cites `DecodeError::UnsupportedBitDepth` for the 8-bit
+  limit), `tests/compressed_header_test.rs` module doc. `cargo doc --no-deps` with
+  `-D rustdoc::broken_intra_doc_links` passes; the pre-existing
+  `private_intra_doc_links` warnings dropped 3 -> 2 (the old `decode_frame` doc linked
+  to the private `decode_one_frame`; the remaining 2 are `src/tile.rs` module-doc links
+  untouched by this wave).
+- `rustfmt` applied only to `tests/synthetic_seg_test.rs` (the one touched leaf file
+  with rustfmt-relevant diffs, both in newly written lines). `src/tile.rs` and
+  `examples/decode_to_png.rs` were left unformatted because their only reported diffs
+  are pre-existing drift outside this wave's hunks (`read_ref_frames`' one-line
+  signature, kept verbatim per the Wave 2a note, and the example's `target_index`
+  arg-parsing closure). `src/lib.rs` edits hand-formatted; no added line exceeds the
+  100-column limit.

@@ -248,7 +248,7 @@ impl TileDecoder {
     /// # Panics
     /// Panics if `color_config.bit_depth != 8`. Frame buffers for depths other than
     /// 8bit (10bit/12bit) cannot be represented since [`Plane`] is fixed to `u8`.
-    /// The caller ([`crate::decode_keyframe`]) must check `bit_depth` before calling
+    /// The caller ([`crate::Decoder`]) must check `bit_depth` before calling
     /// `TileDecoder::new`. `use_prev_frame_mvs`/`prev_mi_grid` are always
     /// `false`/`None` (a simple constructor for key frames / M2 compatibility).
     /// `prev_segment_ids` is seeded to all-zero (the "first frame" state of spec
@@ -377,7 +377,7 @@ impl TileDecoder {
     /// Returns a reference to the decoded plane buffers (`CurrFrame`).
     /// Index 0=Y, 1=U, 2=V. The buffers have a size rounded up to the superblock boundary,
     /// so the caller must crop to the display size
-    /// (done by [`crate::decode_keyframe`]).
+    /// (done by [`crate::Decoder`]).
     pub fn planes(&self) -> &[Plane; 3] {
         &self.planes
     }

@@ -9,7 +9,7 @@
 //! this test still primarily verifies that `compressed_header` reads through to completion,
 //! and only confirms that the call to `TileDecoder::decode_tiles` doesn't panic (either an
 //! `Ok` or `Err` result is accepted). Full pixel output correctness (a statistical sanity
-//! check) is verified by the `decode_keyframe`-based tests in `tests/decode_test.rs`.
+//! check) is verified by the `Decoder`-based tests in `tests/decode_test.rs`.
 //! Detailed correctness of tile/partition/mode info is verified by unit tests using
 //! synthetic bitstreams inside `src/tile.rs`.
 //!

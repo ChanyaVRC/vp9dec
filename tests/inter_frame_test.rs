@@ -50,18 +50,21 @@ fn check_vector(relative_path: &str) {
         let frame = frame
             .unwrap_or_else(|e| panic!("{}: failed to read IVF frame {i}: {e:?}", path.display()));
         match decoder.decode_frame(frame.data) {
-            Ok(Some(f)) => {
-                decoded_count += 1;
-                // Minimal sanity check: plane size matches the expected value derived from frame.width/height.
-                assert_eq!(
-                    f.y.len(),
-                    (f.width * f.height) as usize,
-                    "{}: frame {i}: unexpected Y plane size",
-                    path.display()
-                );
-            }
-            Ok(None) => {
-                hidden_count += 1;
+            Ok(decoded) => {
+                for df in decoded {
+                    if let Some(f) = df.frame {
+                        decoded_count += 1;
+                        // Minimal sanity check: plane size matches the expected value derived from frame.width/height.
+                        assert_eq!(
+                            f.y.len(),
+                            (f.width * f.height) as usize,
+                            "{}: frame {i}: unexpected Y plane size",
+                            path.display()
+                        );
+                    } else {
+                        hidden_count += 1;
+                    }
+                }
             }
             Err(e) => panic!(
                 "{}: frame {i} (of {} total so far) failed to decode: {e:?}",

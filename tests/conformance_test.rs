@@ -5,11 +5,11 @@
 //! data (the full Y plane, then the full U plane, then the full V plane, concatenated) —
 //! one line per frame, in standard `md5sum` format: `<32-char hex>  <filename>`.
 //!
-//! Here we verify, for the first output frame (= the first key frame), that the MD5 of
-//! `decode_keyframe`'s output (the Y->U->V concatenated byte string, cropped to display size)
-//! exactly matches the first line of `.ivf.md5`. If the loop filter, cropping, plane
-//! concatenation order, or render size interpretation is wrong in any way, this comparison
-//! is guaranteed to fail.
+//! Here we verify, for every displayed output frame, that the MD5 of the decoder's output
+//! (the Y->U->V concatenated byte string, cropped to display size) exactly matches the
+//! corresponding line of `.ivf.md5`. If the loop filter, cropping, plane concatenation
+//! order, or render size interpretation is wrong in any way, this comparison is
+//! guaranteed to fail.
 //!
 //! Assumes the test vectors and MD5 files have already been downloaded into `tests/vectors/`
 //! (excluded via `.gitignore`; see README.md for how to obtain them). If they're missing,
@@ -21,21 +21,7 @@ use std::path::Path;
 use vp9dec::header::{SEG_LVL_ALT_L, SEG_LVL_ALT_Q, SEG_LVL_MAX, SEG_LVL_REF_FRAME, SEG_LVL_SKIP};
 use vp9dec::ivf::IvfReader;
 use vp9dec::md5::{md5, to_hex};
-use vp9dec::superframe::split_superframe;
-use vp9dec::{decode_keyframe, Decoder, Frame, FrameDecodeInfo};
-
-/// Extracts just the MD5 hex string from the first line of an `.ivf.md5`.
-/// The format is `md5sum`-compatible: `<hex>␠␠<filename>` (separator is two spaces or a tab).
-fn first_line_md5(md5_file_contents: &str) -> &str {
-    let first_line = md5_file_contents
-        .lines()
-        .next()
-        .expect(".ivf.md5 file is empty");
-    first_line
-        .split_whitespace()
-        .next()
-        .expect("first line of .ivf.md5 has no whitespace-separated fields")
-}
+use vp9dec::{Decoder, Frame, FrameDecodeInfo};
 
 /// Returns the `Frame`'s I420 bytes concatenated in Y->U->V order (the layout expected by `.ivf.md5`).
 fn i420_bytes(frame: &Frame) -> Vec<u8> {
@@ -46,95 +32,14 @@ fn i420_bytes(frame: &Frame) -> Vec<u8> {
     out
 }
 
-fn check_vector(ivf_name: &str) {
-    let vectors_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("vectors");
-    let ivf_path = vectors_dir.join(ivf_name);
-    let md5_path = vectors_dir.join(format!("{ivf_name}.md5"));
-
-    if !ivf_path.exists() || !md5_path.exists() {
-        eprintln!(
-            "[skip] Test vector or .ivf.md5 not found, skipping: {} / {}\n\
-             Please download them beforehand following the instructions in README.md.",
-            ivf_path.display(),
-            md5_path.display()
-        );
-        return;
-    }
-
-    let ivf_bytes = std::fs::read(&ivf_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ivf_path.display()));
-    let md5_text = std::fs::read_to_string(&md5_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", md5_path.display()));
-    let expected = first_line_md5(&md5_text).to_ascii_lowercase();
-
-    let mut reader = IvfReader::new(&ivf_bytes).unwrap_or_else(|e| {
-        panic!(
-            "failed to parse IVF header for {}: {e:?}",
-            ivf_path.display()
-        )
-    });
-    let first_frame = reader
-        .next()
-        .unwrap_or_else(|| panic!("{} contains no frames", ivf_path.display()))
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to read first frame of {}: {e:?}",
-                ivf_path.display()
-            )
-        });
-
-    let frame = decode_keyframe(first_frame.data).unwrap_or_else(|e| {
-        panic!(
-            "{}: decode_keyframe failed on first frame: {e:?}",
-            ivf_path.display()
-        )
-    });
-
-    let actual_bytes = i420_bytes(&frame);
-    let actual = to_hex(&md5(&actual_bytes));
-
-    assert_eq!(
-        actual,
-        expected,
-        "{}: MD5 of frame 1 (key frame) doesn't match the official value\n  actual:   {}\n  expected: {}\n\
-         (frame: {}x{}, y.len={}, u.len={}, v.len={})",
-        ivf_path.display(),
-        actual,
-        expected,
-        frame.width,
-        frame.height,
-        frame.y.len(),
-        frame.u.len(),
-        frame.v.len(),
-    );
-    eprintln!(
-        "[ok] {}: MD5 of frame 1 exactly matches the official value ({})",
-        ivf_path.display(),
-        actual
-    );
-}
-
-#[test]
-fn vp90_2_12_droppable_1_first_keyframe_matches_official_md5() {
-    check_vector("vp90-2-12-droppable_1.ivf");
-}
-
-#[test]
-fn vp90_2_09_subpixel_00_first_keyframe_matches_official_md5() {
-    check_vector("vp90-2-09-subpixel-00.ivf");
-}
-
 /// M3 second half: verifies that **every displayed frame** exactly matches the corresponding
 /// line in `.ivf.md5` (this won't pass unless motion compensation, probability adaptation,
 /// the DPB, and the loop filter's cross-frame state are all correct — a far stricter test
 /// than verifying a single key frame).
 ///
-/// `.ivf.md5` has "1 line = 1 output (displayed) frame"; each time [`Decoder::decode_frame`]
-/// returns `Some(Frame)`, one line is consumed and compared (hidden frames with
-/// `show_frame == 0` have no corresponding line in `.ivf.md5`, so a `None` result doesn't
-/// consume a line).
+/// `.ivf.md5` has "1 line = 1 output (displayed) frame"; each `DecodedFrame` with
+/// `frame: Some` consumes one line and is compared (hidden constituent frames with
+/// `show_frame == 0` have no corresponding line in `.ivf.md5`, so they don't consume one).
 fn check_all_frames(ivf_name: &str) {
     let vectors_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -177,7 +82,7 @@ fn check_all_frames(ivf_name: &str) {
     let mut output_idx = 0usize;
     let mut mismatches: Vec<usize> = Vec::new();
 
-    for (ivf_frame_idx, frame) in reader.enumerate() {
+    'frames: for (ivf_frame_idx, frame) in reader.enumerate() {
         let frame = frame.unwrap_or_else(|e| {
             panic!(
                 "{}: failed to read IVF frame {ivf_frame_idx}: {e:?}",
@@ -190,7 +95,7 @@ fn check_all_frames(ivf_name: &str) {
                 ivf_path.display()
             )
         });
-        if let Some(decoded) = outcome {
+        for decoded in outcome.into_iter().filter_map(|df| df.frame) {
             let actual_bytes = i420_bytes(&decoded);
             let actual = to_hex(&md5(&actual_bytes));
             let expected = expected_lines.get(output_idx).unwrap_or_else(|| {
@@ -213,7 +118,7 @@ fn check_all_frames(ivf_name: &str) {
                 );
                 // Only the first mismatch needs close investigation, so stop early here
                 // (see README "Debugging notes": first check how many frames match).
-                break;
+                break 'frames;
             }
             output_idx += 1;
         }
@@ -249,11 +154,12 @@ fn vp90_2_09_subpixel_00_all_frames_match_official_md5() {
 }
 
 /// Same as [`check_all_frames`] (bit-exact MD5 check of every displayed frame), plus a
-/// coverage check: `predicate` is evaluated against [`Decoder::last_frame_info`] after
-/// *every* `decode_frame` call (including hidden frames with `show_frame == 0`, since
-/// segmentation/intra_only state isn't limited to displayed frames), and at least one
-/// frame must satisfy it. This proves the vector actually exercises the decode path
-/// `description` names, rather than merely producing correct output on some other path.
+/// coverage check: `predicate` is evaluated against the `info` of *every* returned
+/// `DecodedFrame` that carries one (including hidden constituent frames with
+/// `show_frame == 0`, since segmentation/intra_only state isn't limited to displayed
+/// frames), and at least one frame must satisfy it. This proves the vector actually
+/// exercises the decode path `description` names, rather than merely producing correct
+/// output on some other path.
 ///
 /// Also `eprintln!`s a one-line coverage summary (the set of `reset_frame_context`
 /// values seen, and the union of `seg_features_active` across the whole stream) so a
@@ -313,23 +219,21 @@ fn check_all_frames_with_coverage(
                 ivf_path.display()
             )
         });
-        // `Decoder::decode_frame` now splits a superframe chunk internally, so calling it
-        // once on `frame.data` would already decode correctly. Splitting here too is no
-        // longer needed for correctness, but is kept so `last_frame_info()` can be sampled
-        // after *each* constituent frame -- decode_frame() only exposes the last one -- which
-        // the coverage predicate below relies on (e.g. vp90-2-16-intra-only's intra_only
-        // frames are the hidden ones in a superframe, not the trailing visible frame).
-        for sub_frame in split_superframe(frame.data) {
-            let outcome = decoder.decode_frame(sub_frame).unwrap_or_else(|e| {
-                panic!(
-                    "{}: IVF frame {ivf_frame_idx} failed to decode: {e:?}",
-                    ivf_path.display()
-                )
-            });
-            if let Some(info) = decoder.last_frame_info() {
+        let outcome = decoder.decode_frame(frame.data).unwrap_or_else(|e| {
+            panic!(
+                "{}: IVF frame {ivf_frame_idx} failed to decode: {e:?}",
+                ivf_path.display()
+            )
+        });
+        // One DecodedFrame per constituent frame, so hidden sub-frames' infos are observed
+        // too -- the coverage predicate below relies on this (e.g. vp90-2-16-intra-only's
+        // intra_only frames are the hidden ones in a superframe, not the trailing visible
+        // frame).
+        for df in outcome {
+            if let Some(info) = df.info {
                 infos.push(info);
             }
-            if let Some(decoded) = outcome {
+            if let Some(decoded) = df.frame {
                 let actual_bytes = i420_bytes(&decoded);
                 let actual = to_hex(&md5(&actual_bytes));
                 let expected = expected_lines.get(output_idx).unwrap_or_else(|| {

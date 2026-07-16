@@ -194,7 +194,7 @@ fn set_off(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, k: i64, v: i
 
 /// Spec §8.8.5.1 "Filter mask process". Returns `(hevMask, filterMask, flatMask, flatMask2)`.
 /// Since `BitDepth == 8` is fixed (this decoder only supports 8bit, see
-/// `decode_keyframe`), the spec's bit-depth scaling via `<< (BitDepth - 8)`
+/// `DecodeError::UnsupportedBitDepth`), the spec's bit-depth scaling via `<< (BitDepth - 8)`
 /// is omitted as an identity operation (shift amount 0).
 #[allow(clippy::too_many_arguments)]
 fn compute_filter_mask(
