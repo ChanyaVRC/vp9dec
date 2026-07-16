@@ -23,13 +23,17 @@ needs ~62 MP/s plus headroom, so this blocks practical Noiria integration for HD
 - First wave = measurement: a benchmark harness (large-clip decode MP/s, per-stage
   profile) so optimization targets are data-driven, not guessed.
 
-## P1.5 — Noiria integration
+## P1.5 — Noiria integration: in-engine validation
 
-Blocked only by P1 for HD content (SD works today). Noiria side: implement the
-`VideoSource` trait (`noiria/src/codec/video.rs`) + one branch in `open_video_file()`.
-vp9dec side: API is ready (`Decoder::decode_frame(chunk) -> Vec<DecodedFrame>`; the
-`ivf` module reads the container). Decoder is Send (Arc-based DPB). 8-bit 4:2:0 only
-until P2 lands. HEVC stays Media Foundation (patents — separate decision, not backlog).
+CORRECTION (2026-07-17): the integration itself already exists — Noiria's
+`crates/noiria-core/src/codec/video.rs` has a `Vp9Ivf` `VideoSource` backed by this
+crate (path dependency), sniffed by `open_video_file()` ahead of Media Foundation. The
+2026-07-16 API break was adapted there on 2026-07-17 (Noiria workspace fully green).
+Remaining work: in-engine playback validation of HD content once P1 (SIMD) lands, and
+whatever the Noiria-side backlog's frame-seek discussion (its B4) decides. When changing
+this crate's API, run Noiria's `cargo check -p noiria-core` as the break detector.
+8-bit 4:2:0 only until P2 lands. HEVC stays Media Foundation (patents — separate
+decision, not backlog).
 
 ## P2 — VP9 profiles 1-3 (4:2:2 / 4:4:4, 10/12-bit)
 
