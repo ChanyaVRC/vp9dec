@@ -5,8 +5,14 @@
 # `cargo run --example webm_to_ivf` and copies the .webm.md5 alongside it as .ivf.md5 (the
 # MD5s are of the decoded pixel output, not the container, so they carry over unchanged).
 #
+# Individual download/remux failures are recorded and skipped rather than aborting the whole
+# run (M4 wave 1): at ~330 manifest entries, some upstream files 404 (a vector may ship only
+# one container form, or lack a .md5) and some .webm files may not remux cleanly -- both are
+# expected data about the vector set, not reasons to stop fetching the rest. A summary with
+# every failing name is printed at the end; see docs/implementation-notes.md "M4 wave 1".
+#
 # Usage: bash scripts/fetch-vectors.sh
-set -euo pipefail
+set -uo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
@@ -15,17 +21,35 @@ base_url="https://storage.googleapis.com/downloads.webmproject.org/test_data/lib
 
 mkdir -p "$vectors_dir"
 
-# Downloads $1 to $2, skipping if $2 already exists. Fails loudly (via `set -e` + curl -f) on
-# any HTTP error or network failure.
+dl_ok=()
+dl_fail=()
+remux_ok=()
+remux_fail=()
+
+# Downloads $1 to $2, skipping if $2 already exists. Records the outcome in dl_ok/dl_fail
+# instead of letting a single HTTP/network failure abort the whole run, and returns non-zero
+# so callers can react (e.g. skip a remux whose source download failed).
 fetch() {
     local url="$1" out="$2"
     if [ -f "$out" ]; then
         echo "[skip] $out already present"
-        return
+        return 0
     fi
     echo "[fetch] $url -> $out"
-    curl -fSL -o "$out" "$url"
+    if curl -fSL -o "$out" "$url"; then
+        dl_ok+=("$out")
+        return 0
+    fi
+    local rc=$?
+    echo "[FAIL] download failed (curl exit $rc): $url" >&2
+    rm -f "$out" # curl -o may leave a truncated/empty file behind on failure
+    dl_fail+=("$url")
+    return 1
 }
+
+# Pre-build once so the ~300 subsequent `cargo run --example webm_to_ivf` invocations below
+# each skip straight to executing the (already up to date) binary.
+cargo build --quiet --example webm_to_ivf
 
 while read -r name kind; do
     case "$name" in
@@ -38,28 +62,51 @@ while read -r name kind; do
             fetch "$base_url/$name.ivf.md5" "$vectors_dir/$name.ivf.md5"
             ;;
         webm)
-            fetch "$base_url/$name.webm" "$vectors_dir/$name.webm"
+            webm_ready=1
+            fetch "$base_url/$name.webm" "$vectors_dir/$name.webm" || webm_ready=0
             fetch "$base_url/$name.webm.md5" "$vectors_dir/$name.webm.md5"
 
             if [ -f "$vectors_dir/$name.ivf" ]; then
                 echo "[skip] $vectors_dir/$name.ivf already present"
+            elif [ "$webm_ready" -eq 0 ] && [ ! -f "$vectors_dir/$name.webm" ]; then
+                echo "[skip] $name.webm not available, cannot remux"
             else
                 echo "[remux] $name.webm -> $name.ivf"
-                (cd "$repo_root" && cargo run --example webm_to_ivf -- \
-                    "tests/vectors/$name.webm" "tests/vectors/$name.ivf")
+                remux_err="$(mktemp)"
+                if (cd "$repo_root" && cargo run --quiet --example webm_to_ivf -- \
+                    "tests/vectors/$name.webm" "tests/vectors/$name.ivf") 2>"$remux_err"; then
+                    remux_ok+=("$name")
+                else
+                    echo "[FAIL] remux failed: $name" >&2
+                    cat "$remux_err" >&2
+                    remux_fail+=("$name: $(tail -n 1 "$remux_err")")
+                fi
+                rm -f "$remux_err"
             fi
 
             if [ -f "$vectors_dir/$name.ivf.md5" ]; then
                 echo "[skip] $vectors_dir/$name.ivf.md5 already present"
-            else
+            elif [ -f "$vectors_dir/$name.webm.md5" ]; then
                 cp "$vectors_dir/$name.webm.md5" "$vectors_dir/$name.ivf.md5"
             fi
             ;;
         *)
             echo "[error] unknown vector kind '$kind' for '$name' in scripts/vectors.txt" >&2
-            exit 1
             ;;
     esac
 done < "$script_dir/vectors.txt"
 
-echo "[done] all vectors present in $vectors_dir"
+echo
+echo "===== fetch-vectors.sh summary ====="
+echo "downloads ok:     ${#dl_ok[@]}"
+echo "downloads failed: ${#dl_fail[@]}"
+for f in "${dl_fail[@]+"${dl_fail[@]}"}"; do
+    echo "  [download-fail] $f"
+done
+echo "remux ok:         ${#remux_ok[@]}"
+echo "remux failed:     ${#remux_fail[@]}"
+for f in "${remux_fail[@]+"${remux_fail[@]}"}"; do
+    echo "  [remux-fail] $f"
+done
+echo "====================================="
+echo "[done] fetch-vectors.sh finished (see summary above for anything that didn't succeed)"

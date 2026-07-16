@@ -1875,3 +1875,101 @@ itself carries zero external dependencies throughout; the one dev-dependency
 (`test-support`, a self-reference) never affects a plain `cargo build`. M4 (the full
 official libvpx vector sweep beyond these 5) remains open — see README.md's Status/
 limitations table and `scripts/fetch-vectors.{sh,ps1}` for extending vector coverage.
+
+## M4 wave 1: full official-vector sweep infrastructure + first honest triage (2026-07-16)
+
+Infrastructure-only wave: built the machinery to run every official libvpx `vp90-2-*`
+conformance vector through the decoder and categorized the failures. **No `src/` changes were
+made in this wave** (the decoder bugs surfaced below are reported, not fixed — that is a later
+wave's job). Only `scripts/`, `tests/`, and this notes file changed.
+
+### Infrastructure added
+
+- **`scripts/vectors.txt`**: expanded from the 5 curated entries to the full official set,
+  330 entries (`<name> <kind>` format, unchanged schema). Derived mechanically from
+  libvpx's `test/test-data.sha1` list (359 `vp90-2-*` filenames). Excluded: the 12
+  `vp90-2-tos_*`/`vp90-2-sintel_*` movie clips (full-length, deferred to a later phase per
+  the wave scope) and the 17 `*.res` sidecars (those are libvpx's expected-frame-count
+  fixtures for its own corrupted-stream tests, not video containers, so they don't fit the
+  `ivf`/`webm` kind schema). 307 `webm`-kind + 23 `ivf`-kind = 330. The 5 pre-existing
+  curated entries are preserved in the regenerated list.
+- **`scripts/fetch-vectors.sh` / `.ps1`**: reworked from fail-fast (`set -euo pipefail` /
+  `$ErrorActionPreference=Stop`) to **continue-on-error with an end-of-run summary**. At 330
+  entries some upstream files legitimately 404 and some `.webm` might not remux; aborting on
+  the first one would defeat the sweep. Each download/remux failure is recorded and skipped;
+  the summary prints counts + every failing name. Also added a one-time
+  `cargo build --example webm_to_ivf` before the loop so the ~300 remux invocations reuse the
+  built binary.
+- **`tests/sweep_test.rs`**: new `#[test] #[ignore] fn official_vector_sweep()`. Scans
+  `tests/vectors/*.ivf` that have a matching `.ivf.md5`, decodes ALL IVF chunks per vector
+  through one `Decoder`, MD5s each displayed `DecodedFrame`'s I420 bytes (via
+  `tests/common/md5`) against the `.ivf.md5` lines. Every failure mode is caught per-vector
+  so one bad vector never aborts the sweep: a returned `Err` becomes `error@frame N`, an MD5
+  divergence `md5-mismatch@frame N`, a frame-count divergence `md5-count-mismatch`, and a
+  panic is caught via `std::panic::catch_unwind` (with the default panic hook suppressed for
+  the sweep's duration so a decoder-internal panic doesn't spew backtraces over the report).
+  Emits one `[PASS]`/`[FAIL <reason>]` line per vector plus a summary block, and writes the
+  same report to `target/sweep-report.txt` for the reviewer. The test asserts all-pass at the
+  end, so it **fails today** — that is expected and why it's `#[ignore]`d; the normal
+  `cargo test` suite stays green (147/147). Run it with:
+  `cargo test --release --test sweep_test official_vector_sweep -- --ignored --nocapture`
+  (release for speed; `RUST_MIN_STACK=16777216` was set on the build to avoid the documented
+  rustc-side ThinLTO worker-thread stack overflow, an environment quirk noted in earlier
+  waves — it did not actually bite this time but the env var was kept as insurance).
+
+### Fetch / remux stats (one full run, this machine)
+
+- downloads ok: **605**, downloads failed (404): **45**, remux ok: **301**, remux failed:
+  **0**. The pure-std WebM remuxer (`examples/webm_to_ivf.rs`) handled **every** downloaded
+  `.webm` without a single lacing/structure rejection — a good result for the from-scratch
+  EBML reader.
+- The 45 download 404s break down as: 16 `ivf`-kind "invalid/resilience" entries whose whole
+  `.ivf` isn't hosted (the `*.webm.ivf.sNNNNN_r01-05_b6-*.ivf` / `*.ivf.kf_65527x61446.ivf`
+  family — libvpx generates these locally for its own decode-of-corrupt tests, they aren't in
+  the storage bucket; 32 files = 16 `.ivf` + 16 `.ivf.md5`), 3 fully-absent `webm` vectors
+  (`vp90-2-07-frame_parallel-2`, `-3`, `vp90-2-08-tile_1x4_frame_parallel_all_key`; 6 files),
+  and 7 `bbb` vectors that ship a `.webm` but **no** `.webm.md5` upstream (7 files). The bbb
+  ones still remuxed to `.ivf`, but with no MD5 the sweep can't check them, so they're
+  skipped.
+- Net on disk: 311 `.ivf` produced (330 − 16 unhosted `.ivf` − 3 absent `webm`), of which
+  **304 have a matching `.ivf.md5`** and are therefore swept; the 7 bbb `.ivf` are the
+  no-MD5 skips. tests/vectors/ ≈ 1.5 GB.
+
+### Sweep result: 275 / 304 pass (90.5%)
+
+`total 304 / pass 275 / fail 29`, and — notably — **every one of the 29 failures is a plain
+`md5-mismatch`: zero decode-errors, zero panics, zero frame-count mismatches.** So every
+in-scope bitstream parses and decodes to completion end-to-end (container, superframe split,
+all header layers, tile/token decode, DPB, loop filter); only some reconstructed pixels
+differ. Full per-vector report: `target/sweep-report.txt`.
+
+### Triage (5 categories, 29 vectors) — hypotheses, NOT fixes
+
+Quick evidence gathered by reading each failing vector's uncompressed header (`base_q_idx` /
+`lossless` / dims) via a throwaway probe example (since deleted; not committed). No deep
+debugging.
+
+| # | Category (count) | Example vectors | Evidence | One-line hypothesis |
+|---|---|---|---|---|
+| A | **Low-QP / lossless keyframe recon (9)** | `quantizer-00`..`-07` (8), `13-largescaling` | Crisp QP threshold: `quantizer-00..07` = `base_q_idx` 0,4,…,28 all FAIL @0; `quantizer-08..63` = `base_q_idx`≥32 all PASS. `quantizer-00` and `largescaling` are exactly `lossless` (`base_q_idx==0`). | Inverse-transform intermediate precision/clamping (or high-magnitude dequant) that only trips once coefficients get large enough at low QP; `quantizer-00`/`largescaling` additionally hit the exact-lossless 4×4-WHT path. Not *purely* a lossless bug (only `-00` is lossless, yet `-01..-07` fail). |
+| B | **Small odd frame sizes (10)** | `02-size-10x08`, `-10x10`, `-10x32`, `-08x34`, `-08x66`, `-16x66`, `-18x10`, `-34x10`, `-66x08`, `-66x10` | 10 of 71 `02-size` fail (mostly @0 keyframe). No divisibility rule: `w=10` fails at `h∈{8,10,32}` but passes at `h∈{16,18,34,64,66}`; `32` fails yet `34` passes. QP-independent (`08x32` q=1 passes; `08x34` q=93 fails). All 65 `03-size` (196–226) and 3 `11-size` (351/352) PASS. | Edge-block / partial-superblock intra-reconstruction (or boundary pixel extension) bug specific to the tiny (≤66 px) regime; content/partition-specific, not a clean dimension-alignment error. |
+| C | **Reference scaling / resize / SVC (4)** | `18-resize` @2, `22-svc_1280x720_3` @0, `14-resize-10frames-fp-tiles-1-2-4-8` @40, `14-…-8-4-2-1` @31 | Basic scaled MC works: `05-resize`, all 16 `21-resize_inter_*`, and 34 of 36 `14-resize-*` PASS. The 2 failing `14-*` are exactly the ones cycling **four** tile configs. `svc_3` (3 spatial layers) fails where `svc_1` (1 layer) passes; its base layer is 320×180. | Reference-frame scaling for specific scale ratios / resize×multi-tile-config transitions / multi-spatial-layer SVC diverges, while single-ratio scaled MC is correct. |
+| D | **Mid-stream inter divergence (5)** | `07-frame_parallel-1` @10, `19-skip` @6, `19-skip-01` @8, `20-big_superframe-01` @3, `20-big_superframe-02` @8 | All decode many frames correctly, then one diverges. Siblings pass: `frame_parallel` (base), `skip-02`. | A specific inter-frame feature / probability-adaptation edge case triggered only by certain frames; core inter-prediction is correct (proven by the many matching frames before the break). Not yet localized. |
+| E | **show_existing_frame first output (1)** | `10-show-existing-frame` @0 | 2 of 3 show-existing vectors PASS (`10-show-existing-frame2`, `17-show-existing-frame`). | The `show_existing_frame` mechanism itself works; this stream's first *output* diverges, most likely because the hidden frame it references decoded slightly wrong upstream — a symptom of another category, not of show-existing. |
+
+Priority order for a future fix wave, by evidence sharpness: **A** (crispest boundary, likely
+a single transform/clamp site) → **B** (well-bounded to the tiny-size regime) → **C**
+(scaling, well-isolated) → **D**/**E** (need per-frame localization first).
+
+### Verification
+
+- `cargo test` (normal suite): **147 passed, 0 failed** across 6 binaries (119 lib + 6
+  `api_test` + 12 `conformance_test` + 6 `synthetic_seg_test` + 4 `decode_to_png`), unchanged
+  from the pre-wave baseline. The new `sweep_test` binary reports `0 passed; 1 ignored` — the
+  sweep does not run under a plain `cargo test`, so the suite stays green.
+- The 5 curated conformance vectors and their named tests are untouched and still pass
+  (they're a subset of the 275 the sweep also passes).
+- `git diff`/`status` touches only `scripts/vectors.txt`, `scripts/fetch-vectors.sh`,
+  `scripts/fetch-vectors.ps1`, and the new `tests/sweep_test.rs`, plus this notes section.
+  **Zero `src/` changes.** (`tests/vectors/*` and `target/` are gitignored, so the downloaded
+  vectors and `target/sweep-report.txt` don't appear in the diff.)
