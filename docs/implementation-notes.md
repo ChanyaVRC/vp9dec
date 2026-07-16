@@ -1060,3 +1060,94 @@ conformance tests and the ffmpeg cross-decode, all green before and after).
   signature, kept verbatim per the Wave 2a note, and the example's `target_index`
   arg-parsing closure). `src/lib.rs` edits hand-formatted; no added line exceeds the
   100-column limit.
+
+## Wave 3: test-layer consolidation (2026-07-16)
+
+### Scope
+
+Collapsed the milestone-accreted test layer -- 6 integration test files, each with its own
+copy of vector-loading/skip/md5 boilerplate -- down to 3, with the shared infrastructure
+factored into `tests/common/`.
+
+### What moved where
+
+- **`tests/common/mod.rs`** (new): `vectors_dir()`/`read_vector()`/`read_vector_with_md5()`/
+  `first_ivf_frame()`/`i420_bytes()`, extracted from what were 8 duplicated skip-if-absent
+  blocks, 8 vectors-path constructions, 3 I420-concat copies, and 3 `.ivf.md5` parsers spread
+  across the 6 original files. The module head carries `#![allow(dead_code)]` (cascades to its
+  `encoder`/`md5` submodules) since each `tests/*.rs` binary recompiles this module and uses
+  only a subset of it -- e.g. `api_test.rs` never touches `i420_bytes` or `md5`.
+- **`tests/common/md5.rs`**: relocated verbatim from `src/md5.rs` (the RFC 1321 implementation);
+  `pub mod md5;` removed from `src/lib.rs` since its sole external consumer was
+  `conformance_test.rs`. Its 7 unit tests moved into `tests/conformance_test.rs`'s
+  `mod md5_tests` (option (a) from the task) rather than staying alongside the implementation in
+  `tests/common/md5.rs`: everything under `tests/common/` recompiles once per consuming test
+  binary, so a `#[test]` there would rerun once per binary instead of once overall.
+- **`tests/common/encoder.rs`** (new): the ~400-line synthetic VP9 bitstream encoder
+  (`SegSpec`, the header/tile/compressed-header builders, `tree_path`/`encode_tree`,
+  `kb`/`header_size`/`assemble_frame`, `FEATURE_BITS`/`FEATURE_SIGNED`, `WIDTH`/`HEIGHT`)
+  extracted from `tests/synthetic_seg_test.rs`, so a future synthetic-vector test file (e.g. M4's
+  planned reference-frame-scaling coverage) can reuse it without re-deriving ~400 lines of
+  encoder plumbing. The scenario builders (`build_skip_ref_frames`/`build_steering_frames`/
+  `build_alt_l_frames`/`scenarios()`) and all 6 `#[test]` fns stayed in
+  `synthetic_seg_test.rs` per the task's default -- judged not worth moving further, since
+  they're this file's actual test content (what varies per scenario), not shared plumbing.
+- **`tests/conformance_test.rs`**: `check_all_frames` and `check_all_frames_with_coverage`
+  (~80% identical) merged into one `check_all_frames(ivf_name, coverage: Option<Coverage>)`,
+  `type Coverage = (&'static str, fn(&FrameDecodeInfo) -> bool)` (a type alias only to satisfy
+  clippy's `type_complexity` lint on the bare tuple). `FrameDecodeInfo` is now collected
+  unconditionally in the decode loop (previously only in the `_with_coverage` copy) -- this is
+  bookkeeping, not an extra assertion, so it changes nothing the 2 non-coverage callers
+  (`droppable_1`/`subpixel_00`) check. The 3 coverage callers (`segkey`/`segkey_adpq`/
+  `intra-only`) keep their exact predicate and `eprintln!` coverage summary.
+- **`tests/inter_frame_test.rs`**: deleted (pre-authorized). Its "every frame parses without
+  panic" check over the same two vectors is strictly subsumed by `conformance_test.rs`'s
+  all-frames MD5 check (which also decodes every frame in order, and additionally verifies
+  pixel-exact output), and it double-decoded 119 frames on every `cargo test` run for no
+  incremental coverage.
+- **`tests/api_test.rs`** (new): `header_test.rs` + `compressed_header_test.rs` +
+  `decode_test.rs` merged verbatim (same test names, same assertions; their 3 `check_vector`
+  helpers renamed to `check_header_vector`/`check_compressed_header_vector`/
+  `check_decode_vector` to avoid collision in one file). The three originals deleted.
+
+### Judgment calls
+
+- `common::first_ivf_frame(bytes: &[u8]) -> (IvfHeader, &[u8])` replaced the repeated
+  "`IvfReader::new` + `.next()`" boilerplate common to all 3 `api_test.rs` probes (and used by
+  `check_header_vector` for the fourcc/width/height check). Returns the owned `IvfHeader`
+  (`Clone`) alongside a `&[u8]` borrowing from the input, rather than the `IvfReader` itself,
+  since none of the 3 callers need to continue iterating past the first frame.
+- `SegSpec`'s fields and `KeyBlock` became `pub` (mostly `pub` fields) purely as a mechanical
+  consequence of the file split -- `synthetic_seg_test.rs`'s scenario builders mutate `SegSpec`
+  fields directly (e.g. `seg.feature_enabled[0][SEG_LVL_SKIP] = true`) and now live in a
+  different module than the struct definition. No behavior change.
+- Left `#[cfg(test)]` off the relocated md5 unit tests (`mod md5_tests` in
+  `conformance_test.rs`): every `tests/*.rs` file is only ever compiled under `cargo test`'s
+  implicit `--test` flag (which itself implies `--cfg test`), so the gate would be
+  permanently-true dead weight there, unlike its original home in `src/md5.rs` where it
+  distinguished test builds from the shipped library.
+
+### Verification
+
+`cargo test`: 146/146 pass across 5 binaries -- lib 118, `api_test` 6, `conformance_test` 12
+(5 conformance + 7 relocated md5 unit tests), `synthetic_seg_test` 6, `decode_to_png` example 4.
+This is exactly 148 (the pre-Wave-3 total across the former 8 binaries/files) minus
+`inter_frame_test.rs`'s 2 deleted tests, with no other count changes anywhere. Conformance: all
+5 tests print real `[ok]`/`[coverage]` lines against real vector paths (not skipped); the skip
+path was re-verified by temporarily renaming `tests/vectors/` (produced the expected `[skip]`
+line, the test still passed, the directory was renamed back immediately after).
+`VP9DEC_FFMPEG=... cargo test --test synthetic_seg_test
+synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`: 8/8 `[xdecode]` OK lines
+(unchanged from before this wave -- `encoder.rs`'s extraction is a pure move, no byte-level
+behavior changed). `cargo clippy --all-targets`: 3 pre-existing warnings only
+(`large_enum_variant` in `src/header.rs`, `identity_op` in `src/superframe.rs`,
+`field_reassign_with_default` in `src/lib.rs`); one new `type_complexity` warning surfaced by
+the merged `check_all_frames`'s bare tuple-`Option` parameter, fixed with the `Coverage` type
+alias above before being recorded as clean.
+`RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --no-deps`: clean pass (2
+pre-existing `private_intra_doc_links` warnings in `src/tile.rs`, unrelated to the md5 move --
+nothing publicly documented ever linked to `vp9dec::md5`). `rustfmt --check` per touched leaf
+file: only `tests/api_test.rs` needed reformatting (a line over 100 columns produced by the
+merge), applied; `tests/common/{mod,md5,encoder}.rs`, `tests/conformance_test.rs`, and
+`tests/synthetic_seg_test.rs` were already clean. `src/lib.rs`'s 2-line mod-declaration removal
+was not run through rustfmt (per the standing constraint) and needed no reformatting regardless.

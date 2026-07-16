@@ -34,8 +34,6 @@ pub mod header;
 #[doc(hidden)]
 pub mod loop_filter;
 #[doc(hidden)]
-pub mod md5;
-#[doc(hidden)]
 pub mod mv;
 #[doc(hidden)]
 pub mod predict;

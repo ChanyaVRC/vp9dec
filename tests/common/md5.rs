@@ -2,13 +2,18 @@
 //!
 //! Used by the conformance test (`tests/conformance_test.rs`) to compare against the
 //! `.md5` files bundled with the official test vectors (MD5 checksums of the decoded
-//! I420 frame data). Implemented using only the standard library, per the zero
-//! dependency crates policy.
+//! I420 frame data). Lives under `tests/common/` (relocated from `src/md5.rs` in Wave 3,
+//! 2026-07-16) since it has no consumer outside the test suite; implemented using only the
+//! standard library, per the zero dependency crates policy.
 //!
 //! The algorithm follows RFC 1321 "The MD5 Message-Digest Algorithm" directly
 //! (<https://www.ietf.org/rfc/rfc1321.txt>, a public IETF standard specification,
 //! which does not fall under this repository's clean-room policy's prohibition on
 //! "referencing other OSS implementations' source code").
+//!
+//! Unit tests for this module live in `tests/conformance_test.rs`'s `mod md5_tests` rather
+//! than here: everything under `tests/common/` is recompiled once per consuming test binary,
+//! so a `#[test]` here would rerun once per binary instead of once overall.
 
 /// The shift amount for each round (RFC 1321 §3.4 "Round 1" through "Round 4").
 const SHIFTS: [u32; 64] = [
@@ -97,69 +102,4 @@ pub fn to_hex(digest: &[u8; 16]) -> String {
         s.push_str(&format!("{byte:02x}"));
     }
     s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn hex_of(data: &[u8]) -> String {
-        to_hex(&md5(data))
-    }
-
-    #[test]
-    fn empty_string() {
-        assert_eq!(hex_of(b""), "d41d8cd98f00b204e9800998ecf8427e");
-    }
-
-    #[test]
-    fn abc() {
-        assert_eq!(hex_of(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
-    }
-
-    #[test]
-    fn message_digest() {
-        assert_eq!(
-            hex_of(b"message digest"),
-            "f96b697d7cb7938d525a2f31aaf161d0"
-        );
-    }
-
-    #[test]
-    fn alphabet() {
-        assert_eq!(
-            hex_of(b"abcdefghijklmnopqrstuvwxyz"),
-            "c3fcd3d76192e4007dfb496cca67e13b"
-        );
-    }
-
-    #[test]
-    fn alphanumeric() {
-        assert_eq!(
-            hex_of(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
-            "d174ab98d277d9f5a5611c2c9f419d9f"
-        );
-    }
-
-    #[test]
-    fn eighty_digits() {
-        assert_eq!(
-            hex_of(
-                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
-            ),
-            "57edf4a22be3c955ac49da2e2107b67a"
-        );
-    }
-
-    /// Confirms padding is applied correctly even for input crossing a block boundary (64 bytes).
-    #[test]
-    fn exactly_one_block() {
-        let data = vec![b'a'; 64];
-        // Rather than comparing against a known value, this only confirms determinism
-        // and the absence of panics (a length of exactly 64 bytes is the boundary case
-        // where padding overflows entirely into a second block).
-        let d1 = md5(&data);
-        let d2 = md5(&data);
-        assert_eq!(d1, d2);
-    }
 }
