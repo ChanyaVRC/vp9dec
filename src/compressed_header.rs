@@ -29,6 +29,7 @@
 //! (`read_inter_mode_probs` onward, spec §6.3.9-6.3.18) were implemented in M3.
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
+use crate::header::NewFrameHeader;
 use crate::prob_tables::{
     CoefProbs, ALTREF_FRAME, COMPOUND_REFERENCE, DEFAULT_COEF_PROBS, DEFAULT_COMP_MODE_PROB,
     DEFAULT_COMP_REF_PROB, DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS,
@@ -498,51 +499,30 @@ fn mv_probs(r: &mut BoolDecoder, allow_high_precision_mv: bool, probs: &mut Comp
     }
 }
 
-/// Parses `compressed_header()` (spec §6.3) (a simplified key-frame-only wrapper).
+/// Parses `compressed_header()` (spec §6.3).
 ///
-/// `data` is the `header_size_in_bytes`-byte slice. `lossless` is the
-/// `Lossless` flag obtained from the uncompressed header's
-/// `quantization_params()`. Calls [`parse_compressed_header_ex`] with
-/// `FrameIsIntra == 1` (starting probabilities are always the default values).
-pub fn parse_compressed_header(
-    data: &[u8],
-    lossless: bool,
-) -> Result<CompressedHeader, CompressedHeaderError> {
-    parse_compressed_header_ex(
-        data,
-        lossless,
-        true,
-        SWITCHABLE,
-        [false; 4],
-        false,
-        CompressedHeaderProbs::default(),
-    )
-}
-
-/// Parses `compressed_header()` (spec §6.3) (the full version, supporting inter frames).
-///
-/// - `frame_is_intra`: `FrameIsIntra`. When true, none of the inter-related
-///   syntax (spec §6.3.9-6.3.18) is read at all.
-/// - `interpolation_filter`: the uncompressed header's `interpolation_filter`
-///   (ignored when `FrameIsIntra == 1`).
-/// - `ref_frame_sign_bias`: the uncompressed header's `ref_frame_sign_bias` (indexed by `ref_frame` value).
-/// - `allow_high_precision_mv`: the uncompressed header's field of the same name.
+/// `data` is the `header_size_in_bytes`-byte slice. The five uncompressed-header-derived
+/// values `read_tx_mode`/`frame_reference_mode`/etc. need (`Lossless`, `FrameIsIntra`,
+/// `interpolation_filter`, `ref_frame_sign_bias`, `allow_high_precision_mv`) are all read
+/// from `header` -- none of them are cross-frame state, unlike `starting_probs`:
+/// - `header.quantization.lossless`: forces `tx_mode` to `ONLY_4X4` when set.
+/// - `header.frame_is_intra`: when true, none of the inter-related syntax
+///   (spec §6.3.9-6.3.18) is read at all.
+/// - `header.interpolation_filter`: read_interp_filter_probs is skipped unless `SWITCHABLE`
+///   (ignored entirely when `FrameIsIntra == 1`).
+/// - `header.ref_frame_sign_bias`: indexed by `ref_frame` value.
+/// - `header.allow_high_precision_mv`: gates whether `mv_class0_hp_prob`/`mv_hp_prob` are read.
 /// - `starting_probs`: the starting probability table equivalent to
 ///   `load_probs( frame_context_idx )` (obtained via [`FrameContextStore::load`]).
-#[allow(clippy::too_many_arguments)]
-pub fn parse_compressed_header_ex(
+pub fn parse_compressed_header(
     data: &[u8],
-    lossless: bool,
-    frame_is_intra: bool,
-    interpolation_filter: u8,
-    ref_frame_sign_bias: [bool; 4],
-    allow_high_precision_mv: bool,
-    starting_probs: CompressedHeaderProbs,
+    header: &NewFrameHeader,
+    starting_probs: FrameContext,
 ) -> Result<CompressedHeader, CompressedHeaderError> {
     let mut r = BoolDecoder::new(data).map_err(CompressedHeaderError::BoolCoder)?;
     let mut probs = starting_probs;
 
-    let tx_mode = read_tx_mode(&mut r, lossless);
+    let tx_mode = read_tx_mode(&mut r, header.quantization.lossless);
     if tx_mode == TX_MODE_SELECT {
         read_tx_mode_probs(&mut r, &mut probs.tx_probs);
     }
@@ -553,20 +533,20 @@ pub fn parse_compressed_header_ex(
     let mut comp_fixed_ref = 0u8;
     let mut comp_var_ref = [0u8; 2];
 
-    if !frame_is_intra {
+    if !header.frame_is_intra {
         read_inter_mode_probs(&mut r, &mut probs.inter_mode_probs);
-        if interpolation_filter == SWITCHABLE {
+        if header.interpolation_filter == SWITCHABLE {
             read_interp_filter_probs(&mut r, &mut probs.interp_filter_probs);
         }
         read_is_inter_probs(&mut r, &mut probs.is_inter_prob);
-        let (rm, cfr, cvr) = frame_reference_mode(&mut r, &ref_frame_sign_bias);
+        let (rm, cfr, cvr) = frame_reference_mode(&mut r, &header.ref_frame_sign_bias);
         reference_mode = rm;
         comp_fixed_ref = cfr;
         comp_var_ref = cvr;
         frame_reference_mode_probs(&mut r, reference_mode, &mut probs);
         read_y_mode_probs(&mut r, &mut probs.y_mode_probs);
         read_partition_probs(&mut r, &mut probs.partition_probs);
-        mv_probs(&mut r, allow_high_precision_mv, &mut probs);
+        mv_probs(&mut r, header.allow_high_precision_mv, &mut probs);
     }
 
     r.exit_bool();
@@ -583,8 +563,76 @@ pub fn parse_compressed_header_ex(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::header::{
+        ColorConfig, FrameType, LoopFilterParams, QuantizationParams, SegmentationParams,
+    };
     use crate::prob_tables::ONLY_4X4;
     use crate::test_support::BoolEncoder;
+
+    /// Builds a minimal key-frame `NewFrameHeader` for these tests: `quantization.lossless` is
+    /// the value under test; every other field holds what a real key frame's header would
+    /// (`frame_is_intra = true`, so the four inter-only fields `interpolation_filter`/
+    /// `ref_frame_sign_bias`/`allow_high_precision_mv` are never actually read by
+    /// `parse_compressed_header`, but are filled with the same values a real key frame's
+    /// parse produces -- see `header.rs`'s key-frame branch).
+    fn key_frame_header(lossless: bool) -> NewFrameHeader {
+        NewFrameHeader {
+            profile: 0,
+            frame_type: FrameType::KeyFrame,
+            show_frame: true,
+            error_resilient_mode: false,
+            frame_is_intra: true,
+            intra_only: false,
+            reset_frame_context: 0,
+            color_config: Some(ColorConfig {
+                bit_depth: 8,
+                color_space: 0,
+                color_range: false,
+                subsampling_x: 1,
+                subsampling_y: 1,
+            }),
+            width: 8,
+            height: 8,
+            render_width: 8,
+            render_height: 8,
+            refresh_frame_flags: 0xFF,
+            ref_frame_idx: [0, 0, 0],
+            ref_frame_sign_bias: [false; 4],
+            allow_high_precision_mv: false,
+            interpolation_filter: SWITCHABLE,
+            refresh_frame_context: true,
+            frame_parallel_decoding_mode: false,
+            frame_context_idx: 0,
+            frame_context_idx_raw: 0,
+            loop_filter: LoopFilterParams {
+                level: 0,
+                sharpness: 0,
+                delta_enabled: false,
+                ref_deltas: [1, 0, -1, -1],
+                mode_deltas: [0, 0],
+            },
+            quantization: QuantizationParams {
+                base_q_idx: 0,
+                delta_q_y_dc: 0,
+                delta_q_uv_dc: 0,
+                delta_q_uv_ac: 0,
+                lossless,
+            },
+            segmentation: SegmentationParams {
+                enabled: false,
+                update_map: false,
+                tree_probs: [255; 7],
+                pred_prob: [255; 3],
+                temporal_update: false,
+                abs_or_delta_update: false,
+                feature_enabled: [[false; 4]; 8],
+                feature_data: [[0; 4]; 8],
+            },
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+            header_size_in_bytes: 0,
+        }
+    }
 
     #[test]
     fn lossless_frame_forces_only_4x4_and_reads_no_extra_bit() {
@@ -599,7 +647,9 @@ mod tests {
         enc.write_bool(false, 252); // read_skip_prob[2]
         let buf = enc.finish();
 
-        let header = parse_compressed_header(&buf, true).expect("should parse");
+        let header =
+            parse_compressed_header(&buf, &key_frame_header(true), FrameContext::default())
+                .expect("should parse");
         assert_eq!(header.tx_mode, ONLY_4X4);
         assert_eq!(header.probs, CompressedHeaderProbs::default());
     }
@@ -618,7 +668,9 @@ mod tests {
         enc.write_bool(false, 252);
         let buf = enc.finish();
 
-        let header = parse_compressed_header(&buf, false).expect("should parse");
+        let header =
+            parse_compressed_header(&buf, &key_frame_header(false), FrameContext::default())
+                .expect("should parse");
         assert_eq!(header.tx_mode, 2); // ALLOW_16X16
         assert_eq!(header.probs, CompressedHeaderProbs::default());
     }
@@ -642,7 +694,9 @@ mod tests {
         enc.write_bool(false, 252);
         let buf = enc.finish();
 
-        let header = parse_compressed_header(&buf, false).expect("should parse");
+        let header =
+            parse_compressed_header(&buf, &key_frame_header(false), FrameContext::default())
+                .expect("should parse");
         assert_eq!(header.tx_mode, TX_MODE_SELECT);
         assert_eq!(header.probs, CompressedHeaderProbs::default());
     }
@@ -660,7 +714,9 @@ mod tests {
         enc.write_bool(false, 252); // skip_prob[2]: update_prob=0
         let buf = enc.finish();
 
-        let header = parse_compressed_header(&buf, true).expect("should parse");
+        let header =
+            parse_compressed_header(&buf, &key_frame_header(true), FrameContext::default())
+                .expect("should parse");
         let expected = inv_remap_prob(5, DEFAULT_SKIP_PROB[0]);
         assert_eq!(header.probs.skip_prob[0], expected);
         assert_ne!(header.probs.skip_prob[0], DEFAULT_SKIP_PROB[0]);
@@ -682,7 +738,8 @@ mod tests {
     fn empty_data_is_rejected() {
         let data: [u8; 0] = [];
         assert_eq!(
-            parse_compressed_header(&data, true).unwrap_err(),
+            parse_compressed_header(&data, &key_frame_header(true), FrameContext::default())
+                .unwrap_err(),
             CompressedHeaderError::BoolCoder(BoolCoderError::EmptyBuffer)
         );
     }

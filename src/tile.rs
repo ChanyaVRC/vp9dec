@@ -22,7 +22,8 @@ use crate::counts::Counts;
 use crate::dpb::RefFrameData;
 use crate::framebuffer::Plane;
 use crate::header::{
-    self, NewFrameHeader, SegmentationParams, SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
+    self, ColorConfig, NewFrameHeader, SegmentationParams, SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME,
+    SEG_LVL_SKIP,
 };
 use crate::mv::{
     add_mv_ref_list, clamp_mv_col, clamp_mv_row, scale_mv, use_mv_hp, Mv, MVREF_NEIGHBOURS,
@@ -245,18 +246,23 @@ impl TileDecoder {
     /// Builds a `TileDecoder` from the uncompressed and compressed headers.
     ///
     /// # Panics
-    /// Panics if `header.color_config.bit_depth != 8`. Frame buffers for depths other than
+    /// Panics if `color_config.bit_depth != 8`. Frame buffers for depths other than
     /// 8bit (10bit/12bit) cannot be represented since [`Plane`] is fixed to `u8`.
     /// The caller ([`crate::decode_keyframe`]) must check `bit_depth` before calling
     /// `TileDecoder::new`. `use_prev_frame_mvs`/`prev_mi_grid` are always
     /// `false`/`None` (a simple constructor for key frames / M2 compatibility).
     /// `prev_segment_ids` is seeded to all-zero (the "first frame" state of spec
     /// §7.2.6), sized to this frame's `MiRows x MiCols`.
-    pub fn new(header: &NewFrameHeader, compressed: &CompressedHeader) -> Self {
+    pub fn new(
+        header: &NewFrameHeader,
+        color_config: ColorConfig,
+        compressed: &CompressedHeader,
+    ) -> Self {
         let image_size = header::compute_image_size(header.width, header.height);
         let zero_prev_segment_ids = vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize];
         Self::new_with_prev(
             header,
+            color_config,
             compressed,
             false,
             None,
@@ -265,17 +271,20 @@ impl TileDecoder {
         )
     }
 
-    /// Inter-frame-capable version of [`TileDecoder::new`]. `use_prev_frame_mvs`/`prev_mi_grid`
-    /// correspond to `UsePrevFrameMvs` from spec §7.2.6 and the previous frame's
-    /// `Mvs`/`RefFrames` that it references (the `usePrev` branch of `find_mv_refs`, spec
-    /// §6.5.1). `resolved_refs` is the actual pixel data of the reference frames used for
-    /// motion compensation (spec §8.5.2) (resolved by the caller from [`crate::dpb::Dpb`],
-    /// indexed the same way as `ref_frame_idx`). `prev_segment_ids` is `PrevSegmentIds`
-    /// (spec §6.4.14), row-major `MiRows x MiCols`; unlike `prev_mi_grid` it is NOT gated
-    /// by `use_prev_frame_mvs` (its own persistence/reset rules are spec §7.2.6/§8.1 step 3,
-    /// tracked by the caller — see `Decoder::prev_segment_ids` in `src/lib.rs`).
+    /// Inter-frame-capable version of [`TileDecoder::new`]. `color_config` is the resolved
+    /// value for this frame (the caller -- `Decoder` -- resolves `NewFrameHeader::color_config`,
+    /// which is `None` for a regular inter frame, before calling this; see `src/lib.rs`).
+    /// `use_prev_frame_mvs`/`prev_mi_grid` correspond to `UsePrevFrameMvs` from spec §7.2.6 and
+    /// the previous frame's `Mvs`/`RefFrames` that it references (the `usePrev` branch of
+    /// `find_mv_refs`, spec §6.5.1). `resolved_refs` is the actual pixel data of the reference
+    /// frames used for motion compensation (spec §8.5.2) (resolved by the caller from
+    /// [`crate::dpb::Dpb`], indexed the same way as `ref_frame_idx`). `prev_segment_ids` is
+    /// `PrevSegmentIds` (spec §6.4.14), row-major `MiRows x MiCols`; unlike `prev_mi_grid` it is
+    /// NOT gated by `use_prev_frame_mvs` (its own persistence/reset rules are spec §7.2.6/§8.1
+    /// step 3, tracked by the caller — see `Decoder::prev_segment_ids` in `src/lib.rs`).
     pub fn new_with_prev(
         header: &NewFrameHeader,
+        color_config: ColorConfig,
         compressed: &CompressedHeader,
         use_prev_frame_mvs: bool,
         prev_mi_grid: Option<MiGrid>,
@@ -283,14 +292,14 @@ impl TileDecoder {
         prev_segment_ids: Vec<u8>,
     ) -> Self {
         assert_eq!(
-            header.color_config.bit_depth, 8,
+            color_config.bit_depth, 8,
             "TileDecoder only supports 8bit frames"
         );
         let image_size = header::compute_image_size(header.width, header.height);
         let grid_cols = (image_size.sb64_cols * 8) as usize;
         let grid_rows = (image_size.sb64_rows * 8) as usize;
-        let subsampling_x = header.color_config.subsampling_x as u32;
-        let subsampling_y = header.color_config.subsampling_y as u32;
+        let subsampling_x = color_config.subsampling_x as u32;
+        let subsampling_y = color_config.subsampling_y as u32;
 
         // Frame buffers are allocated rounded up to the superblock boundary
         // (Sb64Cols*64 / Sb64Rows*64) (see the docs in src/framebuffer.rs).
@@ -329,7 +338,7 @@ impl TileDecoder {
             mi_col_end: image_size.mi_cols,
             mi_row_start: 0,
             mi_row_end: image_size.mi_rows,
-            bit_depth: header.color_config.bit_depth,
+            bit_depth: color_config.bit_depth,
             subsampling_x,
             subsampling_y,
             lossless: header.quantization.lossless,
@@ -2294,13 +2303,13 @@ mod tests {
             ref_frame_sign_bias: [false; 4],
             allow_high_precision_mv: false,
             interpolation_filter: crate::prob_tables::SWITCHABLE,
-            color_config: ColorConfig {
+            color_config: Some(ColorConfig {
                 bit_depth: 8,
                 color_space: 0,
                 color_range: false,
                 subsampling_x: 1,
                 subsampling_y: 1,
-            },
+            }),
             width,
             height,
             render_width: width,
@@ -2361,7 +2370,7 @@ mod tests {
         // has_rows=has_cols=true and the whole tree must be read.
         let header = minimal_header(8, 8);
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
         let mut enc = BoolEncoder::new();
         // BLOCK_64X64: has_rows=true, has_cols=true (MiRows=MiCols=1, half=32>>... actually
@@ -2408,7 +2417,7 @@ mod tests {
         // pipeline with a minimal configuration.
         let header = minimal_header(8, 8);
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
         let mut enc = BoolEncoder::new();
         enc.write_bool(false, KF_PARTITION_PROBS[0][0]); // PARTITION_NONE
@@ -2453,7 +2462,7 @@ mod tests {
         header.segmentation.update_map = true;
         header.segmentation.tree_probs = [128; 7];
         let compressed = default_compressed_header();
-        let decoder = TileDecoder::new(&header, &compressed);
+        let decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
         // segment_tree[14] = {2,4,6,8,10,12, 0,-1,-2,-3,-4,-5,-6,-7} (spec §9.3.1). Leaf
         // value 5 is reached via node 0 (bit=1 -> index 4), node 2 (bit=0 -> index 10),
@@ -2474,7 +2483,7 @@ mod tests {
     fn intra_segment_id_is_zero_without_update_map() {
         let header = minimal_header(8, 8); // segmentation disabled.
         let compressed = default_compressed_header();
-        let decoder = TileDecoder::new(&header, &compressed);
+        let decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
         // An empty tile: if intra_segment_id tried to read a bit, this would panic/error.
         let mut r = BoolDecoder::new(&[0x00]).expect("valid bitstream");
@@ -2497,6 +2506,7 @@ mod tests {
         ];
         let decoder = TileDecoder::new_with_prev(
             &header,
+            header.color_config.unwrap(),
             &compressed,
             false,
             None,
@@ -2527,6 +2537,7 @@ mod tests {
         let prev_segment_ids = vec![6u8]; // MiCols=MiRows=1 at 8x8.
         let mut decoder = TileDecoder::new_with_prev(
             &header,
+            header.color_config.unwrap(),
             &compressed,
             false,
             None,
@@ -2551,7 +2562,7 @@ mod tests {
         header.segmentation.enabled = true;
         header.segmentation.feature_enabled[2][SEG_LVL_SKIP] = true;
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
         // Empty tile data: if read_skip tried to read a bit, BoolDecoder::new would still
         // succeed on an all-zero buffer, but the returned value would come from the (absent)
@@ -2571,7 +2582,7 @@ mod tests {
         header.segmentation.feature_enabled[1][SEG_LVL_REF_FRAME] = true;
         header.segmentation.feature_data[1][SEG_LVL_REF_FRAME] = LAST_FRAME as i32;
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
         let n = NeighborRefInfo {
             avail_u: false,
             avail_l: false,
@@ -2597,7 +2608,7 @@ mod tests {
         header.segmentation.feature_enabled[4][SEG_LVL_REF_FRAME] = true;
         header.segmentation.feature_data[4][SEG_LVL_REF_FRAME] = GOLDEN_FRAME as i32;
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
         let n = NeighborRefInfo {
             avail_u: false,
             avail_l: false,
@@ -2626,7 +2637,7 @@ mod tests {
         let mut header = header;
         header.tile_cols_log2 = 1;
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
         // Less than 4 bytes, so not even the tile size field can be read.
         let buf = [0u8; 2];
@@ -2652,7 +2663,7 @@ mod tests {
     fn read_mv_component_class0_roundtrip() {
         let header = minimal_inter_header(64, 64);
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
         let probs = CompressedHeaderProbs::default();
 
         // mv_sign=0(positive), mv_class=MV_CLASS_0, class0_bit=1, class0_fr=2, (since
@@ -2677,7 +2688,7 @@ mod tests {
     fn read_mv_component_negative_class0_roundtrip() {
         let header = minimal_inter_header(64, 64);
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
         let probs = CompressedHeaderProbs::default();
 
         let mut enc = BoolEncoder::new();
@@ -2698,7 +2709,7 @@ mod tests {
     fn read_mv_component_higher_class_roundtrip() {
         let header = minimal_inter_header(64, 64);
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
         let probs = CompressedHeaderProbs::default();
 
         // mv_class = MV_CLASS_1 (value 1): in the tree [0,2,-1,4,...], bit0=1,bit1=0 -> leaf -1 (value 1).
@@ -2725,7 +2736,7 @@ mod tests {
         // read_mv(ref) = BestMv + diffMv. mv_joint = MV_JOINT_HNZVNZ (both components nonzero).
         let header = minimal_inter_header(64, 64);
         let compressed = default_compressed_header();
-        let mut decoder = TileDecoder::new(&header, &compressed);
+        let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
         let probs = CompressedHeaderProbs::default();
         let best_mv: Mv = [10, -20];
 

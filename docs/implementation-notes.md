@@ -832,3 +832,158 @@ in any form.
 `field_reassign_with_default`); the two `new_without_default` warnings clippy raised
 against the newly-`pub` `BoolEncoder`/`BitWriter` were fixed by adding `Default` impls
 (delegating to `new()`) rather than suppressed.
+
+## Wave 2a: internal signature redesign (2026-07-16)
+
+### Scope
+
+Killed the "cross-frame state threaded one-parameter-per-milestone" pattern and the `_ex`
+suffix accretion, purely internal (public `Decoder`/`decode_keyframe` behavior is
+byte-identical; all 7 MD5 conformance tests + 4 synthetic round-trip tests pin it
+unmodified). Touched `src/header.rs`, `src/compressed_header.rs`, `src/lib.rs`,
+`src/tile.rs`, `tests/header_test.rs`, `tests/compressed_header_test.rs`.
+`tests/synthetic_seg_test.rs` calls only `Decoder`'s public API and needed no changes
+(verified by inspection: no direct `parse_uncompressed_header`/`parse_compressed_header`/
+`TileDecoder` calls in that file).
+
+### `PersistentState` (spec §7.2 cross-frame state)
+
+`src/header.rs` gained three new structs: `LoopFilterDeltas { ref_deltas, mode_deltas }`,
+`SegFeaturePersist { enabled, data, abs_or_delta }` (replacing the former
+`(SegFeatureEnabled, SegFeatureData, bool)` tuple), and `PersistentState {
+ref_frame_sizes, loop_filter_deltas, segmentation }` bundling both plus the reference
+frame size table. All three derive `Copy` (matching the tuples they replace) and get a
+`new()`/`Default` pair whose value is exactly `Decoder::new()`'s old field-by-field
+initialization (`ref_frame_sizes` all-zero, `loop_filter_deltas` = the spec's
+`DEFAULT_LOOP_FILTER_*` constants -- NOT all-zero, despite the task brief's "all-zero
+state" phrasing being a simplification -- `segmentation` all-zero/false). This matters
+because `decode_keyframe`'s old "dummy" values were built from exactly those same
+constants; replacing them with `PersistentState::default()` is only behavior-preserving
+because the default reproduces that exact prior value, not a literal all-zero struct.
+
+`parse_uncompressed_header(data, prev: &PersistentState)` replaces the old 4-parameter
+form; `parse_loop_filter_params`/`parse_segmentation_params` take the new named structs
+(by value, since `Copy`) instead of tuples. `Decoder` now holds one `persist:
+PersistentState` field instead of `ref_frame_sizes`/`loop_filter_deltas`/
+`segmentation_features`; all three post-decode write-back sites in `decode_one_frame`
+write into `self.persist.*` instead.
+
+### Honest `color_config`
+
+`NewFrameHeader::color_config` is now `Option<ColorConfig>`: `Some` for key frames
+(always) and `intra_only` frames (both the `profile > 0` parsed case and the `profile ==
+0` spec-defined 8-bit/CS_BT_601/4:2:0 default -- confirmed the latter is genuinely
+spec-defined, not a fabrication, by re-reading spec §6.2.2's `color_config()` default
+path before leaving that branch `Some`); `None` for a regular inter frame, which the old
+code filled with a fabricated `{CS_UNKNOWN, 8-bit, 4:2:0}` placeholder.
+
+`Decoder::decode_one_frame` resolves this once, right after the `FrameHeader::New` match:
+
+```rust
+let color_config = header.color_config.unwrap_or_else(|| {
+    self.last_color_config.unwrap_or(ColorConfig { bit_depth: 8, color_space: CS_UNKNOWN,
+        color_range: false, subsampling_x: 1, subsampling_y: 1 })
+});
+if header.frame_is_intra {
+    self.last_color_config = Some(color_config);
+}
+```
+
+Proved this behavior-neutral by case analysis rather than by trusting the tests alone
+(the degenerate branch -- an inter frame before any intra frame ever ran -- isn't
+exercised by any conformance vector, so a test pass wouldn't have caught a subtle
+mismatch here):
+
+- `frame_is_intra == true` (key or intra_only): `header.color_config` is always `Some`,
+  so `unwrap_or_else`'s closure never runs; `color_config` is exactly the parsed/
+  spec-default value, and `last_color_config` is refreshed to it -- identical to the old
+  `self.last_color_config = Some(header.color_config)`.
+- `frame_is_intra == false` with a prior intra frame seen: `header.color_config` is
+  `None`, so `color_config` = `self.last_color_config.unwrap()` -- identical to the old
+  `else if let Some(cc) = self.last_color_config { header.color_config = cc; }`.
+- `frame_is_intra == false`, no prior intra frame (`last_color_config` still `None`,
+  malformed-but-defensively-handled stream): `color_config` falls through to the
+  hardcoded `{8-bit, CS_UNKNOWN, 4:2:0}` literal -- byte-for-byte the same struct
+  `header.rs` used to fabricate inline for every non-intra frame, just now materialized
+  in `lib.rs` only for this one fallback case instead of unconditionally.
+
+The resolved `color_config` then replaces every downstream read of `header.color_config`
+(the bit-depth check, `build_ref_frame_data`, `crop_to_frame`, and the new
+`TileDecoder::new`/`new_with_prev` parameter below) -- `header.color_config` itself is
+never read again after the resolution point.
+
+### `TileDecoder::new`/`new_with_prev` gained a `color_config: ColorConfig` parameter
+
+Not explicitly requested by the task brief, but a necessary consequence of making
+`color_config` honest: `TileDecoder::new_with_prev` previously read
+`header.color_config.bit_depth`/`.subsampling_x`/`.subsampling_y` directly, which no
+longer type-checks once the field is `Option`. Rather than have `TileDecoder` re-derive
+its own fallback (reintroducing exactly the fabrication this wave removes, just
+relocated), it now takes the caller's already-resolved `ColorConfig` as a plain
+parameter, inserted right after `header`. This rippled into ~14 call sites: `src/lib.rs`
+(1), `src/tile.rs`'s own unit tests (12, all via `header.color_config.unwrap()` since
+their `minimal_header()` test helper always sets it to `Some`), and
+`tests/compressed_header_test.rs` (1, via `header.color_config.expect(...)` since the
+first frame of any IVF stream is a key frame).
+
+### Collapsed `parse_compressed_header`/`_ex`
+
+`parse_compressed_header(data, header: &NewFrameHeader, starting_probs: FrameContext)`
+replaces both the old keyframe-only wrapper and the 7-argument `_ex` (`#[allow(
+clippy::too_many_arguments)]` deleted along with it -- `header.rs` had no such allow to
+begin with). Verified all five of `_ex`'s former loose parameters
+(`lossless`/`frame_is_intra`/`interpolation_filter`/`ref_frame_sign_bias`/
+`allow_high_precision_mv`) exist on `NewFrameHeader` already, so no field needed adding.
+`compressed_header.rs`'s 5 internal unit tests and `tests/compressed_header_test.rs`'s
+external one previously called the keyframe-only wrapper (which hardcoded
+`frame_is_intra = true`, `interpolation_filter = SWITCHABLE`, `ref_frame_sign_bias =
+[false; 4]`, `allow_high_precision_mv = false`); a `#[cfg(test)] fn key_frame_header
+(lossless) -> NewFrameHeader` helper in `compressed_header.rs` now builds a full header
+carrying those same four values (they match what a real key frame's
+`parse_uncompressed_header` produces anyway, since those fields are never touched by the
+key-frame branch), so the encoded bitstreams in those tests needed no changes.
+
+### Judgment call: recovering from an accidental `rustfmt src/lib.rs` invocation
+
+Ran `rustfmt --check` in a shell loop over all six touched files for the final
+verification pass, including `src/lib.rs` -- forgetting, in the moment, that the
+project's standing rule against `rustfmt src/lib.rs` applies even in `--check` mode
+(module-tree cascading is triggered by rustfmt's file-discovery logic regardless of
+`--check` vs. write). No files were written (`--check` only reports), but the output
+confirmed the cascade did happen: diffs were reported against `src/compressed_header.rs`,
+`src/header.rs`, `src/prob_tables.rs`, and `src/lib.rs` itself from that single `src/
+lib.rs` invocation. Recovery: abandoned that loop entirely; ran `rustfmt` (write mode)
+individually only on the leaf-module files with no `mod x;` file-declarations of their
+own (`src/compressed_header.rs`, `src/header.rs`, `src/tile.rs`,
+`tests/compressed_header_test.rs`, `tests/header_test.rs` -- each only has inline
+`#[cfg(test)] mod tests { ... }`, so formatting them individually cannot cascade
+further), then hand-fixed `src/lib.rs`'s two over-length lines introduced by this wave's
+own edits via targeted `Edit` calls, leaving the rest of `src/lib.rs` (and
+`src/prob_tables.rs`, untouched by this wave at all) alone.
+
+One of those individual `rustfmt` invocations swept up unrelated pre-existing drift
+anyway: formatting `src/tile.rs` as a whole file also rewrapped `read_ref_frames`'s
+signature (a function this wave never touched) onto multiple lines. Caught this by
+diffing before/after and reverted that one hunk by hand, restoring the original one-line
+signature -- `rustfmt --check src/tile.rs` now reports exactly that one pre-existing
+diff, left deliberately alone per "leave unrelated hunks alone."
+
+### Verification
+
+`cargo test`: 150 passed, 0 failed, across all 9 binaries -- unchanged from the Wave 1
+baseline (125 lib unit + 2 + 7 + 2 + 2 + 2 + 6 integration + 4 example). Conformance
+(`cargo test --test conformance_test -- --nocapture`): 7/7, all printing real `[ok]`
+lines with vector paths (none skipped). `VP9DEC_FFMPEG=... cargo test --test
+synthetic_seg_test synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`: all 8
+`[xdecode] .../libvpx-vp9: OK` / `.../vp9: OK` lines present. `cargo clippy
+--all-targets`: the same 3 pre-existing warnings as Wave 1's baseline
+(`src/header.rs` `large_enum_variant`, `src/superframe.rs` `identity_op`, `src/lib.rs`
+`field_reassign_with_default`, all confirmed via `git diff` to fall on lines this wave
+never touched); the `too_many_arguments` allow removed from `compressed_header.rs` did
+not reappear (the new 3-parameter `parse_compressed_header` is well under the default
+threshold), and `tile.rs`/`loop_filter.rs`/`predict.rs`'s pre-existing allows for that
+lint were left untouched as instructed. `git diff --stat`: exactly the 6 intended files
+(`src/header.rs`, `src/compressed_header.rs`, `src/lib.rs`, `src/tile.rs`,
+`tests/header_test.rs`, `tests/compressed_header_test.rs`); `tests/synthetic_seg_test.rs`,
+`tests/decode_test.rs`, `tests/inter_frame_test.rs`, and `tests/conformance_test.rs` show
+no diff.

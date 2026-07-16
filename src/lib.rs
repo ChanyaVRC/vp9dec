@@ -35,12 +35,13 @@ pub mod tile;
 pub mod transform;
 
 use compressed_header::{
-    parse_compressed_header_ex, CompressedHeaderError, FrameContext, FrameContextStore,
+    parse_compressed_header, CompressedHeaderError, FrameContext, FrameContextStore,
 };
 use counts::{adapt_coef_probs, adapt_noncoef_probs};
 use dpb::{Dpb, RefFrameData};
 use header::{
-    parse_uncompressed_header, ColorConfig, FrameHeader, FrameType, HeaderError, NUM_REF_FRAMES,
+    parse_uncompressed_header, ColorConfig, FrameHeader, FrameType, HeaderError, LoopFilterDeltas,
+    PersistentState, SegFeaturePersist, CS_UNKNOWN,
 };
 use tile::{MiGrid, TileDecoder, TileError};
 
@@ -189,22 +190,9 @@ fn ref_frame_data_to_frame(data: &RefFrameData) -> Frame {
 /// After tile decoding and before cropping, the loop filter (spec §8.8, [`crate::loop_filter`]) is applied.
 pub fn decode_keyframe(frame_data: &[u8]) -> Result<Frame, DecodeError> {
     // Confirm up front that this is a keyframe (decode_frame also accepts non-keyframes).
-    let dummy_ref_sizes = [(0u32, 0u32); NUM_REF_FRAMES];
-    let dummy_lf_deltas = (
-        header::DEFAULT_LOOP_FILTER_REF_DELTAS,
-        header::DEFAULT_LOOP_FILTER_MODE_DELTAS,
-    );
-    let dummy_seg_features = (
-        [[false; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
-        [[0i32; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
-        false,
-    );
-    let (parsed, _consumed) = parse_uncompressed_header(
-        frame_data,
-        &dummy_ref_sizes,
-        dummy_lf_deltas,
-        dummy_seg_features,
-    )?;
+    // A keyframe's setup_past_independence() ignores whatever persisted state is passed in
+    // anyway, so a fresh PersistentState::default() is equivalent to real prior state here.
+    let (parsed, _consumed) = parse_uncompressed_header(frame_data, &PersistentState::default())?;
     match &parsed {
         FrameHeader::New(h) if h.frame_type == FrameType::KeyFrame => {}
         FrameHeader::New(_) => return Err(DecodeError::NotAKeyFrame),
@@ -235,7 +223,10 @@ pub fn decode_keyframe(frame_data: &[u8]) -> Result<Frame, DecodeError> {
 /// - `LastFrameType` (spec §7.2; used in the `updateFactor` calculation for
 ///   probability adaptation, spec §8.4.3).
 pub struct Decoder {
-    ref_frame_sizes: [(u32, u32); NUM_REF_FRAMES],
+    /// Cross-frame state spec §7.2 requires: `RefFrameWidth`/`RefFrameHeight`, the loop
+    /// filter's `ref_deltas`/`mode_deltas`, and the segmentation feature state -- see
+    /// [`PersistentState`].
+    persist: PersistentState,
     frame_contexts: FrameContextStore,
     /// Used for computing `UsePrevFrameMvs` (spec §7.2.6). Not updated on
     /// `show_existing_frame` (because `compute_image_size` isn't called).
@@ -250,15 +241,6 @@ pub struct Decoder {
     last_color_config: Option<ColorConfig>,
     /// The actual pixel data of reference frames (spec §8.10 `FrameStore`).
     dpb: Dpb,
-    /// The loop filter's `ref_deltas`/`mode_deltas` (state that persists per spec §7.2).
-    loop_filter_deltas: ([i8; 4], [i8; 2]),
-    /// The segmentation `FeatureEnabled`/`FeatureData`/`segmentation_abs_or_delta_update`
-    /// state that persists across frames per spec §7.2.10 (reset by `setup_past_independence()`).
-    segmentation_features: (
-        [[bool; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
-        [[i32; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
-        bool,
-    ),
     /// `PrevSegmentIds` (spec §6.4.14), row-major `MiRows x MiCols` (unpadded).
     /// Cleared to all-zero on the first frame and whenever the frame size changes
     /// (spec §7.2.6), updated after decoding only when
@@ -281,22 +263,13 @@ impl Default for Decoder {
 impl Decoder {
     pub fn new() -> Self {
         Self {
-            ref_frame_sizes: [(0, 0); NUM_REF_FRAMES],
+            persist: PersistentState::default(),
             frame_contexts: FrameContextStore::new(),
             prev_frame_dims: None,
             prev_show_frame: None,
             prev_mi_grid: None,
             last_color_config: None,
             dpb: Dpb::new(),
-            loop_filter_deltas: (
-                header::DEFAULT_LOOP_FILTER_REF_DELTAS,
-                header::DEFAULT_LOOP_FILTER_MODE_DELTAS,
-            ),
-            segmentation_features: (
-                [[false; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
-                [[0; header::SEG_LVL_MAX]; header::MAX_SEGMENTS],
-                false,
-            ),
             prev_segment_ids: Vec::new(),
             last_frame_type: None,
             last_frame_info: None,
@@ -364,13 +337,8 @@ impl Decoder {
     /// (reference frame buffers, frame context, previous frame's MVs, etc.) is updated
     /// correctly in either case.
     fn decode_one_frame(&mut self, frame_data: &[u8]) -> Result<Option<Frame>, DecodeError> {
-        let (parsed, consumed) = parse_uncompressed_header(
-            frame_data,
-            &self.ref_frame_sizes,
-            self.loop_filter_deltas,
-            self.segmentation_features,
-        )?;
-        let mut header = match parsed {
+        let (parsed, consumed) = parse_uncompressed_header(frame_data, &self.persist)?;
+        let header = match parsed {
             FrameHeader::New(h) => h,
             FrameHeader::ShowExistingFrame {
                 frame_to_show_map_idx,
@@ -383,17 +351,26 @@ impl Decoder {
             }
         };
 
+        // header.color_config is Some exactly when frame_is_intra (see header.rs); resolve it
+        // once, here, to the value that applies to this frame. Reproduces the old
+        // fabricate-then-patch behavior exactly, including its degenerate-case fallback (an
+        // inter frame appearing before any intra frame ever ran): the same fixed placeholder
+        // color config that header.rs used to fabricate for every non-intra frame.
+        let color_config = header.color_config.unwrap_or_else(|| {
+            self.last_color_config.unwrap_or(ColorConfig {
+                bit_depth: 8,
+                color_space: CS_UNKNOWN,
+                color_range: false,
+                subsampling_x: 1,
+                subsampling_y: 1,
+            })
+        });
         if header.frame_is_intra {
-            self.last_color_config = Some(header.color_config);
-        } else if let Some(cc) = self.last_color_config {
-            // Inter frames don't resend color_config (see comment in header.rs).
-            header.color_config = cc;
+            self.last_color_config = Some(color_config);
         }
 
-        if header.color_config.bit_depth != 8 {
-            return Err(DecodeError::UnsupportedBitDepth(
-                header.color_config.bit_depth,
-            ));
+        if color_config.bit_depth != 8 {
+            return Err(DecodeError::UnsupportedBitDepth(color_config.bit_depth));
         }
 
         let header_size = header.header_size_in_bytes as usize;
@@ -444,15 +421,8 @@ impl Decoder {
         // backward adaptation.
         let starting_probs = self.frame_contexts.load(header.frame_context_idx);
 
-        let compressed = parse_compressed_header_ex(
-            compressed_bytes,
-            header.quantization.lossless,
-            header.frame_is_intra,
-            header.interpolation_filter,
-            header.ref_frame_sign_bias,
-            header.allow_high_precision_mv,
-            starting_probs.clone(),
-        )?;
+        let compressed =
+            parse_compressed_header(compressed_bytes, &header, starting_probs.clone())?;
 
         // Resolve the pixel data of the DPB slots this frame references, for motion
         // compensation (spec §8.5.2.3-8.5.2.4). Not referenced when `FrameIsIntra == 1`.
@@ -470,6 +440,7 @@ impl Decoder {
         };
         let mut tile_decoder = TileDecoder::new_with_prev(
             &header,
+            color_config,
             &compressed,
             use_prev_frame_mvs,
             prev_grid,
@@ -541,10 +512,10 @@ impl Decoder {
             tile_decoder.planes(),
             header.width,
             header.height,
-            &header.color_config,
+            &color_config,
         );
         self.dpb.update(header.refresh_frame_flags, &ref_data);
-        for (slot, size) in self.ref_frame_sizes.iter_mut().enumerate() {
+        for (slot, size) in self.persist.ref_frame_sizes.iter_mut().enumerate() {
             if (header.refresh_frame_flags >> slot) & 1 == 1 {
                 *size = (header.width, header.height);
             }
@@ -555,15 +526,15 @@ impl Decoder {
         self.prev_frame_dims = Some((header.width, header.height));
         self.prev_show_frame = Some(header.show_frame);
         self.prev_mi_grid = Some(tile_decoder.mi_grid().clone());
-        self.loop_filter_deltas = (
-            header.loop_filter.ref_deltas,
-            header.loop_filter.mode_deltas,
-        );
-        self.segmentation_features = (
-            header.segmentation.feature_enabled,
-            header.segmentation.feature_data,
-            header.segmentation.abs_or_delta_update,
-        );
+        self.persist.loop_filter_deltas = LoopFilterDeltas {
+            ref_deltas: header.loop_filter.ref_deltas,
+            mode_deltas: header.loop_filter.mode_deltas,
+        };
+        self.persist.segmentation = SegFeaturePersist {
+            enabled: header.segmentation.feature_enabled,
+            data: header.segmentation.feature_data,
+            abs_or_delta: header.segmentation.abs_or_delta_update,
+        };
         self.last_frame_type = Some(header.frame_type);
         self.last_frame_info = Some(FrameDecodeInfo {
             intra_only: header.intra_only,
@@ -572,7 +543,11 @@ impl Decoder {
             segmentation_enabled: header.segmentation.enabled,
             seg_features_active: std::array::from_fn(|level| {
                 header.segmentation.enabled
-                    && header.segmentation.feature_enabled.iter().any(|seg| seg[level])
+                    && header
+                        .segmentation
+                        .feature_enabled
+                        .iter()
+                        .any(|seg| seg[level])
             }),
         });
 
@@ -581,7 +556,7 @@ impl Decoder {
                 tile_decoder.planes(),
                 header.width,
                 header.height,
-                &header.color_config,
+                &color_config,
             )))
         } else {
             Ok(None)

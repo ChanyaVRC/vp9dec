@@ -11,19 +11,8 @@
 
 use std::path::Path;
 
-use vp9dec::header::{
-    parse_uncompressed_header, FrameHeader, FrameType, MAX_SEGMENTS, NUM_REF_FRAMES, SEG_LVL_MAX,
-};
+use vp9dec::header::{parse_uncompressed_header, FrameHeader, FrameType, PersistentState};
 use vp9dec::ivf::IvfReader;
-
-const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
-const NO_LF_DELTAS: ([i8; 4], [i8; 2]) = ([1, 0, -1, -1], [0, 0]);
-const NO_SEG_FEATURES: ([[bool; SEG_LVL_MAX]; MAX_SEGMENTS], [[i32; SEG_LVL_MAX]; MAX_SEGMENTS], bool) =
-    (
-        [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
-        [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
-        false,
-    );
 
 /// Verifies, for the given test vector, that "the IVF can be read / the first frame is a
 /// key frame / the header's width and height match the IVF header".
@@ -58,8 +47,7 @@ fn check_vector(relative_path: &str) {
         .unwrap_or_else(|e| panic!("failed to read first frame of {}: {e:?}", path.display()));
 
     let (parsed, _consumed) =
-        parse_uncompressed_header(first_frame.data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES)
-            .unwrap_or_else(
+        parse_uncompressed_header(first_frame.data, &PersistentState::default()).unwrap_or_else(
             |e| {
                 panic!(
                     "failed to parse uncompressed header of first frame in {}: {e:?}",

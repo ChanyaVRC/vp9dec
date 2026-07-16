@@ -18,21 +18,10 @@
 
 use std::path::Path;
 
-use vp9dec::compressed_header::parse_compressed_header;
-use vp9dec::header::{
-    parse_uncompressed_header, FrameHeader, MAX_SEGMENTS, NUM_REF_FRAMES, SEG_LVL_MAX,
-};
+use vp9dec::compressed_header::{parse_compressed_header, FrameContext};
+use vp9dec::header::{parse_uncompressed_header, FrameHeader, PersistentState};
 use vp9dec::ivf::IvfReader;
 use vp9dec::tile::TileDecoder;
-
-const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
-const NO_LF_DELTAS: ([i8; 4], [i8; 2]) = ([1, 0, -1, -1], [0, 0]);
-const NO_SEG_FEATURES: ([[bool; SEG_LVL_MAX]; MAX_SEGMENTS], [[i32; SEG_LVL_MAX]; MAX_SEGMENTS], bool) =
-    (
-        [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
-        [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
-        false,
-    );
 
 fn check_vector(relative_path: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -61,8 +50,7 @@ fn check_vector(relative_path: &str) {
         .unwrap_or_else(|e| panic!("failed to read first frame of {}: {e:?}", path.display()));
 
     let (parsed, consumed) =
-        parse_uncompressed_header(first_frame.data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES)
-            .unwrap_or_else(
+        parse_uncompressed_header(first_frame.data, &PersistentState::default()).unwrap_or_else(
             |e| {
                 panic!(
                     "failed to parse uncompressed header of first frame in {}: {e:?}",
@@ -97,7 +85,7 @@ fn check_vector(relative_path: &str) {
     );
     let compressed_bytes = &first_frame.data[compressed_start..compressed_end];
 
-    let compressed = parse_compressed_header(compressed_bytes, header.quantization.lossless)
+    let compressed = parse_compressed_header(compressed_bytes, &header, FrameContext::default())
         .unwrap_or_else(|e| {
             panic!(
                 "{}: failed to parse compressed_header (size={header_size}): {e:?}",
@@ -143,7 +131,10 @@ fn check_vector(relative_path: &str) {
     // doesn't panic (either Ok or Err is fine); full pixel/statistical correctness is checked
     // elsewhere.
     let tile_data = &first_frame.data[compressed_end..];
-    let mut tile_decoder = TileDecoder::new(&header, &compressed);
+    let color_config = header.color_config.expect(
+        "first frame of an IVF stream is always a key frame, which always parses color_config",
+    );
+    let mut tile_decoder = TileDecoder::new(&header, color_config, &compressed);
     match tile_decoder.decode_tiles(tile_data) {
         Ok(()) => eprintln!("[ok] {}: decode_tiles completed fully", path.display()),
         Err(e) => eprintln!("[info] {}: decode_tiles stopped with {e:?}", path.display()),

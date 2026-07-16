@@ -89,6 +89,74 @@ pub struct ColorConfig {
     pub subsampling_y: u8,
 }
 
+/// The loop filter's `ref_deltas`/`mode_deltas` (spec §7.2), persisted across frames by the
+/// caller and reset only by `setup_past_independence()`. Replaces the former
+/// `([i8; 4], [i8; 2])` tuple threaded through [`parse_uncompressed_header`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopFilterDeltas {
+    pub ref_deltas: [i8; 4],
+    pub mode_deltas: [i8; 2],
+}
+
+impl Default for LoopFilterDeltas {
+    fn default() -> Self {
+        Self {
+            ref_deltas: DEFAULT_LOOP_FILTER_REF_DELTAS,
+            mode_deltas: DEFAULT_LOOP_FILTER_MODE_DELTAS,
+        }
+    }
+}
+
+/// The segmentation `FeatureEnabled`/`FeatureData`/`segmentation_abs_or_delta_update` state
+/// (spec §7.2.10), persisted across frames by the caller and reset only by
+/// `setup_past_independence()`. Replaces the former `(SegFeatureEnabled, SegFeatureData,
+/// bool)` tuple threaded through [`parse_uncompressed_header`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegFeaturePersist {
+    pub enabled: SegFeatureEnabled,
+    pub data: SegFeatureData,
+    pub abs_or_delta: bool,
+}
+
+impl Default for SegFeaturePersist {
+    fn default() -> Self {
+        Self {
+            enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+            data: [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
+            abs_or_delta: false,
+        }
+    }
+}
+
+/// All of the cross-frame state [`parse_uncompressed_header`] needs from the caller (spec
+/// §7.2): the reference frame slot sizes (`RefFrameWidth`/`RefFrameHeight`, used by
+/// `frame_size_with_refs()`, spec §6.2.5), and the loop filter/segmentation state that
+/// `setup_past_independence()` would otherwise reset. Callers (`Decoder`) keep one instance of
+/// this across frames instead of three separate fields; [`decode_keyframe`](crate::decode_keyframe)
+/// (which carries no state across frames) passes a fresh [`PersistentState::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistentState {
+    pub ref_frame_sizes: [(u32, u32); NUM_REF_FRAMES],
+    pub loop_filter_deltas: LoopFilterDeltas,
+    pub segmentation: SegFeaturePersist,
+}
+
+impl PersistentState {
+    pub fn new() -> Self {
+        Self {
+            ref_frame_sizes: [(0, 0); NUM_REF_FRAMES],
+            loop_filter_deltas: LoopFilterDeltas::default(),
+            segmentation: SegFeaturePersist::default(),
+        }
+    }
+}
+
+impl Default for PersistentState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A parsed uncompressed frame header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameHeader {
@@ -112,7 +180,13 @@ pub struct NewFrameHeader {
     pub intra_only: bool,
     /// `reset_frame_context` (spec §7.2). Always 0 when `error_resilient_mode == 1`.
     pub reset_frame_context: u8,
-    pub color_config: ColorConfig,
+    /// `Some` exactly when `color_config()` is actually parsed or spec-defined for this frame:
+    /// key frames (always), and `intra_only` frames (parsed when `profile > 0`, or the
+    /// spec-defined 8-bit/CS_BT_601/4:2:0 default when `profile == 0`, spec §6.2). `None` for
+    /// a regular inter frame, which per spec §7.2 doesn't resend `color_config` at all (it's a
+    /// conformance requirement that it match the reference frame) — the caller (`Decoder`)
+    /// resolves this from the most recently seen key/intra-only frame's value.
+    pub color_config: Option<ColorConfig>,
     pub width: u32,
     pub height: u32,
     pub render_width: u32,
@@ -328,7 +402,7 @@ pub const DEFAULT_LOOP_FILTER_MODE_DELTAS: [i8; 2] = [0, 0];
 fn parse_loop_filter_params(
     r: &mut BitReader,
     reset: bool,
-    prev_deltas: ([i8; 4], [i8; 2]),
+    prev_deltas: LoopFilterDeltas,
 ) -> LoopFilterParams {
     let level = r.f(6) as u8;
     let sharpness = r.f(3) as u8;
@@ -340,7 +414,7 @@ fn parse_loop_filter_params(
             DEFAULT_LOOP_FILTER_MODE_DELTAS,
         )
     } else {
-        prev_deltas
+        (prev_deltas.ref_deltas, prev_deltas.mode_deltas)
     };
 
     if delta_enabled {
@@ -437,7 +511,7 @@ pub struct SegmentationParams {
 fn parse_segmentation_params(
     r: &mut BitReader,
     reset: bool,
-    prev_features: (SegFeatureEnabled, SegFeatureData, bool),
+    prev_features: SegFeaturePersist,
 ) -> SegmentationParams {
     let enabled = r.flag();
     let (mut feature_enabled, mut feature_data, mut abs_or_delta_update) = if reset {
@@ -447,7 +521,11 @@ fn parse_segmentation_params(
             false,
         )
     } else {
-        prev_features
+        (
+            prev_features.enabled,
+            prev_features.data,
+            prev_features.abs_or_delta,
+        )
     };
 
     if !enabled {
@@ -538,22 +616,16 @@ fn parse_tile_info(r: &mut BitReader, sb64_cols: u32) -> (u32, u32) {
 
 /// Parses `uncompressed_header()` (spec §6.2).
 ///
-/// `ref_frame_sizes` is the per-slot size table equivalent to
-/// `RefFrameWidth`/`RefFrameHeight`, referenced by `frame_size_with_refs()`
-/// (spec §6.2.5). Not referenced for key frames or intra-only frames (the
-/// caller may pass dummy values).
+/// `prev` carries the cross-frame state spec §7.2 requires (see [`PersistentState`]):
+/// the per-slot reference frame sizes (used by `frame_size_with_refs()`, spec §6.2.5; not
+/// referenced for key frames or intra-only frames), and the loop filter/segmentation state
+/// that `setup_past_independence()` would otherwise reset.
 ///
 /// Returns a pair of the parse result and the number of bytes consumed,
 /// including byte-boundary alignment via `trailing_bits()`.
-///
-/// `prev_segmentation_features` is the `(FeatureEnabled, FeatureData,
-/// segmentation_abs_or_delta_update)` state that persists across frames per
-/// spec §7.2.10, analogous to `prev_loop_filter_deltas`.
 pub fn parse_uncompressed_header(
     data: &[u8],
-    ref_frame_sizes: &[(u32, u32); NUM_REF_FRAMES],
-    prev_loop_filter_deltas: ([i8; 4], [i8; 2]),
-    prev_segmentation_features: (SegFeatureEnabled, SegFeatureData, bool),
+    prev: &PersistentState,
 ) -> Result<(FrameHeader, usize), HeaderError> {
     let mut r = BitReader::new(data);
 
@@ -605,7 +677,7 @@ pub fn parse_uncompressed_header(
         if sync != [0x49, 0x83, 0x42] {
             return Err(HeaderError::InvalidSyncCode);
         }
-        color_config = parse_color_config(&mut r, profile)?;
+        color_config = Some(parse_color_config(&mut r, profile)?);
         let (w, h) = parse_frame_size(&mut r);
         let (rw, rh) = parse_render_size(&mut r, w, h);
         width = w;
@@ -630,9 +702,11 @@ pub fn parse_uncompressed_header(
             if sync != [0x49, 0x83, 0x42] {
                 return Err(HeaderError::InvalidSyncCode);
             }
-            color_config = if profile > 0 {
+            color_config = Some(if profile > 0 {
                 parse_color_config(&mut r, profile)?
             } else {
+                // Not read from the bitstream, but not a fabrication either: this is the
+                // spec-defined default for intra_only + profile 0 (spec §6.2.2).
                 ColorConfig {
                     bit_depth: 8,
                     color_space: CS_BT_601,
@@ -640,7 +714,7 @@ pub fn parse_uncompressed_header(
                     subsampling_x: 1,
                     subsampling_y: 1,
                 }
-            };
+            });
             refresh_frame_flags = r.f(8) as u8;
             let (w, h) = parse_frame_size(&mut r);
             let (rw, rh) = parse_render_size(&mut r, w, h);
@@ -654,7 +728,7 @@ pub fn parse_uncompressed_header(
                 ref_frame_idx[i] = r.f(3) as u8;
                 ref_frame_sign_bias[LAST_FRAME as usize + i] = r.flag();
             }
-            let (w, h) = parse_frame_size_with_refs(&mut r, ref_frame_idx, ref_frame_sizes);
+            let (w, h) = parse_frame_size_with_refs(&mut r, ref_frame_idx, &prev.ref_frame_sizes);
             width = w;
             height = h;
             let (rw, rh) = parse_render_size(&mut r, w, h);
@@ -665,17 +739,10 @@ pub fn parse_uncompressed_header(
             // Profile, bit depth, and color space are not read from an inter
             // frame's bitstream (they are required to match the reference
             // frame, spec §7.2). This parser has no access to prior frames'
-            // state, so it fabricates a placeholder here; `Decoder` (which does
+            // state, so it honestly reports None here; `Decoder` (which does
             // carry color config across frames, see `last_color_config`)
-            // overwrites it with the value from the preceding key/intra-only
-            // frame before the header is used.
-            color_config = ColorConfig {
-                bit_depth: 8,
-                color_space: CS_UNKNOWN,
-                color_range: false,
-                subsampling_x: 1,
-                subsampling_y: 1,
-            };
+            // resolves it from the preceding key/intra-only frame before use.
+            color_config = None;
         }
     }
 
@@ -697,9 +764,9 @@ pub fn parse_uncompressed_header(
     // loop filter deltas and segmentation feature data are also reset to their
     // default values (same condition as the frame_context reset).
     let lf_reset = frame_is_intra || error_resilient_mode;
-    let loop_filter = parse_loop_filter_params(&mut r, lf_reset, prev_loop_filter_deltas);
+    let loop_filter = parse_loop_filter_params(&mut r, lf_reset, prev.loop_filter_deltas);
     let quantization = parse_quantization_params(&mut r);
-    let segmentation = parse_segmentation_params(&mut r, lf_reset, prev_segmentation_features);
+    let segmentation = parse_segmentation_params(&mut r, lf_reset, prev.segmentation);
 
     let image_size = compute_image_size(width, height);
     let (tile_cols_log2, tile_rows_log2) = parse_tile_info(&mut r, image_size.sb64_cols);
@@ -793,35 +860,24 @@ mod tests {
         w.finish()
     }
 
-    /// Dummy value used in tests where a reference frame size is not needed.
-    const NO_REF_SIZES: [(u32, u32); NUM_REF_FRAMES] = [(0, 0); NUM_REF_FRAMES];
-    const NO_LF_DELTAS: ([i8; 4], [i8; 2]) = (
-        DEFAULT_LOOP_FILTER_REF_DELTAS,
-        DEFAULT_LOOP_FILTER_MODE_DELTAS,
-    );
-    /// Dummy value used in tests: no persisted segmentation feature state (as if
-    /// `setup_past_independence()` had just run).
-    const NO_SEG_FEATURES: (SegFeatureEnabled, SegFeatureData, bool) = (
-        [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
-        [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
-        false,
-    );
-
     #[test]
     fn parses_minimal_keyframe_header() {
         let data = build_minimal_keyframe_header();
         let (header, _consumed) =
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES).expect("should parse");
+            parse_uncompressed_header(&data, &PersistentState::default()).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert_eq!(f.profile, 0);
                 assert_eq!(f.frame_type, FrameType::KeyFrame);
                 assert!(f.show_frame);
                 assert!(!f.error_resilient_mode);
-                assert_eq!(f.color_config.bit_depth, 8);
-                assert_eq!(f.color_config.color_space, CS_UNKNOWN);
-                assert_eq!(f.color_config.subsampling_x, 1);
-                assert_eq!(f.color_config.subsampling_y, 1);
+                let cc = f
+                    .color_config
+                    .expect("key frame always parses color_config");
+                assert_eq!(cc.bit_depth, 8);
+                assert_eq!(cc.color_space, CS_UNKNOWN);
+                assert_eq!(cc.subsampling_x, 1);
+                assert_eq!(cc.subsampling_y, 1);
                 assert_eq!(f.width, 8);
                 assert_eq!(f.height, 8);
                 assert_eq!(f.render_width, 8);
@@ -845,7 +901,7 @@ mod tests {
         w.push_bits(0, 30);
         let data = w.finish();
         assert_eq!(
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES),
+            parse_uncompressed_header(&data, &PersistentState::default()),
             Err(HeaderError::InvalidFrameMarker)
         );
     }
@@ -865,7 +921,7 @@ mod tests {
         w.push_bits(0x00, 8);
         let data = w.finish();
         assert_eq!(
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES),
+            parse_uncompressed_header(&data, &PersistentState::default()),
             Err(HeaderError::InvalidSyncCode)
         );
     }
@@ -925,10 +981,9 @@ mod tests {
     #[test]
     fn parses_inter_frame_using_ref_frame_size() {
         let data = build_minimal_inter_frame_header();
-        let mut ref_sizes = NO_REF_SIZES;
-        ref_sizes[0] = (8, 8);
-        let (header, _consumed) =
-            parse_uncompressed_header(&data, &ref_sizes, NO_LF_DELTAS, NO_SEG_FEATURES).expect("should parse");
+        let mut prev = PersistentState::default();
+        prev.ref_frame_sizes[0] = (8, 8);
+        let (header, _consumed) = parse_uncompressed_header(&data, &prev).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert_eq!(f.frame_type, FrameType::NonKeyFrame);
@@ -961,7 +1016,7 @@ mod tests {
         let data = w.finish();
 
         let (header, consumed) =
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES).expect("should parse");
+            parse_uncompressed_header(&data, &PersistentState::default()).expect("should parse");
         assert_eq!(
             header,
             FrameHeader::ShowExistingFrame {
@@ -1020,7 +1075,7 @@ mod tests {
 
         let data = w.finish();
         let (header, _) =
-            parse_uncompressed_header(&data, &NO_REF_SIZES, NO_LF_DELTAS, NO_SEG_FEATURES).expect("should parse");
+            parse_uncompressed_header(&data, &PersistentState::default()).expect("should parse");
         match header {
             FrameHeader::New(f) => {
                 assert!(f.error_resilient_mode);
@@ -1078,7 +1133,7 @@ mod tests {
         }
         let data = w.finish();
         let mut r = BitReader::new(&data);
-        let seg = parse_segmentation_params(&mut r, false, NO_SEG_FEATURES);
+        let seg = parse_segmentation_params(&mut r, false, SegFeaturePersist::default());
 
         assert!(seg.enabled);
         assert!(seg.update_map);
@@ -1108,7 +1163,11 @@ mod tests {
         let mut prev_data = [[0i32; SEG_LVL_MAX]; MAX_SEGMENTS];
         prev_enabled[4][SEG_LVL_ALT_Q] = true;
         prev_data[4][SEG_LVL_ALT_Q] = 77;
-        let prev = (prev_enabled, prev_data, true);
+        let prev = SegFeaturePersist {
+            enabled: prev_enabled,
+            data: prev_data,
+            abs_or_delta: true,
+        };
 
         // segmentation_enabled=1, update_map=0, update_data=0: nothing is re-signaled.
         let mut w = BitWriter::new();
