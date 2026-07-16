@@ -17,15 +17,14 @@
 //!   differ per plane)
 
 use crate::framebuffer::Plane;
-use crate::mv::Mv;
 use crate::prob_tables::{
-    BLOCK_8X8, INTERP_EXTEND, NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP,
-    REF_SCALE_SHIFT, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, SUBPEL_SHIFTS,
+    BLOCK_8X8, D117_PRED, D135_PRED, D153_PRED, D207_PRED, D45_PRED, D63_PRED, DC_PRED, H_PRED,
+    NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP, TM_PRED, TX_4X4, V_PRED,
 };
-use crate::prob_tables::{
-    D117_PRED, D135_PRED, D153_PRED, D207_PRED, D45_PRED, D63_PRED, DC_PRED, H_PRED, TM_PRED,
-    TX_4X4, V_PRED,
+use crate::subpel::{
+    INTERP_EXTEND, REF_SCALE_SHIFT, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, SUBPEL_SHIFTS,
 };
+use crate::tile::Mv;
 
 #[inline]
 fn round2(x: i32, n: u32) -> i32 {
@@ -316,21 +315,37 @@ fn clip1(x: i32, bit_depth: u8) -> i32 {
     clip3(0, (1i32 << bit_depth) - 1, x)
 }
 
+/// Per-block-invariant parameters for `predict_inter` (spec §8.5.2) and its helpers
+/// (`select_mv`/`clamp_mv_for_plane`/`scale_mv_for_plane`).
+///
+/// A single coding block's `residual()` (`src/tile/residual.rs`) calls `predict_inter` once
+/// per plane (further split into 4x4 sub-blocks when `MiSize < BLOCK_8X8`); every field here
+/// is identical across all of those calls -- only `dst`/`plane`/`x`/`y`/`w`/`h`/`block_idx`
+/// (`predict_inter`'s remaining positional parameters) vary call to call.
+pub struct InterPredictParams<'a> {
+    pub ref_frame: [u8; 2],
+    pub block_mvs: &'a [[Mv; 4]; 2],
+    pub interp_filter: u8,
+    pub mi_row: u32,
+    pub mi_col: u32,
+    pub mi_size: u8,
+    pub mi_rows: u32,
+    pub mi_cols: u32,
+    pub subsampling_x: u32,
+    pub subsampling_y: u32,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub bit_depth: u8,
+    pub refs: [Option<&'a RefPlaneView<'a>>; 2],
+}
+
 /// Motion vector selection process (spec §8.5.2.1 "Motion vector selection process").
-fn select_mv(
-    plane: usize,
-    ref_list: usize,
-    block_idx: usize,
-    mi_size: u8,
-    block_mvs: &[[Mv; 4]; 2],
-    subsampling_x: u32,
-    subsampling_y: u32,
-) -> Mv {
-    let bm = &block_mvs[ref_list];
-    if plane == 0 || mi_size >= BLOCK_8X8 {
+fn select_mv(plane: usize, ref_list: usize, block_idx: usize, p: &InterPredictParams) -> Mv {
+    let bm = &p.block_mvs[ref_list];
+    if plane == 0 || p.mi_size >= BLOCK_8X8 {
         return bm[block_idx];
     }
-    match (subsampling_x, subsampling_y) {
+    match (p.subsampling_x, p.subsampling_y) {
         (0, 0) => bm[block_idx],
         (0, 1) => [
             round_mv_comp_q2(bm[block_idx][0] + bm[block_idx + 2][0]),
@@ -348,29 +363,18 @@ fn select_mv(
 }
 
 /// Motion vector clamping process (spec §8.5.2.2 "Motion vector clamping process").
-#[allow(clippy::too_many_arguments)]
-fn clamp_mv_for_plane(
-    plane: usize,
-    mv: Mv,
-    mi_row: u32,
-    mi_col: u32,
-    mi_size: u8,
-    mi_rows: u32,
-    mi_cols: u32,
-    subsampling_x: u32,
-    subsampling_y: u32,
-) -> Mv {
+fn clamp_mv_for_plane(plane: usize, mv: Mv, p: &InterPredictParams) -> Mv {
     let (sx, sy) = if plane == 0 {
         (0i32, 0i32)
     } else {
-        (subsampling_x as i32, subsampling_y as i32)
+        (p.subsampling_x as i32, p.subsampling_y as i32)
     };
-    let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as i32;
-    let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as i32;
-    let mi_row = mi_row as i32;
-    let mi_col = mi_col as i32;
-    let mi_rows = mi_rows as i32;
-    let mi_cols = mi_cols as i32;
+    let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[p.mi_size as usize] as i32;
+    let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[p.mi_size as usize] as i32;
+    let mi_row = p.mi_row as i32;
+    let mi_col = p.mi_col as i32;
+    let mi_rows = p.mi_rows as i32;
+    let mi_cols = p.mi_cols as i32;
 
     let mb_to_top_edge = -((mi_row * 8) * 16) >> sy;
     let mb_to_bottom_edge = ((mi_rows - bh - mi_row) * 8 * 16) >> sy;
@@ -397,31 +401,29 @@ fn clamp_mv_for_plane(
 }
 
 /// Motion vector scaling process (spec §8.5.2.3 "Motion vector scaling process").
-/// Returns `(startX, startY, stepX, stepY)` (in 1/16 pel units).
-#[allow(clippy::too_many_arguments)]
+/// Returns `(startX, startY, stepX, stepY)` (in 1/16 pel units). `ref_width`/`ref_height` are
+/// per-call (the specific reference's own size, `view.width`/`view.height` at the call site),
+/// unlike the rest of `p`.
 fn scale_mv_for_plane(
     plane: usize,
     x: usize,
     y: usize,
     clamped_mv: Mv,
-    subsampling_x: u32,
-    subsampling_y: u32,
     ref_width: u32,
     ref_height: u32,
-    frame_width: u32,
-    frame_height: u32,
+    p: &InterPredictParams,
 ) -> (i64, i64, i64, i64) {
-    let x_scale = ((ref_width as i64) << REF_SCALE_SHIFT) / frame_width as i64;
-    let y_scale = ((ref_height as i64) << REF_SCALE_SHIFT) / frame_height as i64;
+    let x_scale = ((ref_width as i64) << REF_SCALE_SHIFT) / p.frame_width as i64;
+    let y_scale = ((ref_height as i64) << REF_SCALE_SHIFT) / p.frame_height as i64;
     let base_x = ((x as i64) * x_scale) >> REF_SCALE_SHIFT;
     let base_y = ((y as i64) * y_scale) >> REF_SCALE_SHIFT;
     let luma_x = if plane > 0 {
-        (x as u32) << subsampling_x
+        (x as u32) << p.subsampling_x
     } else {
         x as u32
     } as i64;
     let luma_y = if plane > 0 {
-        (y as u32) << subsampling_y
+        (y as u32) << p.subsampling_y
     } else {
         y as u32
     } as i64;
@@ -509,7 +511,9 @@ fn block_inter_predict(
 /// samples into the `w x h` region of `dst` with top-left corner `(x, y)`.
 /// `block_idx` is the spec's `blockIdx` (in 4x4 units, representing how much
 /// of this block has been predicted so far; only meaningful when
-/// `MiSize < BLOCK_8X8`).
+/// `MiSize < BLOCK_8X8`). `p` groups the per-block-invariant parameters (see
+/// [`InterPredictParams`]); still `#[allow(too_many_arguments)]` at 8 (down from the
+/// pre-W5 20).
 #[allow(clippy::too_many_arguments)]
 pub fn predict_inter(
     dst: &mut Plane,
@@ -519,62 +523,21 @@ pub fn predict_inter(
     w: usize,
     h: usize,
     block_idx: usize,
-    ref_frame: [u8; 2],
-    block_mvs: &[[Mv; 4]; 2],
-    interp_filter: u8,
-    mi_row: u32,
-    mi_col: u32,
-    mi_size: u8,
-    mi_rows: u32,
-    mi_cols: u32,
-    subsampling_x: u32,
-    subsampling_y: u32,
-    frame_width: u32,
-    frame_height: u32,
-    bit_depth: u8,
-    refs: [Option<&RefPlaneView>; 2],
+    p: &InterPredictParams,
 ) {
     use crate::prob_tables::INTRA_FRAME;
-    let is_compound = ref_frame[1] > INTRA_FRAME;
+    let is_compound = p.ref_frame[1] > INTRA_FRAME;
     let n_refs = 1 + is_compound as usize;
 
     // Fixed-size scratch (w, h <= MAX_BLOCK_DIM): avoids a per-call heap allocation. Only the
     // first w*h entries of each slot are written/read below.
     let mut preds = [[0i32; MAX_BLOCK_DIM * MAX_BLOCK_DIM]; 2];
     for (ref_list, pred_slot) in preds.iter_mut().enumerate().take(n_refs) {
-        let mv = select_mv(
-            plane,
-            ref_list,
-            block_idx,
-            mi_size,
-            block_mvs,
-            subsampling_x,
-            subsampling_y,
-        );
-        let clamped = clamp_mv_for_plane(
-            plane,
-            mv,
-            mi_row,
-            mi_col,
-            mi_size,
-            mi_rows,
-            mi_cols,
-            subsampling_x,
-            subsampling_y,
-        );
-        let view = refs[ref_list].expect("reference frame slot is missing (DPB not initialized)");
-        let (start_x, start_y, step_x, step_y) = scale_mv_for_plane(
-            plane,
-            x,
-            y,
-            clamped,
-            subsampling_x,
-            subsampling_y,
-            view.width,
-            view.height,
-            frame_width,
-            frame_height,
-        );
+        let mv = select_mv(plane, ref_list, block_idx, p);
+        let clamped = clamp_mv_for_plane(plane, mv, p);
+        let view = p.refs[ref_list].expect("reference frame slot is missing (DPB not initialized)");
+        let (start_x, start_y, step_x, step_y) =
+            scale_mv_for_plane(plane, x, y, clamped, view.width, view.height, p);
         block_inter_predict(
             view.plane,
             start_x,
@@ -583,8 +546,8 @@ pub fn predict_inter(
             step_y,
             w,
             h,
-            interp_filter,
-            bit_depth,
+            p.interp_filter,
+            p.bit_depth,
             &mut pred_slot[..w * h],
         );
     }

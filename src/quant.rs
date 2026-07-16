@@ -9,6 +9,8 @@
 //! profiles exactly as listed in the spec, but as of the M2 milestone this
 //! decoder targets, only 8bit (`bit_depth == 8`) is expected to be used.
 
+use crate::header::{SegmentationParams, SEG_LVL_ALT_Q};
+
 /// Spec §8.6.1 `dc_qlookup[ 3 ][ 256 ]`.
 /// The row index is `(BitDepth - 8) >> 1` (8bit->0, 10bit->1, 12bit->2).
 #[rustfmt::skip]
@@ -187,35 +189,23 @@ pub fn ac_q(bit_depth: u8, b: i32) -> i32 {
     AC_QLOOKUP[row][clip3(0, 255, b) as usize]
 }
 
-/// Per-segment `SEG_LVL_ALT_Q` override (equivalent to the
-/// `seg_feature_active( SEG_LVL_ALT_Q )` branch in spec §8.6.1 `get_qindex()`).
-///
-/// Built by the caller (`src/tile.rs`) from `SegmentationParams::feature_data`/
-/// `abs_or_delta_update` (spec §6.2.11) when the feature is active for the
-/// current block's segment; kept as its own small struct (rather than taking
-/// `SegmentationParams` + `segment_id` directly) so this module stays testable
-/// standalone, decoupled from `header::SegmentationParams`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SegQIndexOverride {
-    /// `FeatureData[ segment_id ][ SEG_LVL_ALT_Q ]`.
-    pub data: i32,
-    /// `segmentation_abs_or_delta_update`. If true, `data` is interpreted as
-    /// an absolute value; if false, as a delta from base_q_idx.
-    pub abs_or_delta_update: bool,
-}
-
-/// Spec §8.6.1 `get_qindex()`.
-pub fn get_qindex(base_q_idx: u8, seg: Option<SegQIndexOverride>) -> u8 {
-    match seg {
-        Some(s) => {
-            let data = if s.abs_or_delta_update {
-                s.data
-            } else {
-                base_q_idx as i32 + s.data
-            };
-            clip3(0, 255, data) as u8
-        }
-        None => base_q_idx,
+/// Spec §8.6.1 `get_qindex()`. `segmentation`/`segment_id` are taken directly rather than
+/// via a `quant`-local override type: the type used to exist (`SegQIndexOverride`) to keep
+/// this module decoupled from `header::SegmentationParams`, but since W5's `common` module
+/// that reasoning no longer holds any real weight, and passing the params straight through
+/// lets this function mirror the spec's `seg_feature_active( SEG_LVL_ALT_Q )` branch directly
+/// instead of requiring the caller to pre-compute an `Option`.
+pub fn get_qindex(base_q_idx: u8, segmentation: &SegmentationParams, segment_id: usize) -> u8 {
+    if segmentation.enabled && segmentation.feature_enabled[segment_id][SEG_LVL_ALT_Q] {
+        let data = segmentation.feature_data[segment_id][SEG_LVL_ALT_Q];
+        let data = if segmentation.abs_or_delta_update {
+            data
+        } else {
+            base_q_idx as i32 + data
+        };
+        clip3(0, 255, data) as u8
+    } else {
+        base_q_idx
     }
 }
 
@@ -293,46 +283,51 @@ mod tests {
         assert_eq!(ac_q(8, 300), ac_q(8, 255));
     }
 
+    /// A disabled `SegmentationParams`, for tests that don't exercise `SEG_LVL_ALT_Q`.
+    fn no_segmentation() -> SegmentationParams {
+        SegmentationParams {
+            enabled: false,
+            update_map: false,
+            tree_probs: [255; 7],
+            pred_prob: [255; 3],
+            temporal_update: false,
+            abs_or_delta_update: false,
+            feature_enabled: [[false; 4]; 8],
+            feature_data: [[0; 4]; 8],
+        }
+    }
+
+    /// Builds a `SegmentationParams` with `SEG_LVL_ALT_Q` active for segment 0, with the
+    /// given `data`/`abs_or_delta_update`.
+    fn seg_lvl_alt_q(data: i32, abs_or_delta_update: bool) -> SegmentationParams {
+        let mut seg = no_segmentation();
+        seg.enabled = true;
+        seg.abs_or_delta_update = abs_or_delta_update;
+        seg.feature_enabled[0][SEG_LVL_ALT_Q] = true;
+        seg.feature_data[0][SEG_LVL_ALT_Q] = data;
+        seg
+    }
+
     /// When segmentation is disabled, `get_qindex` returns `base_q_idx` unchanged.
     #[test]
     fn qindex_without_segmentation() {
-        assert_eq!(get_qindex(120, None), 120);
+        assert_eq!(get_qindex(120, &no_segmentation(), 0), 120);
     }
 
     /// The case `segmentation_abs_or_delta_update == 1` (absolute value specified).
     #[test]
     fn qindex_absolute_override() {
-        let seg = SegQIndexOverride {
-            data: 50,
-            abs_or_delta_update: true,
-        };
-        assert_eq!(get_qindex(120, Some(seg)), 50);
+        assert_eq!(get_qindex(120, &seg_lvl_alt_q(50, true), 0), 50);
         // Out-of-range values are clamped via Clip3.
-        let seg_over = SegQIndexOverride {
-            data: 400,
-            abs_or_delta_update: true,
-        };
-        assert_eq!(get_qindex(120, Some(seg_over)), 255);
-        let seg_under = SegQIndexOverride {
-            data: -10,
-            abs_or_delta_update: true,
-        };
-        assert_eq!(get_qindex(120, Some(seg_under)), 0);
+        assert_eq!(get_qindex(120, &seg_lvl_alt_q(400, true), 0), 255);
+        assert_eq!(get_qindex(120, &seg_lvl_alt_q(-10, true), 0), 0);
     }
 
     /// The case `segmentation_abs_or_delta_update == 0` (delta specified).
     #[test]
     fn qindex_delta_override() {
-        let seg = SegQIndexOverride {
-            data: 20,
-            abs_or_delta_update: false,
-        };
-        assert_eq!(get_qindex(100, Some(seg)), 120);
-        let seg_neg = SegQIndexOverride {
-            data: -300,
-            abs_or_delta_update: false,
-        };
-        assert_eq!(get_qindex(100, Some(seg_neg)), 0);
+        assert_eq!(get_qindex(100, &seg_lvl_alt_q(20, false), 0), 120);
+        assert_eq!(get_qindex(100, &seg_lvl_alt_q(-300, false), 0), 0);
     }
 
     /// `get_dc_quant` / `get_ac_quant` switching which delta is applied based on plane.

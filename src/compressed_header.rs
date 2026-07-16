@@ -236,13 +236,13 @@ fn diff_update_prob(r: &mut BoolDecoder, prob: u8) -> u8 {
 
 /// `decode_term_subexp()` (spec §6.3.4). All fields are read via `L(n)` (`read_literal`).
 fn decode_term_subexp(r: &mut BoolDecoder) -> u32 {
-    if r.read_literal(1) == 0 {
+    if !r.flag() {
         return r.read_literal(4);
     }
-    if r.read_literal(1) == 0 {
+    if !r.flag() {
         return r.read_literal(4) + 16;
     }
-    if r.read_literal(1) == 0 {
+    if !r.flag() {
         return r.read_literal(5) + 32;
     }
     let v = r.read_literal(7);
@@ -319,7 +319,7 @@ fn read_tx_mode_probs(r: &mut BoolDecoder, tx_probs: &mut [[[u8; 3]; 2]; 4]) {
 fn read_coef_probs(r: &mut BoolDecoder, tx_mode: u8, coef_probs: &mut CoefProbs) {
     let max_tx_size = TX_MODE_TO_BIGGEST_TX_SIZE[tx_mode as usize];
     for tx_sz in 0..=max_tx_size {
-        let update_probs = r.read_literal(1) == 1;
+        let update_probs = r.flag();
         if !update_probs {
             continue;
         }
@@ -390,11 +390,11 @@ fn frame_reference_mode(r: &mut BoolDecoder, ref_frame_sign_bias: &[bool; 4]) ->
         || ref_frame_sign_bias[ALTREF_FRAME as usize] != ref_frame_sign_bias[LAST_FRAME as usize];
 
     let reference_mode = if compound_reference_allowed {
-        let non_single_reference = r.read_literal(1) == 1;
+        let non_single_reference = r.flag();
         if !non_single_reference {
             SINGLE_REFERENCE
         } else {
-            let reference_select = r.read_literal(1) == 1;
+            let reference_select = r.flag();
             if !reference_select {
                 COMPOUND_REFERENCE
             } else {

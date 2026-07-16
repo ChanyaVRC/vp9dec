@@ -118,6 +118,12 @@ impl<'a> BoolDecoder<'a> {
         x
     }
 
+    /// `read_literal( 1 ) == 1`, as a single-bit flag (spec §9.2.4). A convenience wrapper for
+    /// the very common single-bit `L(1)` reads scattered through the compressed header.
+    pub fn flag(&mut self) -> bool {
+        self.read_literal(1) == 1
+    }
+
     /// Decoding process for tree-coded syntax elements (spec §9.3.3, "Tree decoding process").
     ///
     /// `tree` is the spec's tree array itself (leaves are non-positive values

@@ -464,7 +464,10 @@ pub const SEG_LVL_ALT_L: usize = 1;
 pub const SEG_LVL_REF_FRAME: usize = 2;
 pub const SEG_LVL_SKIP: usize = 3;
 pub const SEG_LVL_MAX: usize = 4;
-pub const MAX_SEGMENTS: usize = 8;
+/// Re-exported so existing `header::MAX_SEGMENTS` import paths (incl. `tests/`) keep working
+/// now that the canonical definition lives in `common` (shared with `loop_filter.rs`, which
+/// used to redefine it privately).
+pub use crate::common::MAX_SEGMENTS;
 const SEGMENTATION_FEATURE_BITS: [u32; SEG_LVL_MAX] = [8, 6, 2, 0];
 const SEGMENTATION_FEATURE_SIGNED: [bool; SEG_LVL_MAX] = [true, true, false, false];
 

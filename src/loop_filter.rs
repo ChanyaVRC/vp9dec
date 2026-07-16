@@ -30,22 +30,18 @@
 //!   them (or from the default values `[1, 0, -1, -1]`/`[0, 0]` when
 //!   `FrameIsIntra || error_resilient_mode`, i.e. `setup_past_independence`).
 
+use crate::common::{get_uv_tx_size, INTRA_FRAME, MAX_SEGMENTS};
 use crate::framebuffer::Plane;
 use crate::header::{LoopFilterParams, SegmentationParams, SEG_LVL_ALT_L};
 use crate::prob_tables::{
-    BLOCK_16X16, BLOCK_8X8, MAX_TXSIZE_LOOKUP, NEARESTMV, NEARMV, NEWMV,
-    NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP, SS_SIZE_LOOKUP, TX_16X16, TX_4X4,
-    TX_8X8,
+    BLOCK_16X16, NEARESTMV, NEARMV, NEWMV, NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP,
+    TX_16X16, TX_4X4, TX_8X8,
 };
 use crate::tile::MiGrid;
 
-const MAX_SEGMENTS: usize = 8;
 const MAX_REF_FRAMES: usize = 4;
 const MAX_MODE_LF_DELTAS: usize = 2;
 const MAX_LOOP_FILTER: i32 = 63;
-/// Reference frame type index (only the values from the spec's `RefFrame`
-/// enum that this implementation uses).
-const INTRA_FRAME: usize = 0;
 
 /// `LvlLookup[ segmentId ][ ref ][ mode ]` (spec §8.8.1).
 type LvlLookup = [[[i32; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SEGMENTS];
@@ -62,18 +58,6 @@ fn round2(x: i32, n: u32) -> i32 {
 #[inline]
 fn clip3(low: i32, high: i32, v: i32) -> i32 {
     v.clamp(low, high)
-}
-
-/// `get_uv_tx_size()` (spec §6.4.22). Equivalent to
-/// `TileDecoder::get_uv_tx_size` in `src/tile.rs`, but duplicated here in
-/// small form because the loop filter is self-contained outside of
-/// `TileDecoder` (as a free function without `&self`).
-fn get_uv_tx_size(mi_size: u8, tx_size: u8, subsampling_x: u32, subsampling_y: u32) -> u8 {
-    if mi_size < BLOCK_8X8 {
-        return TX_4X4;
-    }
-    let plane_sz = SS_SIZE_LOOKUP[mi_size as usize][subsampling_x as usize][subsampling_y as usize];
-    tx_size.min(MAX_TXSIZE_LOOKUP[plane_sz as usize])
 }
 
 /// Spec §8.8.1 "Loop filter frame init process".
@@ -104,8 +88,9 @@ fn build_lvl_lookup(lf: &LoopFilterParams, seg: &SegmentationParams) -> LvlLooku
                 }
             }
         } else {
-            let intra_lvl = lvl_seg + (lf.ref_deltas[INTRA_FRAME] as i32) * (1 << n_shift);
-            seg_table[INTRA_FRAME][0] = clip3(0, MAX_LOOP_FILTER, intra_lvl);
+            let intra_lvl =
+                lvl_seg + (lf.ref_deltas[INTRA_FRAME as usize] as i32) * (1 << n_shift);
+            seg_table[INTRA_FRAME as usize][0] = clip3(0, MAX_LOOP_FILTER, intra_lvl);
             // seg_table[INTRA_FRAME][1] is not defined by the spec (the INTRA_FRAME
             // row only has mode=0). On keyframes isIntra is always true and
             // modeType is always 0, so it's never referenced.
@@ -409,7 +394,7 @@ fn superblock_loop_filter(
             let skip = mi.skip;
             // Spec §8.8.2 step 9: isIntra = RefFrames[loopRow][loopCol][0] <= INTRA_FRAME.
             let ref_frame = mi.ref_frame[0];
-            let is_intra = ref_frame == INTRA_FRAME as u8;
+            let is_intra = ref_frame == INTRA_FRAME;
 
             let is_block_edge = if pass == 0 {
                 x % (8 * NUM_8X8_BLOCKS_WIDE_LOOKUP[sb_size as usize] as u32) == 0
@@ -567,7 +552,7 @@ mod tests {
         };
         let table = build_lvl_lookup(&lf, &no_segmentation());
         // intraLvl = 40 + 1*(1<<1) = 42
-        assert_eq!(table[0][INTRA_FRAME][0], 42);
+        assert_eq!(table[0][INTRA_FRAME as usize][0], 42);
     }
 
     #[test]

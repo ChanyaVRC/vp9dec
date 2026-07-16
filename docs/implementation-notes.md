@@ -1454,3 +1454,237 @@ inter-predicted block used to allocate 3 `Vec`s (`intermediate`, `pred` x{1,2 fo
 also now zero. This scales with block/frame count, so the benefit should grow with real-world
 (larger, more heavily-populated) content even though it doesn't move the needle on these tiny
 conformance clips.
+
+## Wave 5: module boundaries (2026-07-16)
+
+### Scope
+
+Pure structural refactoring -- code motion and signature grouping, zero behavior change.
+Split the 2813-line `tile.rs` monolith at its domain seams, unified three duplicated spec
+constants/helpers, dissolved two documented seam-structs (`mv.rs`'s "half extraction",
+`SegQIndexOverride`), grouped `predict_inter`'s 20 positional args, and added
+`BoolDecoder::flag()`. Every diff traces to relocation, signature grouping, or the minimal
+visibility bump (`pub(super)`) the relocation itself required -- no arithmetic expression was
+touched. Bit-exactness was the gate throughout (full test suite + conformance + ffmpeg
+cross-decode, all green before and after).
+
+### 1. `tile.rs` -> `tile/` directory
+
+`tile.rs` stays as the module file (the hub); it declares `mod mode_info; mod mv_pred; mod
+ref_ctx; mod residual;`, each backed by `src/tile/<name>.rs` and implemented as one or more
+`impl TileDecoder` blocks (methods stay methods -- this is Rust's standard "split a module
+across a directory of files" mechanism, not a new abstraction). Final shape:
+
+- `tile.rs` (853 lines, hub): `TileError`, `MiInfo`/`MiGrid` (+ `Default`/inherent impls,
+  shared by every submodule and by `loop_filter.rs`), `get_tile_offset`, the `TileDecoder`
+  struct/fields, and the traversal `impl` block (`new`/`new_with_prev`, accessors,
+  `apply_loop_filter`, `clear_above_context`/`clear_left_context`, `decode_tiles`/
+  `decode_tile`/`decode_partition`/`read_partition`/`decode_block`). Keeps the 4 tests that
+  exercise `decode_tiles` end-to-end (`get_tile_offset_matches_spec_formula`,
+  `single_skip_block_decodes_without_residual_error`,
+  `non_skip_block_with_all_zero_tokens_decodes_successfully`, `invalid_tile_size_is_rejected`).
+- `tile/mode_info.rs` (1085 lines): `intra_frame_mode_info`/`inter_frame_mode_info` and
+  everything they call directly -- segment id (`intra_segment_id`/`inter_segment_id`/
+  `get_segment_id`/`seg_feature_active`), `read_skip`/`read_tx_size`, `read_is_inter`/
+  `intra_block_mode_info`/`read_ref_frames`, `inter_block_mode_info`/`assign_mv`/`read_mv`/
+  `read_mv_component`. Also holds `NeighborRefInfo` (`pub(super)`, constructed here, read by
+  `ref_ctx`'s methods) and `interp_filter_ctx` (a judgment call: it's a context-derivation
+  function like `ref_ctx`'s, but unlike those it reads `self.mi_grid` rather than being a pure
+  function of `NeighborRefInfo`, and its only caller is `inter_block_mode_info` in this same
+  file, so it stayed here rather than moving to `ref_ctx.rs`). Only `intra_frame_mode_info`/
+  `inter_frame_mode_info` needed `pub(super)` (called from the hub's `decode_block`) --
+  everything else this file calls internally stayed plain-private. Moved the segmentation unit
+  tests, the `read_is_inter`/`read_ref_frames` `SEG_LVL_REF_FRAME`-forcing tests, and the MV
+  round-trip tests (`read_mv`/`read_mv_component`) here, next to their subjects; duplicated the
+  small `minimal_header`/`no_segmentation`/`default_compressed_header` test fixtures (also
+  needed by the hub's own tests) rather than inventing a shared cross-file test-helpers module
+  for ~15 lines of fixture code.
+- `tile/ref_ctx.rs` (286 lines): the pure neighbor-context derivation methods --
+  `comp_mode_ctx`/`comp_ref_ctx`/`single_ref_p1_ctx`/`single_ref_p2_ctx`, all `pub(super)`
+  (called cross-file from `mode_info::read_ref_frames`). No tests of its own: the pre-existing
+  test suite never exercised these directly (`read_ref_frames_seg_lvl_ref_frame_returns_...`
+  short-circuits past them via `seg_feature_active(SEG_LVL_REF_FRAME)`), so there was nothing to
+  move -- not a coverage change made by this wave.
+- `tile/mv_pred.rs` (377 lines): `find_mv_refs`/`find_best_ref_mvs`/`append_sub8x8_mvs` (all
+  `pub(super)`, called cross-file from `mode_info::inter_block_mode_info`) and their
+  neighbor-scanning helpers (`is_inside`/`get_block_mv`/`if_same_ref_frame_add_mv`/
+  `if_diff_ref_frame_add_mv`, all plain-private -- called only within this file). Also fully
+  absorbs the former `src/mv.rs` (`Mv`, `ZERO_MV`, `MVREF_NEIGHBOURS`, `MV_BORDER`,
+  `MV_PRED_BORDER`, `COMPANDED_MVREF_THRESH`, `MI_SIZE`, `clamp_mv_row`/`clamp_mv_col`/
+  `add_mv_ref_list`/`scale_mv`/`use_mv_hp`, plus its 4 unit tests, moved verbatim): `mv.rs`'s own
+  module doc said its bodies stayed in `tile.rs` only for borrow convenience with
+  `TileDecoder`/`MiGrid`, and now that the real methods live in this same submodule, keeping the
+  pure helpers in a separate top-level module served no purpose. `Mv` is `pub` and re-exported
+  at the hub (`pub use mv_pred::Mv;`, so `crate::tile::Mv`) since `predict.rs` is the one
+  external (non-`tile`) consumer; `ZERO_MV`/`use_mv_hp` are `pub(super)` (also used from
+  `mode_info.rs`); everything else former-`mv.rs` stayed plain-private (only used within this
+  file after the merge).
+- `tile/residual.rs` (473 lines): `residual` (`pub(super)`, called from the hub's
+  `decode_block`) and everything it calls directly -- `get_uv_tx_size`/`get_plane_block_size`,
+  `compute_tx_type`/`tx_sz_to_scan_size`, `tokens_and_reconstruct`/`read_coef` -- plus the W4b
+  per-frame dequant table builder `build_dequant_table` (a free fn, `pub(super)`, called from
+  the hub's `TileDecoder::new_with_prev`; it moved here rather than staying in the hub because
+  its only reason to exist is feeding this file's dequantization step).
+
+Mechanically, cross-file calls needed `pub(super)` (Rust privacy is subtree-based: a
+plain-private item is visible in its defining module and that module's descendants, so a
+private method defined inside `tile/mode_info.rs` is *not* visible from `tile.rs` itself or from
+`tile/mv_pred.rs` -- only from `mode_info.rs` and its own descendants -- while `pub(super)`
+makes it visible throughout `tile`'s whole subtree). Struct *fields* needed no visibility
+change at all: `TileDecoder`'s fields are declared plain-private in the hub, and every
+submodule, being a descendant of `tile`, can already read/write `self.<field>` from an `impl
+TileDecoder` block physically located in a different file.
+
+### 2. `src/common.rs`: unify 3 duplicated spec constants/helpers
+
+New `#[doc(hidden)] pub mod common` (same convention as every other internal module, per
+`lib.rs`) holding the single canonical definition of:
+
+- `MAX_SEGMENTS: usize = 8` -- was `pub` in `header.rs` and privately redefined in
+  `loop_filter.rs`. `header.rs` now does `pub use crate::common::MAX_SEGMENTS;` at the same
+  spot, so `header::MAX_SEGMENTS` (imported by `tile.rs` and by `tests/common/encoder.rs`)
+  keeps working unchanged; `loop_filter.rs` imports it straight from `common`.
+- `INTRA_FRAME: u8 = 0` -- was `pub` in `prob_tables.rs` (re-exported by `header.rs`) and
+  privately redefined as a `usize` in `loop_filter.rs`. `prob_tables.rs` now does `pub use
+  crate::common::INTRA_FRAME;` at the same spot (keeps `prob_tables::INTRA_FRAME` and
+  `header`'s further re-export working); `loop_filter.rs` imports it straight from `common` and
+  its 3 `usize`-indexing call sites gained an explicit `as usize` (the type is `u8` now, unified
+  with every other `ref_frame`-typed value in the codebase, rather than a `loop_filter`-local
+  `usize`).
+- `get_uv_tx_size(mi_size, tx_size, subsampling_x, subsampling_y) -> u8` -- was duplicated
+  verbatim as a `TileDecoder` method (deriving `subsampling_x`/`subsampling_y` from `self` via
+  `get_plane_block_size`) and as a `loop_filter.rs` free function (taking them as params
+  directly). Unified on the free-function form (`loop_filter.rs`'s shape, since it has no
+  `self` to borrow from); `TileDecoder::get_uv_tx_size` (`tile/residual.rs`) is now a one-line
+  wrapper passing `self.subsampling_x`/`self.subsampling_y` through, so its call site
+  (`self.get_uv_tx_size(...)` in `residual()`) needed no change at all.
+
+### 3. `SegQIndexOverride` dissolved (`src/quant.rs`)
+
+`get_qindex(base_q_idx, seg: Option<SegQIndexOverride>) -> u8` -> `get_qindex(base_q_idx,
+segmentation: &header::SegmentationParams, segment_id: usize) -> u8`. The struct existed only
+to keep `quant.rs` decoupled from `header::SegmentationParams`; W2b's `common` precedent made
+that reasoning moot (judgment call, per the task brief), and passing the params straight
+through lets `get_qindex` mirror the spec's `seg_feature_active( SEG_LVL_ALT_Q )` branch
+directly instead of requiring the caller to pre-derive an `Option`. The caller
+(`build_dequant_table`, now in `tile/residual.rs`) shrank from a 9-line `Option` construction
+to a single `get_qindex(base_q_idx, segmentation, segment_id)` call. Updated `quant.rs`'s 3
+affected unit tests to build a `SegmentationParams` (via new local test helpers
+`no_segmentation`/`seg_lvl_alt_q`) instead of a `SegQIndexOverride`; no other file referenced
+the struct (confirmed via search before deleting it).
+
+### 4. `predict_inter` parameter grouping (`src/predict.rs`)
+
+New `pub struct InterPredictParams<'a>` groups the 14 of `predict_inter`'s 20 positional
+parameters that are identical across every call one coding block's `residual()` makes (one
+call per plane, further split into 4x4 sub-blocks when `MiSize < BLOCK_8X8`): `ref_frame`,
+`block_mvs`, `interp_filter`, `mi_row`/`mi_col`/`mi_size`/`mi_rows`/`mi_cols`,
+`subsampling_x`/`subsampling_y`, `frame_width`/`frame_height`, `bit_depth`, `refs`.
+`predict_inter` itself is now `(dst, plane, x, y, w, h, block_idx, p: &InterPredictParams)` --
+8 params (still `#[allow(clippy::too_many_arguments)]`, one over the 7 threshold, down from
+20). Call sites in `tile/residual.rs` build one `InterPredictParams` before the
+sub8x8-loop-vs-full-block `if`/`else` (identical either way) instead of repeating the same
+14 values twice.
+
+Applied the same struct to `predict_inter`'s 3 private helpers, since all 3 already draw
+their invariant inputs from this exact same field set:
+`select_mv(plane, ref_list, block_idx, p)` (was 7 params -- not over the clippy threshold, but
+made consistent with its 2 siblings since all its non-`p` inputs are per-call);
+`clamp_mv_for_plane(plane, mv, p)` (was 9, had `#[allow(too_many_arguments)]` -- now 3, allow
+removed); `scale_mv_for_plane(plane, x, y, clamped_mv, ref_width, ref_height, p)` (was 10, had
+the allow -- now 7, right at the threshold, allow removed; `ref_width`/`ref_height` stayed
+positional since they're the specific reference's own size, read from `p.refs[ref_list]` at
+the call site, not frame-invariant).
+
+Left `block_inter_predict` (10 params) and `predict_intra` (11 params) as-is: `predict_intra`
+is a different pipeline (intra, not inter) with no comparable invariant/per-call split --
+every one of its params genuinely varies call to call; `block_inter_predict` only overlaps
+`InterPredictParams` in 2 of its 10 fields (`interp_filter`, `bit_depth`), so threading the
+whole struct through for a 10 -> 9 reduction wasn't judged worth the added coupling. Also left
+the `tile/residual.rs` / `tile/mode_info.rs` / `tile/mv_pred.rs` `#[allow(too_many_arguments)]`
+sites untouched (`residual`, `compute_tx_type`, `tokens_and_reconstruct`, `inter_block_mode_info`,
+`append_sub8x8_mvs`): each one's arguments are already a mix of genuinely-independent per-call
+values (`row`/`col`/`plane`/`start_x`/`start_y`/etc.) with no natural invariant subset to
+extract without inventing a struct that would just re-list most of `TileDecoder`'s own fields.
+
+### 5. `prob_tables.rs` domain split
+
+Moved `SUBPEL_FILTERS` + the 5 motion-compensation constants (`REF_SCALE_SHIFT`/`SUBPEL_BITS`/
+`SUBPEL_SHIFTS`/`SUBPEL_MASK`/`INTERP_EXTEND`) to new `src/subpel.rs` (98 lines); moved
+`MV_REF_BLOCKS`/`MODE_2_COUNTER`/`COUNTER_TO_CONTEXT`/`IDX_N_COLUMN_TO_SUBBLOCK` to new
+`src/mv_ref_tables.rs` (151 lines) rather than into `tile/mv_pred.rs` -- kept as a standalone
+top-level module (mirroring `subpel.rs`) since `prob_tables.rs` itself is a flat table module
+with no submodule structure of its own, so a same-shaped sibling was the smaller conceptual
+jump than reaching into `tile`'s private subtree. Both are `#[doc(hidden)] pub mod`, same
+convention. `predict.rs` now imports the subpel items from `crate::subpel`; `tile/mv_pred.rs`
+imports the MV-ref tables from `crate::mv_ref_tables`. Neither set of items had any other
+importer (`tests/common/encoder.rs` imports neither), so this was a clean move with no
+re-export needed (unlike `common`'s `MAX_SEGMENTS`/`INTRA_FRAME`, which needed re-exports
+because outside code already depended on their old import paths). Two of the moved doc
+comments had their `[`NEARESTMV`]`/`[`NEWMV`]` intra-doc-link brackets flattened to plain code
+spans in `mv_ref_tables.rs` (they relied on those constants being in the same file as the
+comment in `prob_tables.rs`; re-importing them just to keep a doc link alive wasn't worth it).
+`prob_tables.rs` (2024 lines, down from 2270) now holds only trees/probabilities/block-geometry,
+matching its own doc comment's description of its scope.
+
+### 6. `BoolDecoder::flag()`
+
+Added `pub fn flag(&mut self) -> bool` (`read_literal(1) == 1`) to `bool_coder.rs`. Replaced the
+6 genuine boolean-comparison call sites in `compressed_header.rs`
+(`decode_term_subexp`'s 3 `read_literal(1) == 0` checks -> `!r.flag()`; `read_coef_probs`'s
+`update_probs`, `frame_reference_mode`'s `non_single_reference`/`reference_select`, all
+`read_literal(1) == 1` -> `r.flag()`). Left 2 other `read_literal(1)` call sites untouched
+(`decode_term_subexp`'s final `let bit = r.read_literal(1);` and `read_tx_mode`'s `let
+tx_mode_select = r.read_literal(1) as u8;`): both use the result as a `u32`/`u8` in arithmetic
+(`(v << 1) - 1 + bit`, `tx_mode += tx_mode_select`), not as a boolean comparison, so they don't
+match the `read_literal(1) == 1`/`== 0` pattern the task described.
+
+### Judgment calls (summary; see inline call-outs above for the reasoning)
+
+- `interp_filter_ctx` stayed in `mode_info.rs` rather than moving to `ref_ctx.rs` (reads
+  `self.mi_grid`, not a pure function of `NeighborRefInfo` like its 4 `ref_ctx` neighbors).
+  `NeighborRefInfo` itself stayed in `mode_info.rs` (constructed there) with `pub(super)`
+  fields, rather than moving to `ref_ctx.rs` (consumed there) or a new standalone module.
+- Duplicated small test fixtures (`minimal_header`/`no_segmentation`/`default_compressed_header`)
+  across `tile.rs` and `tile/mode_info.rs` rather than adding a shared test-helpers module.
+- `get_qindex`'s replacement signature takes `&header::SegmentationParams` directly (the
+  brief's fallback option) rather than inventing a new minimal shared type, since `common.rs`
+  already removed the original decoupling rationale entirely.
+- `mv_ref_tables.rs` kept as a standalone top-level module rather than folded into
+  `tile/mv_pred.rs` (see §5).
+- `block_inter_predict`/`predict_intra` left with their existing `#[allow(too_many_arguments)]`
+  (see §4) -- the task explicitly said not to force grouping without a natural split.
+
+### Verification
+
+`cargo build`: clean, no warnings. `cargo test`: 147/147 across all 6 binaries, same total as
+the Wave 4b baseline (0 shift) -- per-binary: `vp9dec` (lib) 119 (identical to the pre-wave
+baseline, confirmed via `git stash`: the tests that moved -- `mv.rs`'s 4 and `tile.rs`'s 11
+relocated to `tile::mv_pred`/`tile::mode_info` -- were already counted under the same
+`unittests src\lib.rs` binary before this wave, so the split moved them between source files
+and module paths, not between test binaries), `api_test` 6, `conformance_test` 12,
+`synthetic_seg_test` 6, `decode_to_png` example 4, doc-tests 0. Conformance: all 5 vectors
+print real `[ok]` MD5-match
+lines (`vp90-2-16-intra-only` 7 frames, `vp90-2-15-segkey` 1 frame, `vp90-2-09-subpixel-00` 20
+frames, `vp90-2-12-droppable_1` 99 frames, `vp90-2-15-segkey_adpq` 150 frames), unchanged from
+baseline. `VP9DEC_FFMPEG="<path-to-ffmpeg>" cargo
+test --test synthetic_seg_test synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`:
+8/8 `[xdecode] ... OK` lines (4 synthetic streams x {libvpx-vp9, vp9} ffmpeg decoders).
+`cargo clippy --all-targets`: same 3 pre-existing baseline warnings as Wave 4b (confirmed
+identical via `git stash`; `header.rs` large_enum_variant, `superframe.rs` identity_op,
+`lib.rs` field_reassign_with_default), no new ones. `RUSTDOCFLAGS="-D
+rustdoc::broken_intra_doc_links" cargo doc --no-deps`: no broken links; the pre-existing 3
+`private_intra_doc_links` warnings (confirmed identical via `git stash`: `TileDecoder::residual`/
+`tokens_and_reconstruct`/`crate::Decoder::prev_mi_grid`) are unchanged -- the module doc
+comment added to `tile.rs` initially introduced 4 more (linking to the new private submodules
+by name) but these were flattened to plain code spans (no intra-doc link) once confirmed
+unnecessary. `rustfmt --check` run per new file only (`common.rs`/`subpel.rs`/
+`mv_ref_tables.rs`/`tile/mode_info.rs`/`tile/ref_ctx.rs`/`tile/mv_pred.rs`/`tile/residual.rs`);
+applied where it flagged anything (import-line wrapping and 2 function signatures in
+`tile/mv_pred.rs` that got shorter after dropping their old `pub` keyword but still needed
+multi-line wrapping) -- `tile.rs` itself (pre-existing, not new) was never run through rustfmt.
+`git diff --stat`: `tile.rs` 2813 -> 853 lines; new `tile/mode_info.rs` (1085) /
+`tile/ref_ctx.rs` (286) / `tile/mv_pred.rs` (377) / `tile/residual.rs` (473); `mv.rs` deleted
+(125 lines); new `common.rs` (25) / `subpel.rs` (98) / `mv_ref_tables.rs` (151); `quant.rs`,
+`predict.rs`, `loop_filter.rs`, `header.rs`, `compressed_header.rs`, `bool_coder.rs`, `lib.rs`
+(mod decls) all touched as described above; no changes to any file under `tests/`.

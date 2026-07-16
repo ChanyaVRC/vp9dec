@@ -22,6 +22,8 @@ pub mod bit_reader;
 #[doc(hidden)]
 pub mod bool_coder;
 #[doc(hidden)]
+pub mod common;
+#[doc(hidden)]
 pub mod compressed_header;
 #[doc(hidden)]
 pub mod counts;
@@ -34,7 +36,7 @@ pub mod header;
 #[doc(hidden)]
 pub mod loop_filter;
 #[doc(hidden)]
-pub mod mv;
+pub mod mv_ref_tables;
 #[doc(hidden)]
 pub mod predict;
 #[doc(hidden)]
@@ -43,6 +45,8 @@ pub mod prob_tables;
 pub mod quant;
 #[doc(hidden)]
 pub mod scan;
+#[doc(hidden)]
+pub mod subpel;
 #[doc(hidden)]
 pub mod superframe;
 #[cfg(any(test, feature = "test-support"))]
