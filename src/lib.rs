@@ -309,15 +309,33 @@ impl Decoder {
     /// splits it (`superframe::split_superframe`) and decodes each contained VP9 frame in
     /// turn, returning one [`DecodedFrame`] per constituent frame in bitstream order
     /// (`show_existing_frame` chunks, which never carry a superframe index, yield exactly
-    /// one element). A conformant VP9 chunk displays at most one frame -- at most one
-    /// element with `frame: Some` -- but that is not enforced here; the result simply
-    /// reports what each constituent frame produced. Internal state (reference frame
-    /// buffers, frame context, previous frame's MVs, etc.) is updated for every
-    /// constituent frame, shown or hidden.
+    /// one element). At most one element carries `frame: Some` -- when several
+    /// constituents are marked shown (spatial-SVC streams mark every layer shown), only
+    /// the last of them keeps its picture, matching libvpx's display behavior; the
+    /// others still report their `info`. Internal state (reference frame buffers, frame
+    /// context, previous frame's MVs, etc.) is updated for every constituent frame,
+    /// shown or hidden.
     pub fn decode_frame(&mut self, chunk: &[u8]) -> Result<Vec<DecodedFrame>, DecodeError> {
         let mut decoded = Vec::new();
         for frame_data in superframe::split_superframe(chunk) {
             decoded.push(self.decode_one_frame(frame_data)?);
+        }
+        // Spec §5.26 permits a superframe to produce multiple output frames ("it is also legal
+        // for a superframe to result in multiple output frames"), so §8.9's per-frame Output
+        // process, read in isolation, would surface every constituent whose own show_frame is
+        // 1. In practice this crate's conformance oracle (libvpx, via ffmpeg -- see
+        // docs/implementation-notes.md "M4 wave 3") surfaces exactly one displayed frame per
+        // chunk: each shown constituent overwrites a pending-output slot, so the LAST SHOWN
+        // constituent survives (spatial-SVC streams mark every layer shown; only the top layer
+        // is displayed). Mirror that: only the last constituent with a decoded picture keeps
+        // its `frame`; earlier ones keep their `info` (decode stats) but have `frame` cleared.
+        // Keying on last-SHOWN rather than positionally-last means a (conforming but unusual)
+        // chunk ending in a hidden frame cannot lose its visible output. No-op for the common
+        // case (at most one shown constituent per chunk).
+        if let Some(last_shown) = decoded.iter().rposition(|df| df.frame.is_some()) {
+            for df in &mut decoded[..last_shown] {
+                df.frame = None;
+            }
         }
         Ok(decoded)
     }

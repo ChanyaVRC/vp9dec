@@ -2123,3 +2123,129 @@ not §8.6/§8.7), discovered only by tracing the first bad pixel back through th
 reconstruction pipeline stage by stage per the task's own prescribed method (which is exactly
 how it surfaced: the pre-loop-filter value matched ground truth, isolating the defect to the
 one remaining stage).
+
+## M4 wave 3: last-shown-frame-only output per chunk, for multi-shown-constituent superframes (fixed 2026-07-16)
+
+### Scope
+
+The last failing official vector, `vp90-2-22-svc_1280x720_3.ivf` (`md5-mismatch@frame 0`), is a
+3-spatial-layer SVC stream: each of its 20 IVF chunks is a superframe of 3 constituent VP9
+frames (320x180, 640x360, 1280x720), the two smaller ones inter-predicting the next larger one
+via ordinary reference-frame scaling (spec §8.5.2.3/§8.5.2.4 -- no VP9 syntax is SVC-specific).
+The task's suspect list was the scaled-motion-compensation path itself: the 2:1 scale ratio's
+step/phase math, per-reference size handling, or intra_only/size handling inside the
+superframe. None of these turned out to be the defect -- the actual bug is entirely unrelated
+to per-pixel decoding, and lives in `Decoder::decode_frame`'s (`src/lib.rs`) selection of which
+constituent frame(s) of a chunk get reported as displayed output.
+
+### Repro and evidence chain
+
+1. **Superframe structure probe** (`examples/probe_svc.rs`, parsing each constituent's
+   uncompressed header directly via `header::parse_uncompressed_header`, deleted before
+   finishing): confirmed the layer sizes/ref structure the task described, but also revealed
+   that **all 3 constituents of every chunk have `show_frame == 1`** in the bitstream --
+   not just the final (top) one. This was cross-checked against the spec's own uncompressed
+   header syntax table (§6.2, fetched as text via `pdftotext -layout` on the same cached spec
+   PDF wave 2 used) line-for-line against `src/header.rs::parse_uncompressed_header`: the
+   `show_frame`/`intra_only`/`reset_frame_context` read order matches exactly, and a genuine
+   bit-alignment bug at that position would necessarily desync everything downstream in that
+   constituent's own header/compressed-header/tile decode (byte-for-byte, not just this one
+   flag) -- which does not happen (see point 3 below), so the parse is correct: the bitstream
+   really does set `show_frame = 1` on the base and mid layers, not just the top one.
+2. **ffmpeg ground truth, frame count**: `ffmpeg -c:v libvpx-vp9 -i vp90-2-22-svc_1280x720_3.ivf
+   -f null -` reports `frame=20` (matching the `.ivf.md5` sidecar's 20 lines and the IVF
+   container header's own `frame_count=20`), and logs `dimension change! 0x0 -> 1280x720` as
+   the *first* dimension it ever receives from the decoder -- i.e. libvpx itself never surfaces
+   the 320x180/640x360 constituents to its caller at all, despite their own `show_frame` bit
+   being 1. This crate's decoder, by contrast (before this fix), returned `frame: Some` for
+   every one of the 3 shown constituents per chunk (60 total across the file) -- an instrument
+   probe (temporary; replicates `tests/sweep_test.rs::sweep_one`'s logic with per-constituent
+   detail, deleted before finishing) confirmed this exactly: `output_idx 0` (chunk 0's base
+   layer, 320x180) was compared against `expected[0]`, which is actually the *top*-layer hash,
+   an immediate mismatch -- exactly the reported `md5-mismatch@frame 0`.
+3. **The scaled-MC/reference-scaling code itself needed no fix at all**: the same probe,
+   filtering to just each chunk's 1280x720 (top-layer) constituent and comparing it against
+   `expected[chunk_idx]`, found **20/20 byte-exact matches across the entire file** -- every
+   single top-layer frame this decoder produces, including frame 0 (which depends on scaled
+   motion compensation from the just-decoded, same-superframe base and mid layers) is already
+   bit-identical to the official reference. This rules out every item in the task's suspect
+   list (scale-ratio stepping/phase, per-reference size handling, intra_only/size handling) --
+   the pixel-producing pipeline was already fully correct; the only wrong thing was *which*
+   already-correct frame got exposed as this chunk's display output.
+4. **Spec text on multi-shown superframes** (same cached spec PDF, §5.26 "Superframes" and
+   §8.9 "Output process"): §5.26 explicitly states "it is also legal for a superframe to result
+   in multiple output frames, or even no output frames" -- so spec text alone does not forbid
+   this bitstream's 3-shown-per-superframe structure, and §8.9's Output process is phrased
+   per-frame ("if show_frame is equal to 1, then the decoder should output the current
+   frame"), with no additional carve-out for a superframe with more than one shown constituent.
+   Taken in isolation, a literal reading of §8.9 says every one of the 3 constituents here
+   should be output. This is a genuine spec-vs-reference-decoder gap: this project's
+   conformance oracle (ffmpeg/libvpx -- see the file header's own methodology note, and wave
+   2's `read_partition`-adjacent precedent for resolving such gaps by ffmpeg agreement rather
+   than literal spec text) demonstrably surfaces at most one output frame per input chunk, and
+   specifically the *last* constituent decoded within it, not the union of every shown one.
+
+### Fix
+
+`src/lib.rs`, `Decoder::decode_frame`: after decoding every constituent frame of the chunk into
+`decoded: Vec<DecodedFrame>`, clear `frame` (but not `info`) to `None` on every entry except the
+last. This is a no-op for the overwhelmingly common real-world superframe shape (a hidden
+altref, `show_frame == 0`, followed by one visible frame, `show_frame == 1` -- already handled
+correctly before this fix, since the altref's own `show_frame` was already 0) and for every
+single-constituent chunk (`decoded.len() == 1`, the ordinary case). It only changes behavior
+when 2+ constituents of the *same* chunk each independently have `show_frame == 1`, which this
+SVC vector is the only vector in the whole 304-vector corpus to exercise. 15 lines including
+the comment; no other file in `src/` touched.
+
+### Verification
+
+- **Target vector**: `vp90-2-22-svc_1280x720_3.ivf` -- all 20 shown frames now MD5-match (see
+  point 3 above: the pixel data was always correct; this fix only stops the base/mid layers
+  from being reported as spurious extra outputs, bringing the output *count* and *identity* in
+  line with the official 20-line `.ivf.md5`).
+- **Full sweep** (`RUST_MIN_STACK=16777216 cargo test --release --test sweep_test
+  official_vector_sweep -- --ignored --nocapture`): **304 / 304 pass** (up from wave 2's
+  303/304) -- every vector in the official corpus now passes, zero regressions (every one of
+  the 303 previously-passing vectors' names cross-checked against the new report).
+- **New unit tests**, `tests/synthetic_superframe_test.rs` (2 tests, self-built via
+  `tests/common/encoder.rs`'s keyframe builder + a hand-rolled superframe index mirroring
+  `src/superframe.rs`'s own private test helper):
+  - `superframe_with_multiple_shown_constituents_only_outputs_the_last`: packs two independent
+    key frames (both `show_frame == 1`, `build_keyframe_header` always sets it) into one
+    2-constituent superframe with visibly different content (frame A: flat DC_PRED; frame B:
+    the existing V_PRED/H_PRED 127/129-edge pattern already hand-verified in
+    `synthetic_seg_test.rs`). Asserts `decoded[0].info.is_some() && decoded[0].frame.is_none()`
+    and that `decoded[1].frame`'s pixels are frame B's (127/129), not frame A's (flat 128) --
+    confirming the fix picks the *last* constituent's actual pixels, not just any nonzero
+    frame. Confirmed to pin the bug: reverted the `src/lib.rs` fix (`git stash`) and reran --
+    fails exactly as expected (`decoded[0].frame.is_none()` assertion fails, since the
+    unfixed code reports the first constituent's frame too); reapplied the fix (`git stash
+    pop`) and confirmed it passes again.
+  - `single_frame_chunk_is_unaffected`: a bare single key frame (no superframe index) still
+    reports `frame: Some` -- guards against a future edit accidentally gating on chunk
+    position rather than "is this the last constituent."
+- `cargo test`: **150 passed, 0 failed** (148 from wave 2 + the 2 new tests above), no
+  regressions.
+- `VP9DEC_FFMPEG="<path-to-ffmpeg>" cargo test
+  --test synthetic_seg_test synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`: 8/8
+  unchanged (none of those scenarios pack superframes, so this path is untouched by construction).
+- `cargo clippy --all-targets`: same 3 pre-existing baseline warnings as waves 1/2
+  (`header.rs` large_enum_variant, `superframe.rs` identity_op, `lib.rs`
+  field_reassign_with_default), no new ones.
+- `git diff --stat`: `src/lib.rs` (+15, the fix) and the new
+  `tests/synthetic_superframe_test.rs` (117 lines) -- no other files. The throwaway probe
+  (`examples/probe_svc.rs`, reused across both the header-structure dump and the
+  sweep-replication step) was deleted before finishing.
+
+### Deviations from the task's candidate list
+
+None of the task's three suspect areas (2x scale-ratio stepping/phase in
+`scale_mv_for_plane`/`block_inter_predict`, per-reference differing ref sizes, intra_only/size
+handling inside the superframe) were the actual defect -- all three were empirically ruled out
+by the frame-0 (and, in fact, whole-file) byte-exact match of this decoder's top-layer output
+against the official reference once the base/mid layers' spurious outputs are filtered out
+(step 3 above). The real defect was one level up from per-pixel decoding entirely: which
+already-correctly-decoded constituent frame of a chunk is reported as *the* displayed output,
+a policy question spec §8.9 does not fully pin down for the multi-shown-per-superframe case
+(§5.26 explicitly allows it) but that this project's ffmpeg/libvpx conformance oracle resolves
+unambiguously in practice.
