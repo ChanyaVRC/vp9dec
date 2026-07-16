@@ -109,7 +109,10 @@ fn sh_op(t: &mut [i64], s: &[i64], a: usize, b: usize) {
 /// Spec §8.7.1.2: input array reordering for the inverse DCT (bit-reversal permutation).
 fn idct_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
-    let copy_t: Vec<i64> = t[..n0].to_vec();
+    // Fixed-size scratch: called per row/column of every transform block, so avoiding a
+    // heap alloc here matters. 32 is the max n0 (n <= 5, the 32x32 transform).
+    let mut copy_t = [0i64; 32];
+    copy_t[..n0].copy_from_slice(&t[..n0]);
     for i in 0..n0 {
         t[i] = copy_t[brev(n, i)];
     }
@@ -213,7 +216,9 @@ fn idct(t: &mut [i64], n: u32) {
 fn adst_input_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
     let n1 = 1usize << (n - 1);
-    let copy_t: Vec<i64> = t[..n0].to_vec();
+    // Fixed-size scratch: only ever called with n == 3 or 4 (ADST tops out at 16x16).
+    let mut copy_t = [0i64; 16];
+    copy_t[..n0].copy_from_slice(&t[..n0]);
     for i in 0..n1 {
         t[2 * i] = copy_t[n0 - 1 - 2 * i];
         t[2 * i + 1] = copy_t[2 * i];
@@ -223,7 +228,8 @@ fn adst_input_permute(t: &mut [i64], n: u32) {
 /// Spec §8.7.1.5: output array reordering for the inverse ADST (`n` is 3 or 4).
 fn adst_output_permute(t: &mut [i64], n: u32) {
     if n == 4 {
-        let copy_t: Vec<i64> = t[..16].to_vec();
+        let mut copy_t = [0i64; 16];
+        copy_t.copy_from_slice(&t[..16]);
         for a in 0..2usize {
             for b in 0..2usize {
                 for c in 0..2usize {
@@ -237,7 +243,8 @@ fn adst_output_permute(t: &mut [i64], n: u32) {
         }
     } else {
         debug_assert_eq!(n, 3);
-        let copy_t: Vec<i64> = t[..8].to_vec();
+        let mut copy_t = [0i64; 8];
+        copy_t.copy_from_slice(&t[..8]);
         for a in 0..2usize {
             for b in 0..2usize {
                 for c in 0..2usize {
@@ -475,7 +482,10 @@ pub fn inverse_transform_block(dequant: &mut [i64], n: u32, tx_type: TxType, los
         assert_eq!(n, 2, "lossless transform (WHT) only supports 4x4");
     }
 
-    let mut t = vec![0i64; n0];
+    // Fixed-size scratch (n0 <= 32, the 32x32 max transform), reused for every row and
+    // every column below instead of a per-block heap allocation.
+    let mut t_storage = [0i64; 32];
+    let t = &mut t_storage[..n0];
 
     // Row transform: i = 0..(n0-1).
     for i in 0..n0 {
@@ -486,11 +496,11 @@ pub fn inverse_transform_block(dequant: &mut [i64], n: u32, tx_type: TxType, los
         } else {
             match tx_type {
                 TxType::DctDct | TxType::AdstDct => {
-                    idct_permute(&mut t, n);
-                    idct(&mut t, n);
+                    idct_permute(t, n);
+                    idct(t, n);
                 }
                 TxType::DctAdst | TxType::AdstAdst => {
-                    iadst(&mut t, n);
+                    iadst(t, n);
                 }
             }
         }
@@ -509,11 +519,11 @@ pub fn inverse_transform_block(dequant: &mut [i64], n: u32, tx_type: TxType, los
         } else {
             match tx_type {
                 TxType::DctDct | TxType::DctAdst => {
-                    idct_permute(&mut t, n);
-                    idct(&mut t, n);
+                    idct_permute(t, n);
+                    idct(t, n);
                 }
                 TxType::AdstDct | TxType::AdstAdst => {
-                    iadst(&mut t, n);
+                    iadst(t, n);
                 }
             }
         }

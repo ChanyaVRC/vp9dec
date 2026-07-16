@@ -24,8 +24,8 @@ use crate::counts::Counts;
 use crate::dpb::RefFrameData;
 use crate::framebuffer::Plane;
 use crate::header::{
-    self, ColorConfig, NewFrameHeader, SegmentationParams, SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME,
-    SEG_LVL_SKIP,
+    self, ColorConfig, NewFrameHeader, SegmentationParams, MAX_SEGMENTS, SEG_LVL_ALT_Q,
+    SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
 };
 use crate::mv::{
     add_mv_ref_list, clamp_mv_col, clamp_mv_row, scale_mv, use_mv_hp, Mv, MVREF_NEIGHBOURS,
@@ -158,6 +158,43 @@ fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32 {
     offset.min(mis)
 }
 
+/// Builds the per-frame dequant step table, indexed `[segment_id][plane_kind][dc=0/ac=1]`
+/// (`plane_kind`: 0 = luma, 1 = chroma -- `get_dc_quant`/`get_ac_quant` only distinguish
+/// `plane == 0` from `plane != 0`, so chroma U and V share row 1).
+///
+/// `get_qindex`/`get_dc_quant`/`get_ac_quant` (spec §8.6.1) depend only on `segment_id` and
+/// frame-level header values (`base_q_idx`, the `delta_q_*` fields, `bit_depth`) -- all fixed
+/// for the whole frame -- so building this table once here (instead of re-deriving it, plus
+/// constructing a `SegQIndexOverride`, on every transform block) is exactly equivalent.
+fn build_dequant_table(
+    segmentation: &SegmentationParams,
+    base_q_idx: u8,
+    bit_depth: u8,
+    delta_q_y_dc: i32,
+    delta_q_uv_dc: i32,
+    delta_q_uv_ac: i32,
+) -> [[[i64; 2]; 2]; MAX_SEGMENTS] {
+    let mut table = [[[0i64; 2]; 2]; MAX_SEGMENTS];
+    for (segment_id, seg_row) in table.iter_mut().enumerate() {
+        let seg_q_override =
+            if segmentation.enabled && segmentation.feature_enabled[segment_id][SEG_LVL_ALT_Q] {
+                Some(SegQIndexOverride {
+                    data: segmentation.feature_data[segment_id][SEG_LVL_ALT_Q],
+                    abs_or_delta_update: segmentation.abs_or_delta_update,
+                })
+            } else {
+                None
+            };
+        let qindex = get_qindex(base_q_idx, seg_q_override);
+        for (plane_kind, dc_ac) in seg_row.iter_mut().enumerate() {
+            let dc_quant = get_dc_quant(bit_depth, qindex, plane_kind, delta_q_y_dc, delta_q_uv_dc);
+            let ac_quant = get_ac_quant(bit_depth, qindex, plane_kind, delta_q_uv_ac);
+            *dc_ac = [dc_quant as i64, ac_quant as i64];
+        }
+    }
+    table
+}
+
 /// Decoder that walks tiles and superblocks to decode mode info.
 ///
 /// Holds per-frame state (mode info grid, above/left partition context).
@@ -201,10 +238,9 @@ pub struct TileDecoder {
     subsampling_x: u32,
     subsampling_y: u32,
     lossless: bool,
-    base_q_idx: u8,
-    delta_q_y_dc: i32,
-    delta_q_uv_dc: i32,
-    delta_q_uv_ac: i32,
+    /// Per-frame dequant step table (see [`build_dequant_table`]); replaces re-deriving
+    /// `get_qindex`/`get_dc_quant`/`get_ac_quant` on every transform block.
+    dequant_table: [[[i64; 2]; 2]; MAX_SEGMENTS],
     /// `CurrFrame[ plane ]`. Index 0=Y, 1=U, 2=V.
     planes: [Plane; 3],
     /// `AboveNonzeroContext[ plane ]`. Persists across the whole frame width in 4x4 units
@@ -355,10 +391,14 @@ impl TileDecoder {
             subsampling_x,
             subsampling_y,
             lossless: header.quantization.lossless,
-            base_q_idx: header.quantization.base_q_idx,
-            delta_q_y_dc: header.quantization.delta_q_y_dc,
-            delta_q_uv_dc: header.quantization.delta_q_uv_dc,
-            delta_q_uv_ac: header.quantization.delta_q_uv_ac,
+            dequant_table: build_dequant_table(
+                &header.segmentation,
+                header.quantization.base_q_idx,
+                color_config.bit_depth,
+                header.quantization.delta_q_y_dc,
+                header.quantization.delta_q_uv_dc,
+                header.quantization.delta_q_uv_ac,
+            ),
             planes,
             above_nonzero_context,
             left_nonzero_context: [[0u8; 16]; 3],
@@ -933,7 +973,9 @@ impl TileDecoder {
         let x4 = (start_x >> 2) as u32;
         let y4 = (start_y >> 2) as u32;
 
-        let mut tokens = vec![0i32; seg_eob];
+        // Fixed-size scratch (seg_eob <= 1024, the 32x32 max transform): avoids a per-block
+        // heap allocation. Only the first seg_eob entries are read below.
+        let mut tokens = [0i32; 1024];
         let mut token_cache = [0u8; 1024];
         let mut check_eob = true;
         let mut c = 0usize;
@@ -1030,30 +1072,17 @@ impl TileDecoder {
 
         // Inverse quantization + inverse transform + reconstruction (spec §8.6.2).
         let dq_denom: i64 = if tx_sz == TX_32X32 { 2 } else { 1 };
-        // `get_qindex( )` (spec §8.6.1): SEG_LVL_ALT_Q overrides base_q_idx per-segment.
-        let seg_q_override = if self.seg_feature_active(segment_id, SEG_LVL_ALT_Q) {
-            Some(SegQIndexOverride {
-                data: self.segmentation.feature_data[segment_id as usize][SEG_LVL_ALT_Q],
-                abs_or_delta_update: self.segmentation.abs_or_delta_update,
-            })
-        } else {
-            None
-        };
-        let qindex = get_qindex(self.base_q_idx, seg_q_override);
-        let ac_quant = get_ac_quant(self.bit_depth, qindex, plane, self.delta_q_uv_ac) as i64;
-        let dc_quant = get_dc_quant(
-            self.bit_depth,
-            qindex,
-            plane,
-            self.delta_q_y_dc,
-            self.delta_q_uv_dc,
-        ) as i64;
-        let mut dequant = vec![0i64; n0 * n0];
-        for (idx, &t) in tokens.iter().enumerate() {
+        // Per-frame dequant table (spec §8.6.1 get_qindex/get_dc_quant/get_ac_quant), built
+        // once by `build_dequant_table` -- a per-block table lookup instead of re-deriving.
+        let [dc_quant, ac_quant] = self.dequant_table[segment_id as usize][plane_type];
+        // Fixed-size scratch (n0*n0 <= 1024, the 32x32 max transform): avoids a per-block
+        // heap allocation. Only the first seg_eob (== n0*n0) entries are read below.
+        let mut dequant = [0i64; 1024];
+        for (idx, &t) in tokens[..seg_eob].iter().enumerate() {
             dequant[idx] = (t as i64 * ac_quant) / dq_denom;
         }
         dequant[0] = (tokens[0] as i64 * dc_quant) / dq_denom;
-        inverse_transform_block(&mut dequant, n, tx_type, self.lossless);
+        inverse_transform_block(&mut dequant[..seg_eob], n, tx_type, self.lossless);
 
         let max_val = (1i64 << self.bit_depth) - 1;
         for i in 0..n0 {
@@ -2240,34 +2269,31 @@ impl TileDecoder {
         block_mvs: &[[Mv; 4]; 2],
     ) -> (Mv, Mv) {
         let (ref_list_mv, _ctx) = self.find_mv_refs(row, col, mi_size, ref_frame, block);
-        let mut sub8x8: Vec<Mv> = Vec::with_capacity(2);
+        // Fixed-size list (never holds more than 2 entries) + length counter, the same
+        // pattern `find_mv_refs` uses via `add_mv_ref_list` -- avoids a per-block heap alloc.
+        let mut sub8x8 = [ZERO_MV; 2];
+        let mut len; // assigned in every arm below before any read.
 
         if block == 0 {
-            sub8x8.push(ref_list_mv[0]);
-            sub8x8.push(ref_list_mv[1]);
+            // Unconditional, no dedup (unlike the `add_mv_ref_list` calls below).
+            sub8x8[0] = ref_list_mv[0];
+            sub8x8[1] = ref_list_mv[1];
+            len = 2;
         } else if block <= 2 {
-            sub8x8.push(block_mvs[ref_list][0]);
+            sub8x8[0] = block_mvs[ref_list][0];
+            len = 1;
         } else {
-            sub8x8.push(block_mvs[ref_list][2]);
+            sub8x8[0] = block_mvs[ref_list][2];
+            len = 1;
             for &idx in &[1usize, 0] {
-                if sub8x8.len() >= 2 {
-                    break;
-                }
-                if block_mvs[ref_list][idx] != sub8x8[0] {
-                    sub8x8.push(block_mvs[ref_list][idx]);
-                }
+                add_mv_ref_list(&mut sub8x8, &mut len, block_mvs[ref_list][idx]);
             }
         }
         for &cand in ref_list_mv.iter().take(2) {
-            if sub8x8.len() >= 2 {
-                break;
-            }
-            if cand != sub8x8[0] {
-                sub8x8.push(cand);
-            }
+            add_mv_ref_list(&mut sub8x8, &mut len, cand);
         }
-        if sub8x8.len() < 2 {
-            sub8x8.push(ZERO_MV);
+        if len < 2 {
+            sub8x8[len] = ZERO_MV;
         }
         (sub8x8[0], sub8x8[1])
     }

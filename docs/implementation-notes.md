@@ -1287,3 +1287,170 @@ against bool-decoding/transform/loop-filter work at these resolutions. The wave'
 architectural (removing clone traffic that scales with frame area, ahead of the eventual Noiria
 integration with real-world 1080p+ sources where the same clones would cost proportionally
 more), not a measured win on today's conformance suite.
+
+## Wave 4b: performance -- hot-path allocations + per-frame dequant derivation (2026-07-16)
+
+### Scope
+
+Removed per-block heap allocations from the decode/reconstruction hot paths and hoisted the
+per-block dequant-index derivation (`get_qindex`/`get_dc_quant`/`get_ac_quant`) into a table
+built once per frame. Every change is a storage-strategy change (`Vec` -> fixed-size array,
+sized to the spec's hard maxima) or a hoist-a-pure-function-of-frame-state-out-of-the-loop
+change -- no arithmetic expression was reordered or altered; bit-exactness was the hard gate
+throughout (verified per-step via the full test suite, not just at the end).
+
+### 1. `src/transform.rs`: per-row/column `Vec`/`.to_vec()` -> fixed `[i64; N]`
+
+`idct_permute` (`.to_vec()` of up to `n0` elements, `n0` <= 32 since `n` <= 5) and
+`adst_input_permute`/`adst_output_permute` (`n0` <= 16, ADST tops out at 16x16) each did a
+`.to_vec()` heap allocation *per call*, and both are called once per row and once per column of
+every transform block -- the single biggest allocation-count contributor in the decoder.
+Replaced with a local `[i64; 32]` / `[i64; 16]` stack scratch, copied into via
+`copy_from_slice` instead of `to_vec()`. `inverse_transform_block`'s own per-block
+`vec![0i64; n0]` row/column scratch became a `[i64; 32]` local (`t_storage`) sliced to
+`&mut t_storage[..n0]`; the call sites that used to pass `&mut t` (a `Vec`, auto-deref to
+`&mut [i64]`) now pass `t` directly (already `&mut [i64]`) -- Rust's implicit-reborrow rule for
+`&mut` references used directly as a call argument makes this a non-issue across the loop's
+repeated calls, no explicit reborrowing syntax needed.
+
+### 2. `src/tile.rs::tokens_and_reconstruct`: `tokens`/`dequant` -> fixed `[_; 1024]`
+
+`tokens: vec![0i32; seg_eob]` and `dequant: vec![0i64; n0*n0]` (two heap allocs per transform
+block) became `[0i32; 1024]` / `[0i64; 1024]` locals (1024 = 32*32, the 32x32 max transform),
+sliced to `[..seg_eob]` where the code needs the exact logical length (the iteration over
+`tokens` when building `dequant`, and the slice handed to `inverse_transform_block`, which
+asserts `dequant.len() == n0*n0`). The final reconstruction loop indexes `dequant[i*n0+j]`
+directly against the full fixed array, which is safe unchanged since `i*n0+j < n0*n0 <= 1024`.
+
+### 3. Per-frame dequant table (`src/tile.rs`)
+
+Added a free function `build_dequant_table(segmentation, base_q_idx, bit_depth, delta_q_y_dc,
+delta_q_uv_dc, delta_q_uv_ac) -> [[[i64; 2]; 2]; MAX_SEGMENTS]`, indexed
+`[segment_id][plane_kind][dc=0/ac=1]` (`plane_kind`: 0 = luma, 1 = chroma -- `get_dc_quant`/
+`get_ac_quant` only ever branch on `plane == 0` vs `!= 0`, so chroma U and V legitimately share
+row 1). Built once in `TileDecoder::new_with_prev` from the header/segmentation values (all
+fixed for the whole frame) and stored as `TileDecoder::dequant_table`.
+`tokens_and_reconstruct` now does a single array lookup (`let [dc_quant, ac_quant] =
+self.dequant_table[segment_id as usize][plane_type];`, reusing the `plane_type` already
+computed earlier in the function for `coef_probs`) instead of reconstructing a
+`SegQIndexOverride` and calling `get_qindex`/`get_dc_quant`/`get_ac_quant` on every transform
+block. `get_qindex`/`get_dc_quant`/`get_ac_quant`/`SegQIndexOverride` themselves are untouched
+(still unit-tested in `quant.rs`, now called only from the table builder instead of per block).
+
+Removed the now-caller-less `TileDecoder` fields `base_q_idx`/`delta_q_y_dc`/`delta_q_uv_dc`/
+`delta_q_uv_ac` (grepped the whole crate first: their only reads were the five lines just
+replaced in `tokens_and_reconstruct`; `TileDecoder` is private with two constructors, so no
+external code could be relying on the fields either). `self.segmentation` and
+`seg_feature_active` stay -- both are still live for `SEG_LVL_SKIP`/`SEG_LVL_REF_FRAME`
+elsewhere in the file.
+
+### 4. `src/tile.rs::append_sub8x8_mvs`: `Vec::with_capacity(2)` -> `[Mv; 2]` + len
+
+Mirrors the fixed-array-plus-length-counter pattern `find_mv_refs` already uses via the
+existing `add_mv_ref_list(list: &mut [Mv; 2], count: &mut usize, candidate)` helper (`src/mv.rs`,
+predates this wave). Reused `add_mv_ref_list` directly for the two dedup-with-cap-2 loops (its
+"skip if already at 2" and "skip if equal to slot 0" semantics are exactly what the original
+`Vec`-based loops did by hand). The `block == 0` arm does NOT use `add_mv_ref_list`: the
+original code pushes `ref_list_mv[0]` and `[1]` unconditionally, with no dedup, so that arm
+sets `sub8x8[0]`/`sub8x8[1]` directly to preserve that (using `add_mv_ref_list` there would
+silently drop a legitimately-duplicated second entry -- would have been a behavior change).
+
+### 5. `src/predict.rs::predict_intra`: `above_row`/`left_col`/`pred` -> fixed arrays
+
+`size` <= 32 (the 32x32 max transform), so: `above_row` (needs indices `-1..=2*size-1`, i.e.
+length `2*size+1` <= 65) -> `[i32; 65]`; `left_col` (length `size` <= 32) -> `[i32; 32]`; `pred`
+(length `size*size` <= 1024) -> `[i32; 1024]`. All three are sliced to their exact logical
+length (`&mut buf[..len]`) rather than left at full fixed size, so `pred.fill(value)` in the
+`DC_PRED` arm and the `left_col.iter().sum()` in the same function still only touch the
+logically-valid region, matching the original `Vec` behavior exactly (not just "harmless
+because unread" -- actually equivalent).
+
+### 6. `src/predict.rs::block_inter_predict` / `predict_inter`: the hottest site
+
+`block_inter_predict` returned a freshly `Vec`-allocated `intermediate` (horizontal-filter pass)
+and `pred` (final result) on every call; `predict_inter` additionally heap-allocated
+`preds: [Vec<i32>; 2]` per call. This runs once per sub-8x8 chroma 4x4 block, multiplying the
+allocation count the most of any site in the decoder. Changed `block_inter_predict` to take a
+caller-provided `pred: &mut [i32]` output slice instead of returning a `Vec`; `predict_inter`'s
+`preds` became `[[i32; MAX_BLOCK_DIM * MAX_BLOCK_DIM]; 2]` (a fixed local, not a `TileDecoder`
+field -- see Judgment calls), passing `&mut pred_slot[..w*h]` down. `intermediate` inside
+`block_inter_predict` became a local `[i32; MAX_INTERMEDIATE_HEIGHT * MAX_BLOCK_DIM]`.
+
+`MAX_BLOCK_DIM = 64`: the largest coding block is 64x64 luma; chroma calls are always <= that
+due to subsampling (confirmed both `predict_inter` call sites in `tile.rs` pass
+`num4x4w/h * 4`, derived from `NUM_4X4_BLOCKS_WIDE/HIGH_LOOKUP[plane_sz]`, which for the plane's
+own block size never exceeds 64).
+
+`MAX_INTERMEDIATE_HEIGHT = 134`: this is the one bound in this wave that needed real derivation
+rather than just reading off an existing size, and it disagrees with the task brief's own rough
+estimate (`(64+7)`-ish, i.e. assuming the vertical step is always exactly 16 = 1x/unscaled).
+Reference-frame scaling is a real, exercised code path here (`RefPlaneView::width/height` come
+from the *reference* frame's own decoded dimensions in `Dpb`, which can differ from the current
+frame's `frame_width/height` -- VP9 supports decoding at a different resolution than its
+references), so `y_step` is not always 16. Spec §8.5.2.3 makes `RefFrameHeight <= 2 *
+FrameHeight` a bitstream-conformance requirement; working through the integer arithmetic in
+`scale_mv_for_plane` (`y_scale = (ref_height << 14) / frame_height`, `step_y = (16 *
+y_scale) >> 14`) shows this caps `y_scale <= 2<<14` exactly (achieved when `ref_height == 2 *
+frame_height` exactly, no floor-division loss) and therefore `step_y <= 32`, not just "roughly
+16". With `h <= 64` and `step_y <= 32`: `intermediate_height = (((64-1)*32+15)>>4)+8 == 134`.
+Used 134 (not the brief's rough estimate) plus `debug_assert!`s on both the block-dimension and
+intermediate-height bounds at the top of `block_inter_predict` (zero cost in release, would
+fail loudly under the full test suite in debug if the derivation were ever wrong or the spec
+assumption violated) rather than trusting the estimate outright.
+
+### Judgment calls
+
+- Local fixed-size stack arrays (not `TileDecoder`-owned persistent scratch fields) for every
+  site in this wave, including the two the task suggested could go either way (`tokens`/
+  `dequant` in `tile.rs`, `intermediate`/`preds` in `predict.rs`). Reasons: (1) it fully
+  satisfies the stated goal (zero heap allocation on these paths) without the cross-field
+  aliasing/borrow-splitting the task flagged as a risk (`predict_inter`/`block_inter_predict`
+  are free functions in a different module than `TileDecoder`; threading scratch fields through
+  would mean widening their already-`#[allow(clippy::too_many_arguments)]` signatures and
+  proving disjoint-field-borrow safety at every call site); (2) it keeps each diff local to the
+  function being changed, which matters given the bit-exactness bar; (3) the per-call
+  zero-initialization of a stack array is far cheaper than the allocator round-trip it replaces
+  even where LLVM can't prove full coverage and elide the memset. A `TileDecoder`-owned scratch
+  field remains a valid follow-up if profiling on real (larger, non-conformance-vector) content
+  ever shows the residual zero-init cost matters.
+- Reused the pre-existing `add_mv_ref_list` helper in `append_sub8x8_mvs` (`src/mv.rs`) rather
+  than hand-rolling equivalent cap/dedup logic against the new fixed array, since it was already
+  imported in `tile.rs` and its semantics are exactly what two of the three push sites needed
+  (see item 4) -- less new code, and reuses logic already covered by `mv.rs`'s own unit test.
+- Did not touch `SegQIndexOverride` beyond continuing to construct it (now only inside
+  `build_dequant_table`) -- per the task's explicit instruction, its dissolution is W5's.
+
+### Verification
+
+`cargo test`: 147/147 pass (no count change from Wave 4a). Conformance: all 5 vector tests
+print real `[ok]`-equivalent pass lines against real vector paths (`vp90_2_09_subpixel_00`,
+`vp90_2_12_droppable_1`, `vp90_2_15_segkey`, `vp90_2_15_segkey_adpq`,
+`vp90_2_16_intra_only`), unchanged bit-exact output. `VP9DEC_FFMPEG="<path-to-ffmpeg>" cargo test --test synthetic_seg_test
+synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`: 8/8 `[xdecode] ... OK` lines
+(4 synthetic streams x {libvpx-vp9, vp9} ffmpeg decoders). `cargo clippy --all-targets`: same 3
+pre-existing warnings as Wave 4a (confirmed identical via `git stash`), no new ones -- in
+particular no `needless_range_loop` from the new indexed loops. `rustfmt` run per touched leaf
+file (`transform.rs`, `tile.rs`, `predict.rs`; none needed reformatting beyond what the edits
+themselves already matched). `git diff --stat`: exactly the 3 expected files (`transform.rs`,
+`tile.rs`, `predict.rs`) plus this notes file; no changes to `quant.rs` (the table builder lives
+in `tile.rs`, next to its only caller, rather than `quant.rs`, since it's `tile.rs`-specific
+plumbing -- `quant.rs` itself needed no changes).
+
+Timing (`cargo clean --release; cargo test --release --test conformance_test`, this machine;
+note: this environment's release profile needs `RUST_MIN_STACK` raised for the ThinLTO codegen
+worker thread to avoid a stack overflow in `rustc` itself -- reproduced identically at the
+pre-Wave-4b baseline via `git stash`, so it's a pre-existing environment quirk unrelated to this
+wave's code, not a regression): baseline (5 runs) 2.65/2.65/2.62/2.63/2.64s; after (5 runs)
+2.75/2.72/2.64/2.63/2.72s -- within noise, no measurable wall-time delta either way. Debug
+profile: similarly within noise (~46-50s across both). Expected and consistent with Wave 4a's
+finding: the 5 conformance vectors are small (largest 352x288, few frames), so wall time is
+dominated by fixed per-process/per-frame overhead (bool-decoding, I/O, loop filter) rather than
+the allocator traffic this wave removes. The qualitative win is the allocation *count*: for a
+single 16x16 ADST-ADST transform block alone, the old code made on the order of 64 per-row/
+per-column heap allocations inside `idct_permute`/`adst_input_permute`/`adst_output_permute`
+(2 per row x 16 rows + 2 per column x 16 columns) plus 3 more (`tokens`, `dequant`, and
+`inverse_transform_block`'s own row/column scratch) -- all now zero; every sub-8x8 chroma 4x4
+inter-predicted block used to allocate 3 `Vec`s (`intermediate`, `pred` x{1,2 for compound}) --
+also now zero. This scales with block/frame count, so the benefit should grow with real-world
+(larger, more heavily-populated) content even though it doesn't move the needle on these tiny
+conformance clips.

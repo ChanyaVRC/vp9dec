@@ -64,8 +64,11 @@ pub fn predict_intra(
     let size = 1usize << log2_size;
     let base = 1i32 << (bit_depth - 1);
 
-    // above_row holds the spec's indices -1..=2*size-1, offset by +1 into a 0..=2*size array.
-    let mut above_row = vec![0i32; 2 * size + 1];
+    // Fixed-size scratch (size <= 32, the 32x32 max transform): avoids per-block heap
+    // allocations. above_row holds the spec's indices -1..=2*size-1, offset by +1 into a
+    // 0..=2*size array (max length 2*32+1 == 65).
+    let mut above_row_buf = [0i32; 65];
+    let above_row = &mut above_row_buf[..2 * size + 1];
     for i in 0..size {
         above_row[i + 1] = if have_above {
             let sx = (x + i).min(max_x);
@@ -93,7 +96,8 @@ pub fn predict_intra(
     // above_row[i+1] corresponds to the spec's aboveRow[i]; aboveRow[-1] is above_row[0].
     let above = |i: i32| -> i32 { above_row[(i + 1) as usize] };
 
-    let mut left_col = vec![0i32; size];
+    let mut left_col_buf = [0i32; 32];
+    let left_col = &mut left_col_buf[..size];
     for (i, slot) in left_col.iter_mut().enumerate() {
         *slot = if have_left {
             let sy = (y + i).min(max_y);
@@ -103,7 +107,8 @@ pub fn predict_intra(
         };
     }
 
-    let mut pred = vec![0i32; size * size];
+    let mut pred_buf = [0i32; 1024];
+    let pred = &mut pred_buf[..size * size];
     let at = |i: usize, j: usize| i * size + j;
 
     match mode {
@@ -431,8 +436,21 @@ fn scale_mv_for_plane(
     (start_x, start_y, step_x, step_y)
 }
 
+/// Max output block dimension for a single `predict_inter` call (spec: 64x64 is the
+/// largest coding block, and chroma calls are always <= that due to subsampling).
+const MAX_BLOCK_DIM: usize = 64;
+
+/// Max rows needed in [`block_inter_predict`]'s intermediate (horizontal-filter) buffer.
+/// `h <= MAX_BLOCK_DIM`, and the vertical step `y_step` is bounded by the spec's reference-
+/// scaling conformance requirement (§8.5.2.3: `RefFrameHeight <= 2 * FrameHeight`), which
+/// caps `y_step <= 32` (1/16-pel units; see [`scale_mv_for_plane`]); the 8-tap subpel filter
+/// needs 8 extra rows of context. `(((MAX_BLOCK_DIM - 1) * 32 + 15) >> 4) + 8 == 134`.
+const MAX_INTERMEDIATE_HEIGHT: usize = 134;
+
 /// Per-block inter prediction process (spec §8.5.2.4 "Block inter prediction process").
-/// Returns `pred[r][c]` (`r`=0..h-1, `c`=0..w-1) as a row-major `Vec<i32>`.
+/// Writes `pred[r*w+c]` (`r`=0..h-1, `c`=0..w-1) into the caller-provided `pred` buffer
+/// (length exactly `h*w`) -- avoids a per-call heap allocation (this runs once per sub-8x8
+/// chroma 4x4 block, the hottest call site).
 #[allow(clippy::too_many_arguments)]
 fn block_inter_predict(
     ref_plane: &Plane,
@@ -444,13 +462,19 @@ fn block_inter_predict(
     h: usize,
     interp_filter: u8,
     bit_depth: u8,
-) -> Vec<i32> {
+    pred: &mut [i32],
+) {
+    debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
+    debug_assert_eq!(pred.len(), w * h);
     let last_x = ref_plane.width as i64 - 1;
     let last_y = ref_plane.height as i64 - 1;
     let intermediate_height = (((h as i64 - 1) * y_step + 15) >> 4) + 8;
+    debug_assert!(intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT);
     let filters = &SUBPEL_FILTERS[interp_filter as usize];
 
-    let mut intermediate = vec![0i32; (intermediate_height as usize) * w];
+    // Fixed-size scratch, sized for the worst case; only the first `intermediate_height * w`
+    // entries are written/read below.
+    let mut intermediate = [0i32; MAX_INTERMEDIATE_HEIGHT * MAX_BLOCK_DIM];
     for r in 0..intermediate_height {
         let ref_y = ((y >> 4) + r - 3).clamp(0, last_y) as usize;
         for c in 0..w {
@@ -465,7 +489,6 @@ fn block_inter_predict(
         }
     }
 
-    let mut pred = vec![0i32; h * w];
     for r in 0..h {
         let p = (y & 15) + y_step * (r as i64);
         let coeffs = &filters[(p & 15) as usize];
@@ -478,7 +501,6 @@ fn block_inter_predict(
             pred[r * w + c] = clip1(round2(s, 7), bit_depth);
         }
     }
-    pred
 }
 
 /// `predict_inter()` (spec §8.5.2 "Inter prediction process").
@@ -516,7 +538,9 @@ pub fn predict_inter(
     let is_compound = ref_frame[1] > INTRA_FRAME;
     let n_refs = 1 + is_compound as usize;
 
-    let mut preds: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
+    // Fixed-size scratch (w, h <= MAX_BLOCK_DIM): avoids a per-call heap allocation. Only the
+    // first w*h entries of each slot are written/read below.
+    let mut preds = [[0i32; MAX_BLOCK_DIM * MAX_BLOCK_DIM]; 2];
     for (ref_list, pred_slot) in preds.iter_mut().enumerate().take(n_refs) {
         let mv = select_mv(
             plane,
@@ -551,7 +575,7 @@ pub fn predict_inter(
             frame_width,
             frame_height,
         );
-        *pred_slot = block_inter_predict(
+        block_inter_predict(
             view.plane,
             start_x,
             start_y,
@@ -561,6 +585,7 @@ pub fn predict_inter(
             h,
             interp_filter,
             bit_depth,
+            &mut pred_slot[..w * h],
         );
     }
 
