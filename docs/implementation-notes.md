@@ -194,20 +194,218 @@ themselves (`vp90-2-15-segkey.webm`, `vp90-2-15-segkey_adpq.webm`,
 
 ### Coverage table
 
-| Path | Official E2E vector | Reference-derived vector | Unit test only |
+| Path | Official E2E vector | Synthetic round-trip vector | Unit test only |
 | --- | --- | --- | --- |
 | Segmentation seg-id decode (`intra_segment_id`/`inter_segment_id`/`get_segment_id`) | ✓ `vp90-2-15-segkey` -- `intra_segment_id` only (1-frame vector, no inter frame, so `inter_segment_id`/`get_segment_id` temporal prediction remain unproven E2E) | TODO | yes (`src/tile.rs`) |
 | `SEG_LVL_ALT_Q` | ✓ **`vp90-2-15-segkey_adpq`** -- all 150 output frames bit-exact (coverage line reports `SEG_LVL_ALT_Q=true`) | TODO | yes (`src/quant.rs`, `src/header.rs`) |
-| `SEG_LVL_ALT_L` | none (no official or readily-encodable vector) | TODO | yes (`src/loop_filter.rs`) |
-| `SEG_LVL_REF_FRAME` | none (no official or readily-encodable vector) | TODO | yes (`src/tile.rs`) |
-| `SEG_LVL_SKIP` | none (no official or readily-encodable vector) | TODO | yes (`src/tile.rs`) |
+| `SEG_LVL_ALT_L` | none (no official or readily-encodable vector) | ✓ **`tests/synthetic_seg_test.rs`** (2026-07-14; ffmpeg cross-decoded -- see the External cross-decode sections below) | yes (`src/loop_filter.rs`) |
+| `SEG_LVL_REF_FRAME` | none (no official or readily-encodable vector) | ✓ **`tests/synthetic_seg_test.rs`** (2026-07-14; ffmpeg cross-decoded -- see the External cross-decode sections below) | yes (`src/tile.rs`) |
+| `SEG_LVL_SKIP` | none (no official or readily-encodable vector) | ✓ **`tests/synthetic_seg_test.rs`** (2026-07-14; ffmpeg cross-decoded -- see the External cross-decode sections below) | yes (`src/tile.rs`) |
 | `intra_only` frame | ✓ **`vp90-2-16-intra-only`** -- all 7 output frames bit-exact; the 3 hidden `intra_only` priming frames are verified via `show_existing_frame` round-trip and the 4 inter frames referencing them decode correctly (coef EOB-count fix below) | TODO | yes (`src/header.rs`) |
 | `reset_frame_context < 3` | ✓ **`vp90-2-16-intra-only`** -- exercises `reset_frame_context == 2` on all 3 of its `intra_only` frames (coverage line reports `reset_frame_context values seen = {0, 2}`) | TODO | yes (`src/lib.rs`: `frame_context_reset_*`) |
 
 Final state (as of the superframe-splitting-API and EOB-count fixes below): seg-id decode,
 `SEG_LVL_ALT_Q`, `intra_only`, and `reset_frame_context < 3` (rfc==2 seen) all have official
-end-to-end coverage; `SEG_LVL_ALT_L`/`SEG_LVL_REF_FRAME`/`SEG_LVL_SKIP` remain unit-test-only
-since no official or readily-encodable IVF vector exercises them.
+end-to-end coverage. `SEG_LVL_ALT_L`/`SEG_LVL_REF_FRAME`/`SEG_LVL_SKIP` have no official vector
+(still true as of 2026-07-14 -- libvpx ships none, see the entry below), but as of 2026-07-14
+have a synthetic round-trip vector instead (`tests/synthetic_seg_test.rs`): this is a
+self-consistent encoder-in-this-repo <-> decoder-in-this-repo check, not an official-MD5
+conformance pass, so the table still distinguishes it from the "Official E2E vector" column.
+
+## Synthetic round-trip coverage for SEG_LVL_ALT_L / SEG_LVL_REF_FRAME / SEG_LVL_SKIP (2026-07-14)
+
+### Scope
+
+The "Conformance coverage" entry above left `SEG_LVL_ALT_L`/`SEG_LVL_REF_FRAME`/`SEG_LVL_SKIP`
+unit-test-only, since libvpx ships no official (or readily re-encodable) IVF vector exercising
+them (`vp90-2-15-segkey*.webm` only exercise `SEG_LVL_ALT_Q`/plain seg-id decode; libvpx's
+`vp80-03-segmentation-*.ivf` vectors are VP8, not VP9). Rather than leave the gap, added
+`tests/synthetic_seg_test.rs`: a self-contained, pure-std (no dependencies of any kind --
+written under the then-current policy that forbade even dev-dependencies, and still true of this
+file after the 2026-07-15 relaxation for test tooling) synthetic VP9 *encoder*, hand-rolled
+inside the test file
+itself, that emits just enough bitstream to drive each of the three features through
+`Decoder::decode_frame` and checks the result.
+
+### What this is (and isn't)
+
+This is a **round-trip** test: this file's own bool-coder/bit-writer encoder feeds bytes to
+this crate's own `Decoder`. It is not conformance against an official MD5 -- within the round trip alone there is no
+independent reference encoder or decoder, so a bug present identically on both the encoding
+assumptions here and the decoder's implementation would not be caught by it (the "External
+cross-decode result" section below closes exactly this blind spot with two independent
+third-party decoders). What it
+does prove is that the decoder actually takes the three `seg_feature_active`-gated forced code
+paths in `src/tile.rs` (`read_skip`, `read_is_inter`, `read_ref_frames`, and
+`inter_block_mode_info`'s `SEG_LVL_SKIP` ⇒ `y_mode = ZEROMV` branch) and the `SEG_LVL_ALT_L`
+branch of `src/loop_filter.rs::build_lvl_lookup`, instead of silently falling back to reading
+ordinary per-block bits or ignoring the segmentation override: the hand-built bitstreams contain
+none of the bits a fallback path would need, so a bypassed feature either desyncs the decode
+outright or reconstructs pixels that don't match the hand-derived expected values asserted in
+the tests. This was verified directly, not just argued: temporarily flipping each
+`feature_enabled` flag off one at a time (while leaving the bitstream otherwise unchanged) was
+confirmed to make the corresponding test fail -- for `SEG_LVL_REF_FRAME` and `SEG_LVL_SKIP` via
+an actual pixel divergence (the inter frame decoded as flat grey instead of reproducing the key
+frame), for `SEG_LVL_ALT_L` via the two decodes (levels 0 and 63) becoming identical instead of
+differing. (These were manual, throwaway edits made and reverted during development, not
+committed as part of the test file.)
+
+### Why no residual-token encoder
+
+Every block in every synthetic frame uses `skip = 1`, so no coefficient/token bits are ever
+encoded or decoded. Writing a residual-token encoder (inverse of `src/tile.rs::tokens_and_reconstruct`)
+would have been substantial additional pure-std code for no benefit here: with `skip = 1`, the
+only pixel values that can appear are the direct output of intra prediction
+(`src/predict.rs::predict_intra`) or, for the inter-frame test, zero-MV motion compensation
+(an exact copy of the reference) -- both of which are simple enough to hand-verify pixel-by-pixel
+without needing residuals to make the image non-flat. The "flat content" limitation this implies
+(a single isolated intra block, or a block whose neighbors are all real/available, tends to
+predict flat or to converge back to its neighbor's value -- see the `SEG_LVL_SKIP`/`SEG_LVL_REF_FRAME`
+test's code comment for a worked example of a 4-different-y_modes layout collapsing to a single
+flat 127 value once causal neighbor propagation is taken into account) was worked around by
+choosing modes that are *structurally* immune to neighbor propagation in the direction that
+matters: `V_PRED` (which only ever reads the row above, and is given no "above" neighbor at all
+since it's used only in row 0) and `H_PRED` (which never reads "above" at all, so it can't
+inherit row 0's value even though row 1 does have a real "above" neighbor).
+
+### Test-by-test summary
+
+- **`seg_lvl_skip_forces_exact_copy_without_residual_or_mv_bits`** and
+  **`seg_lvl_ref_frame_selects_the_forced_reference_without_reading_bits`** share one scenario
+  (`decode_skip_ref_frame_scenario`): a key frame (V_PRED row 0 / H_PRED row 1, `skip = 1`,
+  giving an exact, hand-verified 127/129 split -- not a single flat value) followed by an inter
+  frame with one segment forcing `SEG_LVL_SKIP` and `SEG_LVL_REF_FRAME = LAST_FRAME` for every
+  block. Proven: `seg_features_active[SEG_LVL_SKIP]`/`[SEG_LVL_REF_FRAME]` are both set, and the
+  inter frame's Y/U/V are bit-identical to the key frame's (ZEROMV + forced LAST + forced skip
+  ⇒ an exact copy). Left open here (every DPB slot holds the same key frame, since key frames
+  refresh all 8 slots, so there is only one candidate reference to copy from either way): that
+  `SEG_LVL_REF_FRAME` steers to a *specific* slot, as opposed to always falling through to
+  whatever the single reference happens to be. Closed by the next test.
+- **`seg_lvl_ref_frame_steers_to_the_specific_slot_not_just_last`** (2026-07-14, added after the
+  above): closes that gap for the GOLDEN case. Three frames: (1) a key frame, content A = flat
+  127, refreshing all 8 DPB slots; (2) a new hidden (`show_frame = 0`) `intra_only` frame, content
+  B = flat 129, refreshing *only* physical slot 1 (`refresh_frame_flags = 0x02`), leaving slot 0
+  at A -- built with the new `build_intra_only_header` helper (its tail is bit-for-bit identical
+  to `build_keyframe_header`'s, since both share `frame_is_intra = true`, verified against
+  `src/header.rs::parse_uncompressed_header`'s intra_only branch and the shared post-frame-size
+  tail that follows it; its tile data and compressed header reuse `encode_keyframe_tile`/
+  `build_keyframe_compressed_header` unchanged, since `frame_is_intra` also makes an intra_only
+  frame's tile/compressed-header shape identical to a key frame's); (3) an inter frame with
+  `ref_frame_idx = [0, 1, 2]` (LAST -> slot 0 = A, GOLDEN -> slot 1 = B) and
+  `SEG_LVL_REF_FRAME`'s `feature_data = GOLDEN_FRAME`. Discriminating assertion: every pixel of
+  the inter frame's Y plane is 129 (GOLDEN's/slot 1's content) -- a decoder that read
+  `FeatureData` but resolved the wrong slot (even for only some blocks), or one that ignored it
+  and always used LAST, would leave 127 somewhere. A same-decoder companion decode steered to
+  LAST is additionally asserted to be uniformly 127, pinning in-test that slot 0 still held A --
+  so the GOLDEN=129 check can't be satisfied by an over-refresh that put B in every slot.
+  **ALTREF was not additionally exercised**
+  (judged low marginal value once GOLDEN vs. LAST is proven via the same `resolved_refs[..]`
+  indexing code path; left as a possible future addition, not required by this task). Like the
+  rest of this file, still a self-consistent round trip against this crate's own decoder, not
+  conformance against an official MD5.
+- **`seg_lvl_alt_l_loop_filter_level_change_is_observable`**: a key frame with 2 segments (row 0
+  segment 0, no `ALT_L`; row 1 segment 1, `ALT_L` under test, absolute override), decoded twice
+  with segment 1's `ALT_L` level at 0 and 63. Oracle: exact hand-derived pixel values, not just
+  "the outputs differ" -- with `narrow_filter`'s formula worked out by hand for the 127/129 edge
+  (see the test's code comment), level 63 pulls all four samples touching the edge (rows 6-9) to
+  exactly 128, while level 0 leaves them untouched (127/127/129/129); rows 5 and 10, one step
+  further from the edge, are asserted unchanged at either level as an anchor that only the edge
+  moved. This is the strong form of the oracle the task asked for (stronger than the "assert
+  outputs differ" fallback, and stronger than the "reproduces the seg-disabled baseline"
+  equivalence check, which was not additionally implemented given the exact-value check already
+  subsumes it as a correctness signal).
+
+### Verification
+
+`cargo test --test synthetic_seg_test -- --nocapture`: 6/6 pass (4 substantive tests plus the
+env-gated `dump_synthetic_ivf_for_external_cross_decode` no-op and the ffmpeg-gated
+`synthetic_streams_cross_decode_against_ffmpeg`, each of which skips cleanly when its external
+prerequisite is absent). Full `cargo test`: 146/146 pass (was 143/143 before this work; no
+regressions; see the README/task-runner output for the exact per-file breakdown).
+`cargo clippy --tests`: no warnings from `tests/synthetic_seg_test.rs` (the warnings it reports
+are pre-existing, in `src/`, and unrelated to this file). `cargo fmt` (checked with
+`rustfmt --check` scoped to the new file only, since `examples/*.rs` and some other `tests/*.rs`
+files have pre-existing formatting drift unrelated to this change) is clean.
+
+No `src/` changes were made -- `Decoder::last_frame_info()`'s existing `seg_features_active`
+observation surface (added in the "Conformance coverage" entry above) was sufficient.
+
+### External cross-decode dump harness
+
+The three scenarios above are now also exposed as builder fns (`build_skip_ref_frames`,
+`build_steering_frames`, `build_alt_l_frames`) returning the exact ordered raw VP9 frame bytes;
+the existing tests were refactored to call these fns instead of duplicating the bitstream
+construction, so what gets dumped is guaranteed identical to what the tests decode. An env-gated
+test, `dump_synthetic_ivf_for_external_cross_decode` (a no-op unless `VP9DEC_DUMP_DIR` is set, so
+a plain `cargo test` run stays green), writes each scenario to that directory as an `.ivf`
+(via a small pure-std `ivf_wrap` writer mirroring `src/ivf.rs`'s reader layout) plus this
+decoder's own decoded output as raw I420 `.yuv` (shown frames only, in display order):
+
+    VP9DEC_DUMP_DIR=<dir> cargo test --test synthetic_seg_test dump_synthetic_ivf_for_external_cross_decode -- --nocapture
+
+(The `VAR=value` command prefix is bash-only; on PowerShell use
+`$env:VP9DEC_DUMP_DIR = "<dir>"; cargo test ...`.)
+
+This only emits the streams for an external VP9 decoder (e.g. ffmpeg) to independently decode and
+compare against `*.our_i420.yuv`; the dump harness itself does not invoke ffmpeg (see below for the
+separate test that does). The result of actually running that comparison is recorded next.
+
+### External cross-decode result (2026-07-14)
+
+The dump harness was run and each `.ivf` decoded by ffmpeg N-121910 (2025-11), a full
+libvpx-enabled build, with BOTH its `libvpx-vp9` decoder (the reference implementation) and its
+native `vp9` decoder (a fully independent implementation), output as raw I420 (`-f rawvideo
+-pix_fmt yuv420p`) and byte-compared against this decoder's `*.our_i420.yuv`:
+
+- `skip_ref` (`SEG_LVL_SKIP` + `SEG_LVL_REF_FRAME = LAST`): **byte-identical** under both decoders
+  (768 B, 2 shown frames).
+- `alt_l_0` / `alt_l_63` (`SEG_LVL_ALT_L` absolute level 0 vs. 63): **byte-identical** under both
+  decoders (384 B each). This independently confirms the hand-derived loop-filter output (the
+  127/129 edge collapsing to a flat 128 at level 63) matches libvpx and ffmpeg-native exactly --
+  i.e. `build_lvl_lookup`'s `SEG_LVL_ALT_L` branch is correct, not merely internally
+  self-consistent.
+- `steering` (`SEG_LVL_REF_FRAME = GOLDEN` slot-steering): the **shown** frames are byte-identical
+  under both decoders -- our key frame (127) equals ffmpeg's first output frame, and our inter
+  frame (129) equals ffmpeg's last output frame. ffmpeg emits one *extra* frame here: it also
+  outputs the hidden (`show_frame == 0`) `intra_only` frame (content 129), which this decoder
+  deliberately does *not* display (spec §8.9 output process: only `show_frame == 1` /
+  `show_existing_frame` frames are output; the official `.ivf.md5` files likewise carry no line
+  for hidden frames). So the size mismatch (ffmpeg 1152 B / 3 frames vs. ours 768 B / 2 frames) is
+  a frame-*output*-policy difference, not a pixel discrepancy -- frame-for-frame the pixels agree,
+  and ffmpeg's copy of the hidden frame (129) additionally confirms this decoder's internal decode
+  of it.
+
+This obtains the substantive thing official-MD5 conformance provides -- an *independent* oracle --
+despite no official vector existing for these three features: all three
+`SEG_LVL_ALT_L`/`SEG_LVL_REF_FRAME`/`SEG_LVL_SKIP` code paths now produce output confirmed
+byte-identical by two independent third-party VP9 decoders, closing the round-trip's one
+theoretical blind spot (a bug shared identically by this repo's encoder assumptions and its
+decoder). It is still *not* "official MD5 conformance" in the literal sense (the streams are our
+own synthetic ones, not libvpx-published vectors with published MD5s), and ffmpeg remains a
+reference/debugging tool only -- not a build or crate dependency (the automated test below invokes
+the binary out-of-process but skips cleanly without it).
+
+This comparison is no longer a one-time manual check: `synthetic_streams_cross_decode_against_ffmpeg`
+(in the same test file) automates it. It reuses the same scenario builders/`ivf_wrap` as the dump
+harness above -- via a shared `scenarios()` list, so the dumped set and the cross-checked set
+cannot diverge -- and shells out to the ffmpeg *binary* via `std::process::Command` (located via
+the `VP9DEC_FFMPEG` env var, falling back to `ffmpeg` on `PATH` -- never a hardcoded path; a
+set-but-unusable `VP9DEC_FFMPEG` fails the test rather than silently skipping). It runs whichever
+of `libvpx-vp9` and `vp9` (ffmpeg's own independent native decoder) the build provides per
+`-decoders` -- both on a full build; a build lacking one is noted and cross-decoded with the other
+alone, one lacking both skips. Each run requires a clean ffmpeg stderr and an output of exactly
+one frame per constituent VP9 frame (hidden frames included), then byte-compares every shown
+frame against its constituent index; the exact-length requirement is load-bearing, since
+steering's hidden frame and its inter frame are pixel-identical and a laxer length check could
+alias a dropped final frame onto the hidden one. If no ffmpeg binary is found (probed via
+`ffmpeg -version`), the test prints a `[skip]` line and passes trivially, so a plain `cargo test`
+on a machine without ffmpeg installed stays green -- same skip-if-absent convention as the
+vector-file-gated conformance tests. This still adds zero crate dependencies (only the ffmpeg
+*binary* is invoked, never linked), so the product and test harness remain pure-std. The
+shown-frame byte-identical result recorded above is therefore re-checked on every run where an
+ffmpeg binary is available, no longer a single point-in-time observation; the steering scenario's
+hidden-frame confirmation, by contrast, remains manual-only (the public decoder API never
+surfaces hidden frames' pixels for the automated test to compare).
 
 ## WebM remux for official segmentation/intra-only vectors (2026-07-13, pure-std since 2026-07-14)
 
@@ -223,10 +421,12 @@ vectors that upstream ships only as `.webm` (`vp90-2-15-segkey`, `vp90-2-15-segk
 
 The remuxer is written against the Rust standard library alone, with no crate
 dependency of any kind. An initial version used the `matroska-demuxer` crate as a
-`[dev-dependencies]` entry; that was replaced because this repo's zero-dependency policy
-(README: "zero dependencies, including dev-dependencies ... only the Rust standard
-library") extends to dev-dependencies too. ffmpeg/ffmpeg-sys bindings were never an
-option for the same reason (and would pull in a C toolchain besides).
+`[dev-dependencies]` entry; that was replaced because this repo's zero-dependency policy as then
+worded in the README ("zero dependencies, including dev-dependencies ... only the Rust standard
+library") extended to dev-dependencies too. (On 2026-07-15 that policy was relaxed to allow
+dev-dependencies for test tooling -- the shipped decoder stays zero-dependency -- but this
+example remains pure-std.) ffmpeg/ffmpeg-sys bindings were never an option for the shipped
+decoder for the same reason (and would pull in a C toolchain besides).
 
 The replacement is a small hand-rolled EBML/Matroska reader (~330 lines, all in the
 example file, never referenced from `src/`):

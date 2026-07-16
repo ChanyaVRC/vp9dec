@@ -5,9 +5,11 @@ A fully from-scratch VP9 video decoder (Rust, zero dependency crates).
 ## Purpose
 
 With an eye toward eventual integration into the visual novel engine [Noiria](../noiria),
-this implements a clean-room decoder for VP9 (a royalty-free video codec). It depends on no
-external crates (zero dependencies, including dev-dependencies) and is implemented using only
-the Rust standard library.
+this implements a clean-room decoder for VP9 (a royalty-free video codec). The decoder itself --
+everything under `src/` -- depends on no external crates and is implemented using only the Rust
+standard library, with no runtime dependencies whatsoever. Test and verification tooling may use
+`[dev-dependencies]` where genuinely useful (e.g. to automate cross-decoding the output against an
+independent reference decoder); the shipped decoder stays dependency-free.
 
 The primary reference is the [VP9 Bitstream & Decoding Process Specification v0.7](
 https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf)
@@ -104,9 +106,16 @@ related to inter prediction is never read per spec, so it's unimplemented).
   official vectors remuxed from `.webm` (see "Verification with real data" below):
   segment-id decode and `SEG_LVL_ALT_Q` via `vp90-2-15-segkey`/`vp90-2-15-segkey_adpq`
   (150 frames), and `intra_only` frames plus `reset_frame_context` values 0 and 2 via
-  `vp90-2-16-intra-only`. `SEG_LVL_ALT_L` / `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` remain
-  unit-test-only: no official (or readily-encodable) IVF vector exercises them; see
-  `docs/implementation-notes.md`.
+  `vp90-2-16-intra-only`. `SEG_LVL_ALT_L` / `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` still have no
+  official (or readily-encodable) IVF vector, but are now covered end-to-end by a synthetic
+  round-trip test instead: `tests/synthetic_seg_test.rs` is a small, pure-std, hand-rolled VP9
+  encoder (not conformance against an official MD5 -- see the file and
+  `docs/implementation-notes.md` for exactly what this proves and doesn't) that drives all three
+  features through `Decoder` and checks the decoded pixels. To close the round-trip's one blind
+  spot (a bug shared by our encoder and decoder), those synthetic streams were additionally
+  cross-decoded byte-identically by two independent VP9 decoders -- ffmpeg's `libvpx-vp9` (the
+  reference) and its native `vp9` -- an independent oracle standing in for the unavailable
+  official vector.
 - The judgment call regarding the known erratum in how spec section 9.3.2 describes the
   probability selection process for `partition` is unchanged from M1. See the comment on
   `read_partition` in `src/tile.rs` for details.
@@ -455,7 +464,10 @@ For pixel-level debugging beyond visual inspection of a PNG dump (e.g. diffing a
 known-correct decode when an MD5 mismatches), ffmpeg's `libvpx-vp9` decoder can serve as an
 independent reference decoder to produce ground-truth raw YUV for a byte-level diff. This is
 a debugging aid only -- ffmpeg is not a project dependency, and nothing in `src/`/`examples/`
-links against it.
+links against it. An optional automated test (`synthetic_streams_cross_decode_against_ffmpeg`
+in `tests/synthetic_seg_test.rs`) also shells out to the ffmpeg *binary* via `std::process` to
+cross-check decode output, skipping cleanly when no ffmpeg binary is found; it still isn't
+linked against and remains no build or runtime dependency.
 
 ## License
 
