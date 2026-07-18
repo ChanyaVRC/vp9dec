@@ -440,14 +440,16 @@ fn scale_mv_for_plane(
 
 /// Max output block dimension for a single `predict_inter` call (spec: 64x64 is the
 /// largest coding block, and chroma calls are always <= that due to subsampling).
-const MAX_BLOCK_DIM: usize = 64;
+/// `pub(crate)`: shared with `src/simd.rs`'s AVX2 mirror of [`block_inter_predict`].
+pub(crate) const MAX_BLOCK_DIM: usize = 64;
 
 /// Max rows needed in [`block_inter_predict`]'s intermediate (horizontal-filter) buffer.
 /// `h <= MAX_BLOCK_DIM`, and the vertical step `y_step` is bounded by the spec's reference-
 /// scaling conformance requirement (§8.5.2.3: `RefFrameHeight <= 2 * FrameHeight`), which
 /// caps `y_step <= 32` (1/16-pel units; see [`scale_mv_for_plane`]); the 8-tap subpel filter
 /// needs 8 extra rows of context. `(((MAX_BLOCK_DIM - 1) * 32 + 15) >> 4) + 8 == 134`.
-const MAX_INTERMEDIATE_HEIGHT: usize = 134;
+/// `pub(crate)`: shared with `src/simd.rs`'s AVX2 mirror of [`block_inter_predict`].
+pub(crate) const MAX_INTERMEDIATE_HEIGHT: usize = 134;
 
 /// Per-block inter prediction process (spec §8.5.2.4 "Block inter prediction process").
 /// Writes `pred[r*w+c]` (`r`=0..h-1, `c`=0..w-1) into the caller-provided `pred` buffer
@@ -472,6 +474,63 @@ fn block_inter_predict(
     let last_y = ref_plane.height as i64 - 1;
     let intermediate_height = (((h as i64 - 1) * y_step + 15) >> 4) + 8;
     debug_assert!(intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT);
+
+    // SIMD wave 2 (docs/implementation-notes.md): AVX2 fast path for the common unscaled
+    // case (spec §8.5.2.3's x_step == y_step == 16, i.e. reference frame same size as the
+    // current frame -- the overwhelming majority of content). When x_step/y_step == 16,
+    // `p & 15` in the scalar loops below is step-invariant (adding a multiple of 16 never
+    // changes the low 4 bits), so there's exactly one filter for the whole call instead
+    // of one per column/row; and `p >> 4` reduces to a flat per-call offset (`c` alone
+    // for the horizontal pass's column, `r` alone for the vertical pass's row -- see
+    // `simd.rs`'s doc comment for the derivation). Falls through to the scalar loop for:
+    // the scaled path (rarer, harder to vectorize -- kept scalar per this wave's scope),
+    // bit_depth != 8 (never actually reached today, lib.rs rejects non-8-bit streams
+    // before decode, but the scalar loop handles it generically so the guard is free to
+    // keep), width 4 (not a multiple of the AVX2 kernel's 8-wide lane group), and any
+    // block whose source window would need the scalar path's per-pixel edge clamp
+    // (border replication) -- only near reference-frame edges; replicating that with
+    // AVX2 would need a byte gather, which x86 doesn't have.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x_step == 16
+            && y_step == 16
+            && bit_depth == 8
+            && w.is_multiple_of(8)
+            && crate::simd::avx2_enabled()
+        {
+            let src_row0 = (y >> 4) - 3;
+            let src_col0 = (x >> 4) - 3;
+            let in_bounds = src_row0 >= 0
+                && src_row0 + intermediate_height - 1 <= last_y
+                && src_col0 >= 0
+                && src_col0 + (w as i64 - 1) + 7 <= last_x;
+            if in_bounds {
+                let fx = (x & 15) as usize;
+                let fy = (y & 15) as usize;
+                // SAFETY: `avx2_enabled()` proved AVX2 support; `in_bounds` proves every
+                // source pixel `block_inter_predict_avx2` touches (rows
+                // src_row0..src_row0+intermediate_height, columns src_col0..src_col0+w+7)
+                // is within `ref_plane`, matching its documented contract.
+                unsafe {
+                    crate::simd::block_inter_predict_avx2(
+                        ref_plane.as_slice(),
+                        ref_plane.width,
+                        src_row0,
+                        src_col0,
+                        fx,
+                        fy,
+                        w,
+                        h,
+                        intermediate_height as usize,
+                        interp_filter,
+                        pred,
+                    );
+                }
+                return;
+            }
+        }
+    }
+
     let filters = &SUBPEL_FILTERS[interp_filter as usize];
 
     // Fixed-size scratch, sized for the worst case; only the first `intermediate_height * w`

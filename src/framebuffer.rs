@@ -49,6 +49,14 @@ impl Plane {
         self.get(cx, cy)
     }
 
+    /// Raw row-major buffer (stride == `width`), for the AVX2 SIMD convolution
+    /// (`src/simd.rs`), which proves its own bounds instead of paying `get`'s per-access
+    /// check.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+
     /// Returns a row-major byte sequence cropped to the display size `(crop_width, crop_height)`.
     pub fn crop(&self, crop_width: usize, crop_height: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(crop_width * crop_height);

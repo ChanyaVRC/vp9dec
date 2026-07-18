@@ -2450,3 +2450,49 @@ fallback, staying zero-dependency).
 
 Measurement only. `cargo test` 150/150 with the feature off; clippy adds no new warnings with
 the feature on. The `bench-timing` counters and `examples/bench.rs` are the only additions.
+
+## SIMD wave 2: AVX2 inter-prediction subpel convolution (2026-07-17)
+
+Made the SIMD-wave-1 #1 hot spot (`predict::block_inter_predict`'s two-pass 8-tap subpel
+convolution, measured 47-55% of HD decode time) fast on x86_64 with AVX2, bit-identically.
+
+### What / where
+
+`src/simd.rs` (new, x86_64-only, `core::arch::x86_64` intrinsics, zero deps): an AVX2 kernel
+mirroring the scalar convolution for the **unscaled** case only (`x_step == y_step == 16`, ref
+frame same size as current -- the overwhelming majority of content). Horizontal pass widens
+`u8` source to `i32` (`_mm256_cvtepu8_epi32`), multiply-accumulates the 8 taps
+(`_mm256_mullo_epi32`/`_mm256_add_epi32`), then `round2(_, 7)` via `_mm256_srai_epi32(x+64, 7)`
+and clip to `[0,255]` -- 8 output columns per lane group. Vertical pass the same over the
+clamped intermediate. `predict.rs` dispatches to it only when unscaled AND `bit_depth == 8` AND
+`w % 8 == 0` AND `avx2_enabled()` AND the source window is fully in-bounds (no edge clamp
+needed; AVX2 has no byte gather, so border-replication stays scalar). `framebuffer::Plane`
+gained a `pub fn as_slice()` raw-buffer accessor so the kernel proves its own bounds instead of
+paying `get`'s per-access check.
+
+### Kept scalar (by design, this wave)
+
+Scaled path (SVC/resize, step != 16), width-4 blocks (chroma sub-8x8), reference-edge blocks
+needing clamp, and bit_depth != 8. Width-4 and the scaled path are the notable remaining
+inter-pred cost; a later wave can add them.
+
+### Dispatch / fallback / bit-exactness proof
+
+`simd::avx2_enabled()` (cached in a `OnceLock`) = `is_x86_feature_detected!("avx2")` AND
+`VP9DEC_NO_SIMD` unset. The scalar path is always present and taken on non-AVX2 CPUs or when
+forced off. Bit-exactness is proven, not argued: the official 304-vector sweep passes 304/304
+**both** with SIMD on (release, 133.5s) **and** forced scalar via `VP9DEC_NO_SIMD=1` (172.1s) --
+both hit the identical official MD5s, so SIMD output == scalar output == reference. Plus 150/150
+tests and the 8-way ffmpeg cross-decode, all green. The `unsafe` is confined to the
+`#[target_feature(enable = "avx2")]` kernel, entered only past the runtime `avx2_enabled()`
+check, with the bounds contract discharged by the caller's `in_bounds` guard (documented in the
+fn's Safety section).
+
+### Speedup
+
+HD bench (release, first 300 frames of the inter-heavy 1920x800 movie, same harness as wave 1):
+**35.7 -> 56.5 MP/s, a 1.58x total-decode speedup** (12.93s -> 8.15s). InterPredict's share fell
+54.5% -> 29.8%; the profile is now balanced (LoopFilter 28.8%, Token+Dequant+Transform 27.5%,
+InterPredict 29.8%), so the next SIMD target is loop filter or inverse transform. 56.5 MP/s at
+1920-wide is close to the 62 MP/s 1080p30 bar -- one more wave should clear it. (The full
+304-vector sweep, dominated by tiny vectors, sped up 172 -> 133s, ~22%.)

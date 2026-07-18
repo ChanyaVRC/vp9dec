@@ -47,6 +47,10 @@ pub mod prob_tables;
 pub mod quant;
 #[doc(hidden)]
 pub mod scan;
+/// AVX2 inter-prediction convolution (SIMD wave 2); x86_64-only, see `src/simd.rs`.
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub mod simd;
 #[doc(hidden)]
 pub mod subpel;
 #[doc(hidden)]

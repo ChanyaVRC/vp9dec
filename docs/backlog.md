@@ -20,13 +20,17 @@ needs ~62 MP/s plus headroom, so this blocks practical Noiria integration for HD
 - Hard gate: bit-exact output — 304/304 official sweep + 150-test suite + 8-way ffmpeg
   cross-decode must stay green with SIMD enabled AND disabled (integer ops only, so
   exact equality is achievable; any "close enough" result is a bug).
-- First wave = measurement: DONE (2026-07-17, `examples/bench.rs` +
-  `bench-timing` feature; see implementation-notes "SIMD wave 1"). Result (release,
-  inter-heavy 1920x800 movie): **35.7 MP/s single-thread**, split InterPredict 54.5% /
-  LoopFilter 18.6% / Token+Dequant+Transform 17.7% / Intra 0.4%. Wave-2 target order is
-  therefore: (1) `predict.rs::block_inter_predict` 8-tap subpel convolution [dominant],
-  (2) `loop_filter.rs`, (3) `transform.rs` butterflies. `is_x86_feature_detected!`
-  dispatch, scalar fallback kept, bit-exact gate (integer ops).
+- Wave 1 (measurement): DONE 2026-07-17 (`examples/bench.rs` + `bench-timing` feature).
+  Baseline 35.7 MP/s; InterPredict 54.5% / LoopFilter 18.6% / Token+Dequant+Transform 17.7%.
+- Wave 2 (AVX2 inter-pred subpel convolution): DONE 2026-07-17 (`src/simd.rs`; see
+  implementation-notes "SIMD wave 2"). **35.7 -> 56.5 MP/s, 1.58x**, bit-exact (sweep
+  304/304 both SIMD-on and forced-scalar). Scaled path + width-4 + edge blocks stay scalar.
+- Wave 3+ (NEXT): the profile is now balanced -- LoopFilter 28.8% / Token+Dequant+Transform
+  27.5% / InterPredict 29.8%. Target `loop_filter.rs` and/or `transform.rs` butterflies to
+  clear the 62 MP/s 1080p30 bar (currently 56.5 at 1920-wide). Same dispatch/bit-exact rules.
+  Also still scalar: the scaled (SVC/resize) inter path and width-4 blocks.
+- NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
+  `predict.rs` dispatch point when an aarch64 target is needed.
 
 ## P1.5 — Noiria integration: in-engine validation
 
