@@ -88,8 +88,7 @@ fn build_lvl_lookup(lf: &LoopFilterParams, seg: &SegmentationParams) -> LvlLooku
                 }
             }
         } else {
-            let intra_lvl =
-                lvl_seg + (lf.ref_deltas[INTRA_FRAME as usize] as i32) * (1 << n_shift);
+            let intra_lvl = lvl_seg + (lf.ref_deltas[INTRA_FRAME as usize] as i32) * (1 << n_shift);
             seg_table[INTRA_FRAME as usize][0] = clip3(0, MAX_LOOP_FILTER, intra_lvl);
             // seg_table[INTRA_FRAME][1] is not defined by the spec (the INTRA_FRAME
             // row only has mode=0). On keyframes isIntra is always true and
@@ -338,6 +337,88 @@ fn sample_filtering(
     }
 }
 
+/// Per-position filter gating/strength: `(x, y, apply_filter, lvl, filter_size)`, spec
+/// §8.8.2 steps 4-10 plus the §8.8.3/§8.8.4 lookups. Factored out of
+/// `superblock_loop_filter`'s inner loop so the scalar loop and the AVX2 pass==1 fast path
+/// (`superblock_loop_filter_horiz_edge_avx2`, below) call the exact same code to decide
+/// WHICH positions get filtered and how strongly -- the two can never diverge on that,
+/// only on how the pixel arithmetic itself is carried out.
+#[allow(clippy::too_many_arguments)]
+fn edge_position_params(
+    mi_grid: &MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    lvl_lookup: &LvlLookup,
+    plane_idx: usize,
+    pass: u32,
+    row: u32,
+    col: u32,
+    sub_x: u32,
+    sub_y: u32,
+    sub: u32,
+    edge: u32,
+    i: u32,
+) -> (u32, u32, bool, i32, u8) {
+    let (x, y): (u32, u32) = if pass == 0 {
+        (col * 8 + edge * (4 << sub_x), row * 8 + (i << sub_y))
+    } else {
+        (col * 8 + (i << sub_x), row * 8 + edge * (4 << sub_y))
+    };
+
+    let loop_col = ((x >> 3) >> sub_x) << sub_x;
+    let loop_row = ((y >> 3) >> sub_y) << sub_y;
+    let mi = mi_grid.get(loop_row, loop_col);
+
+    let mi_size = mi.mi_size;
+    let tx_size = mi.tx_size;
+    let tx_sz = if plane_idx > 0 {
+        get_uv_tx_size(mi_size, tx_size, subsampling_x, subsampling_y)
+    } else {
+        tx_size
+    };
+    let sb_size = if sub == 0 {
+        mi_size
+    } else {
+        mi_size.max(BLOCK_16X16)
+    };
+    let skip = mi.skip;
+    // Spec §8.8.2 step 9: isIntra = RefFrames[loopRow][loopCol][0] <= INTRA_FRAME.
+    let ref_frame = mi.ref_frame[0];
+    let is_intra = ref_frame == INTRA_FRAME;
+
+    let is_block_edge = if pass == 0 {
+        x % (8 * NUM_8X8_BLOCKS_WIDE_LOOKUP[sb_size as usize] as u32) == 0
+    } else {
+        y % (8 * NUM_8X8_BLOCKS_HIGH_LOOKUP[sb_size as usize] as u32) == 0
+    };
+
+    let is_tx_edge =
+        if pass == 1 && sub_x == 1 && mi_cols % 2 == 1 && edge % 2 == 1 && (x + 8) >= mi_cols * 8 {
+            false
+        } else {
+            edge.is_multiple_of(1 << tx_sz)
+        };
+
+    let is_32_edge = edge.is_multiple_of(8);
+
+    let on_screen =
+        !(x >= 8 * mi_cols || y >= 8 * mi_rows || (pass == 0 && x == 0) || (pass == 1 && y == 0));
+
+    let apply_filter = on_screen && (is_block_edge || (is_tx_edge && (is_intra || !skip)));
+
+    let filter_size = filter_size_process(
+        tx_sz, is_32_edge, pass, x, y, sub_x, sub_y, mi_cols, mi_rows,
+    );
+
+    // Spec §8.8.4: modeType = 1 if mode in {NEARESTMV,NEARMV,NEWMV} else 0.
+    let mode_type = matches!(mi.y_mode, NEARESTMV | NEARMV | NEWMV) as usize;
+    let lvl = lvl_lookup[mi.segment_id as usize][ref_frame as usize][mode_type];
+
+    (x, y, apply_filter, lvl, filter_size)
+}
+
 /// Spec §8.8.2 "Superblock loop filter process".
 #[allow(clippy::too_many_arguments)]
 fn superblock_loop_filter(
@@ -368,67 +449,55 @@ fn superblock_loop_filter(
 
     let num_edges = 16u32 >> sub;
     for edge in 0..num_edges {
-        for i in 0..edge_len {
-            let (x, y): (u32, u32) = if pass == 0 {
-                (col * 8 + edge * (4 << sub_x), row * 8 + (i << sub_y))
-            } else {
-                (col * 8 + (i << sub_x), row * 8 + edge * (4 << sub_y))
-            };
-
-            let loop_col = ((x >> 3) >> sub_x) << sub_x;
-            let loop_row = ((y >> 3) >> sub_y) << sub_y;
-            let mi = mi_grid.get(loop_row, loop_col);
-
-            let mi_size = mi.mi_size;
-            let tx_size = mi.tx_size;
-            let tx_sz = if plane_idx > 0 {
-                get_uv_tx_size(mi_size, tx_size, subsampling_x, subsampling_y)
-            } else {
-                tx_size
-            };
-            let sb_size = if sub == 0 {
-                mi_size
-            } else {
-                mi_size.max(BLOCK_16X16)
-            };
-            let skip = mi.skip;
-            // Spec §8.8.2 step 9: isIntra = RefFrames[loopRow][loopCol][0] <= INTRA_FRAME.
-            let ref_frame = mi.ref_frame[0];
-            let is_intra = ref_frame == INTRA_FRAME;
-
-            let is_block_edge = if pass == 0 {
-                x % (8 * NUM_8X8_BLOCKS_WIDE_LOOKUP[sb_size as usize] as u32) == 0
-            } else {
-                y % (8 * NUM_8X8_BLOCKS_HIGH_LOOKUP[sb_size as usize] as u32) == 0
-            };
-
-            let is_tx_edge = if pass == 1
-                && sub_x == 1
-                && mi_cols % 2 == 1
-                && edge % 2 == 1
-                && (x + 8) >= mi_cols * 8
-            {
-                false
-            } else {
-                edge % (1 << tx_sz) == 0
-            };
-
-            let is_32_edge = edge % 8 == 0;
-
-            let on_screen = !(x >= 8 * mi_cols
-                || y >= 8 * mi_rows
-                || (pass == 0 && x == 0)
-                || (pass == 1 && y == 0));
-
-            let apply_filter = on_screen && (is_block_edge || (is_tx_edge && (is_intra || !skip)));
-
-            let filter_size = filter_size_process(
-                tx_sz, is_32_edge, pass, x, y, sub_x, sub_y, mi_cols, mi_rows,
+        // AVX2 fast path: horizontal edges (pass==1) only -- the along-edge axis (x) is
+        // contiguous in memory for this orientation, see docs/implementation-notes.md
+        // "SIMD wave 3". Vertical edges (pass==0) stay on the scalar loop below (along-edge
+        // there is consecutive ROWS, i.e. strided by the plane stride, not a natural AVX2
+        // fit without a byte gather).
+        #[cfg(target_arch = "x86_64")]
+        if pass == 1 && crate::simd::avx2_enabled() {
+            superblock_loop_filter_horiz_edge_avx2(
+                planes,
+                mi_grid,
+                mi_cols,
+                mi_rows,
+                subsampling_x,
+                subsampling_y,
+                lvl_lookup,
+                sharpness,
+                plane_idx,
+                pass,
+                row,
+                col,
+                sub_x,
+                sub_y,
+                sub,
+                edge_len,
+                edge,
+                dx,
+                dy,
             );
+            continue;
+        }
 
-            // Spec §8.8.4: modeType = 1 if mode in {NEARESTMV,NEARMV,NEWMV} else 0.
-            let mode_type = matches!(mi.y_mode, NEARESTMV | NEARMV | NEWMV) as usize;
-            let lvl = lvl_lookup[mi.segment_id as usize][ref_frame as usize][mode_type];
+        for i in 0..edge_len {
+            let (x, y, apply_filter, lvl, filter_size) = edge_position_params(
+                mi_grid,
+                mi_cols,
+                mi_rows,
+                subsampling_x,
+                subsampling_y,
+                lvl_lookup,
+                plane_idx,
+                pass,
+                row,
+                col,
+                sub_x,
+                sub_y,
+                sub,
+                edge,
+                i,
+            );
 
             if apply_filter && lvl > 0 {
                 let (limit, blimit, thresh) = adaptive_filter_strength(lvl, sharpness);
@@ -445,6 +514,132 @@ fn superblock_loop_filter(
                 );
             }
         }
+    }
+}
+
+/// AVX2 fast path for one pass==1 (horizontal) edge: batches `edge_len` (always a multiple
+/// of 8) along-edge positions into groups of 8 contiguous plane columns, and dispatches the
+/// narrow (4-tap)/wide (8-tap "flat") filter arithmetic to
+/// `simd::loop_filter_horiz8_avx2`. WHICH positions get filtered and how strongly is decided
+/// by the exact same `edge_position_params` the scalar loop uses -- only the pixel
+/// arithmetic is vectorized. Positions whose `filter_size` is `TX_16X16` (the rarer 16-tap
+/// "wide2" filter) are excluded from the SIMD batch and run through the unchanged scalar
+/// `sample_filtering` call instead (see docs/implementation-notes.md "SIMD wave 3": this
+/// wave's scope is narrow+wide8 only).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn superblock_loop_filter_horiz_edge_avx2(
+    planes: &mut [Plane; 3],
+    mi_grid: &MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    lvl_lookup: &LvlLookup,
+    sharpness: u8,
+    plane_idx: usize,
+    pass: u32,
+    row: u32,
+    col: u32,
+    sub_x: u32,
+    sub_y: u32,
+    sub: u32,
+    edge_len: u32,
+    edge: u32,
+    dx: i64,
+    dy: i64,
+) {
+    let mut i = 0u32;
+    while i < edge_len {
+        let mut eligible = [0i32; 8];
+        let mut is_tx8 = [0i32; 8];
+        let mut limit = [0i32; 8];
+        let mut blimit = [0i32; 8];
+        let mut thresh = [0i32; 8];
+        let mut x0 = 0usize;
+        let mut y0 = 0usize;
+
+        for lane in 0..8u32 {
+            let (x, y, apply_filter, lvl, filter_size) = edge_position_params(
+                mi_grid,
+                mi_cols,
+                mi_rows,
+                subsampling_x,
+                subsampling_y,
+                lvl_lookup,
+                plane_idx,
+                pass,
+                row,
+                col,
+                sub_x,
+                sub_y,
+                sub,
+                edge,
+                i + lane,
+            );
+            let px = (x >> sub_x) as usize;
+            let py = (y >> sub_y) as usize;
+            if lane == 0 {
+                x0 = px;
+                y0 = py;
+            }
+            debug_assert_eq!(py, y0, "pass==1 edge: y is constant along the edge");
+            debug_assert_eq!(px, x0 + lane as usize, "pass==1 edge: x is contiguous");
+
+            if apply_filter && lvl > 0 {
+                if filter_size == TX_16X16 {
+                    // Rare 16-tap ("wide2") case: unchanged scalar path, not part of this
+                    // wave's SIMD scope.
+                    let (l, bl, th) = adaptive_filter_strength(lvl, sharpness);
+                    sample_filtering(
+                        &mut planes[plane_idx],
+                        px,
+                        py,
+                        dx,
+                        dy,
+                        l,
+                        bl,
+                        th,
+                        filter_size,
+                    );
+                } else {
+                    eligible[lane as usize] = -1;
+                    is_tx8[lane as usize] = -((filter_size == TX_8X8) as i32);
+                    let (l, bl, th) = adaptive_filter_strength(lvl, sharpness);
+                    limit[lane as usize] = l;
+                    blimit[lane as usize] = bl;
+                    thresh[lane as usize] = th;
+                }
+            }
+        }
+
+        if eligible.iter().any(|&e| e != 0) {
+            // SAFETY: `avx2_enabled()` was checked by the caller (`superblock_loop_filter`).
+            // The row window read by the kernel (y0-4..=y0+3 at columns x0..x0+8, pass==1's
+            // dx=0,dy=1 taps run in the row direction) is exactly the window the
+            // already-proven-bit-exact scalar `compute_filter_mask`/`wide_filter(3)` reads
+            // for any eligible lane at this same edge-constant `y0` -- so it's in-bounds
+            // whenever at least one lane is eligible (`planes` are allocated out to
+            // superblock boundaries, see `framebuffer::Plane`'s doc comment, so the extra
+            // columns read for non-eligible lanes within the same 8-wide group are always
+            // valid memory too).
+            let plane_width = planes[plane_idx].width;
+            unsafe {
+                crate::simd::loop_filter_horiz8_avx2(
+                    planes[plane_idx].as_mut_slice(),
+                    plane_width,
+                    x0,
+                    y0,
+                    &eligible,
+                    &is_tx8,
+                    &limit,
+                    &blimit,
+                    &thresh,
+                );
+            }
+        }
+
+        i += 8;
     }
 }
 
@@ -617,6 +812,111 @@ mod tests {
         narrow_filter(&mut p, 4, 0, 1, 0, false);
         for x in 0..8 {
             assert_eq!(p.get(x, 0), 128);
+        }
+    }
+
+    /// Minimal xorshift32 PRNG for the randomized SIMD-vs-scalar test below -- deterministic
+    /// (fixed seed) so the test is reproducible, and avoids pulling in a `rand` dev-dep for
+    /// one test.
+    fn xorshift32(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+
+    /// Direct equivalence test for `simd::loop_filter_horiz8_avx2` (SIMD wave 3): for many
+    /// random pixel windows and random per-lane `eligible`/`is_tx8`/`limit`/`blimit`/`thresh`
+    /// combinations, the AVX2 kernel's output must exactly match calling this file's own
+    /// (already spec-conformant) `sample_filtering` scalar function once per lane. This is a
+    /// stronger, finer-grained bit-exactness proof than the official-vector sweep: it
+    /// exercises every combination of narrow-selected/wide8-selected/filter_mask-false/
+    /// ineligible lanes directly, including mixes within a single 8-lane batch, which a
+    /// handful of real conformance vectors may not happen to hit simultaneously.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_horiz8_matches_scalar_sample_filtering() {
+        if !crate::simd::avx2_enabled() {
+            // No AVX2 on this host -- the kernel is never dispatched to at runtime either
+            // (see `avx2_enabled()`'s use at the `superblock_loop_filter` call site), so
+            // there's nothing to cross-check here.
+            return;
+        }
+
+        let width = 8usize;
+        let height = 16usize;
+        let y0 = 8usize;
+        let mut seed = 0xC0FFEEu32;
+
+        for trial in 0..500u32 {
+            let mut plane_scalar = Plane::new(width, height);
+            for y in 0..height {
+                for x in 0..width {
+                    plane_scalar.set(x, y, (xorshift32(&mut seed) & 0xFF) as u8);
+                }
+            }
+            let mut plane_simd = plane_scalar.clone();
+
+            let mut eligible = [0i32; 8];
+            let mut is_tx8 = [0i32; 8];
+            let mut limit = [0i32; 8];
+            let mut blimit = [0i32; 8];
+            let mut thresh = [0i32; 8];
+            for lane in 0..8usize {
+                let elig = !xorshift32(&mut seed).is_multiple_of(5); // ~80% eligible
+                let tx8 = xorshift32(&mut seed).is_multiple_of(2);
+                eligible[lane] = if elig { -1 } else { 0 };
+                is_tx8[lane] = if tx8 { -1 } else { 0 };
+                // Wide-ranging (not just spec-plausible) limit/blimit/thresh: the kernel and
+                // `sample_filtering` are just fixed integer arithmetic over whatever's passed
+                // in, so exercising a broad range is a stronger, still-valid check.
+                limit[lane] = (xorshift32(&mut seed) % 64) as i32;
+                blimit[lane] = (xorshift32(&mut seed) % 200) as i32;
+                thresh[lane] = (xorshift32(&mut seed) % 16) as i32;
+
+                if elig {
+                    let filter_size = if tx8 { TX_8X8 } else { TX_4X4 };
+                    sample_filtering(
+                        &mut plane_scalar,
+                        lane,
+                        y0,
+                        0,
+                        1,
+                        limit[lane],
+                        blimit[lane],
+                        thresh[lane],
+                        filter_size,
+                    );
+                }
+            }
+
+            // SAFETY: avx2_enabled() confirmed above; the plane is 16 rows tall with y0==8,
+            // so rows y0-4..=y0+3 (the kernel's read/write window) are all in bounds.
+            unsafe {
+                crate::simd::loop_filter_horiz8_avx2(
+                    plane_simd.as_mut_slice(),
+                    width,
+                    0,
+                    y0,
+                    &eligible,
+                    &is_tx8,
+                    &limit,
+                    &blimit,
+                    &thresh,
+                );
+            }
+
+            for y in 0..height {
+                for x in 0..width {
+                    assert_eq!(
+                        plane_scalar.get(x, y),
+                        plane_simd.get(x, y),
+                        "trial {trial}: mismatch at column (lane) {x}, row {y}"
+                    );
+                }
+            }
         }
     }
 }

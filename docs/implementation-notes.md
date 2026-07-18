@@ -2496,3 +2496,97 @@ HD bench (release, first 300 frames of the inter-heavy 1920x800 movie, same harn
 InterPredict 29.8%), so the next SIMD target is loop filter or inverse transform. 56.5 MP/s at
 1920-wide is close to the 62 MP/s 1080p30 bar -- one more wave should clear it. (The full
 304-vector sweep, dominated by tiny vectors, sped up 172 -> 133s, ~22%.)
+
+## SIMD wave 3: AVX2 the loop filter, horizontal edges only (2026-07-18)
+
+Targeted the loop filter (`src/loop_filter.rs`), the joint-largest remaining stage after wave 2
+(measured 28.8-42.8% depending on content). Scope, deliberately partial (see below): only
+**horizontal edges** (`pass == 1`) and only the **narrow (4-tap) and wide8 (8-tap "flat")**
+filters are vectorized; vertical edges and the wide2 (16-tap "flat2", `TX_16X16`) filter stay
+scalar, unchanged.
+
+### What / where
+
+`src/simd.rs` gained `loop_filter_horiz8_avx2`: an AVX2 kernel processing 8 contiguous
+along-edge positions at once. Spec §8.8.5.1's filter/hev/flat masks become `_mm256_cmpgt_epi32`
+compares; the narrow filter (§8.8.5.2) and the wide8 filter (§8.8.5.3, `log2_size == 3`) are
+both computed for all 8 lanes and blended per-lane with `_mm256_blendv_epi8` based on each
+lane's mask -- the standard libvpx-style approach the wave's brief pointed at. The wide8 filter
+uses closed-form weighted sums (`3*p3+2*p2+p1+p0+q0` etc., hand-derived from and verified
+against the spec's `t = get_off(i) + sum_j get_off(clip3(-4,3,i+j))` loop -- reordering the same
+integer terms is exact, not approximate) instead of the spec's O(n^2) loop.
+
+`src/loop_filter.rs`'s per-position gating (`x, y, apply_filter, lvl, filter_size` -- spec
+§8.8.2 steps 4-10 plus the §8.8.3/§8.8.4 lookups) was factored out of `superblock_loop_filter`'s
+inner loop into `edge_position_params`, called identically by the scalar loop and by the new
+`superblock_loop_filter_horiz_edge_avx2` batching path, so the two can never diverge on *which*
+positions get filtered or *how strongly* -- only the pixel arithmetic differs. The batching path
+gathers 8 lanes' params, runs any `TX_16X16` lane through the unchanged scalar `sample_filtering`
+call directly (this wave's kernel never reads `p4..p7`/`q4..q7`, so it can only pick narrow or
+wide8), and dispatches the rest to `loop_filter_horiz8_avx2`.
+
+**Fast path inside the kernel**: for luma, an 8-lane batch's along-edge span is exactly one mi
+block's width, and for chroma the mi-index rounding (`loop_col`'s `>>sub_x<<sub_x`) still lands
+the whole batch in one rounded mi cell -- so `filter_size` (hence `is_tx8`) is uniform across
+essentially every batch in practice. When no lane in a batch is `TX_8X8`, wide8 can never be
+selected (`flat_mask` is always ANDed with `is_tx8`), so the kernel skips computing `flat_mask`
+and the wide8 sums entirely, and skips writing p2/q2 (only wide8 ever touches them) --
+`_mm256_testz_si256(is_tx8_v, is_tx8_v)` detects this in one instruction. This mattered:
+without it, the first measurement showed a wash (see below).
+
+### Why only horizontal edges
+
+For `pass == 1` (horizontal edges), the along-edge axis is the plane's x (column) direction,
+which is contiguous in memory -- each of the 8 taps needed is one `_mm_loadl_epi64` contiguous
+8-byte row read. For `pass == 0` (vertical edges), the along-edge axis is consecutive *rows*,
+strided by the plane's stride -- not a natural fit without a byte gather (x86 has none) or a
+transpose. Per the wave's own scope guidance, vertical edges were left scalar rather than risk a
+bug for a harder-to-verify win; that's the main remaining loop-filter SIMD opportunity for a
+future wave.
+
+### Bit-exactness proof
+
+Beyond the official-vector conformance gate, this wave added a direct, much finer-grained proof:
+`loop_filter::tests::avx2_horiz8_matches_scalar_sample_filtering` runs 500 trials of random 8x16
+pixel windows with random per-lane `eligible`/`is_tx8`/`limit`/`blimit`/`thresh` (deterministic
+xorshift32 PRNG, no dev-dep needed), calling the kernel and the file's own scalar
+`sample_filtering` once per lane, asserting byte-identical planes. This exercises mixes of
+narrow-selected/wide8-selected/filter-mask-false/ineligible lanes within a single 8-lane batch
+that a handful of real conformance vectors may not happen to hit simultaneously. All 500 passed
+on the first run.
+
+### Dispatch / fallback
+
+Reuses wave 2's `simd::avx2_enabled()` gate unchanged (`VP9DEC_NO_SIMD` + `is_x86_feature_detected!`).
+`cargo test`: **151 passed** (120 lib incl. the new randomized test + 6 api + 12 conformance + 7
+synthetic_seg + 2 synthetic_superframe + 4 decode_to_png; sweep 0/1 ignored), unchanged count
+plus the one new test. `cargo test --test conformance_test`: 12/12 with SIMD on **and** with
+`VP9DEC_NO_SIMD=1`. `cargo clippy --all-targets`: still exactly the 3 pre-existing baseline
+warnings (large_enum_variant/identity_op/field_reassign_with_default) -- two `manual_is_multiple_of`
+warnings appeared when pre-existing `edge % N == 0` lines were relocated into the new
+`edge_position_params` helper (same lines, unchanged behavior, clippy just hadn't flagged them
+in their old location) and one `neg_multiply` from this wave's own new code; all three fixed
+with clippy's own suggested (behavior-identical) rewrites.
+
+### Speedup: modest, and honestly reported
+
+Unlike wave 2's clear ~1.58x, this wave's isolated effect on loop filter's own time is modest and
+partly noise-level, because only one of the two edge orientations is vectorized and real content
+still exercises the (unfastpathed) wide8/`TX_8X8` case often. Measured on this machine
+(back-to-back same-session runs, `--release`, first 300 frames, `--stages`; `VP9DEC_NO_SIMD=1`
+also disables wave 2's InterPredict SIMD, so it isn't a clean loop-filter-only isolation, but
+LoopFilter's own reported stage time is):
+
+| clip | LoopFilter, SIMD on | LoopFilter, forced scalar | delta |
+| --- | --- | --- | --- |
+| tos_1920x800 (28.8-33% share) | 2093-2334 ms (2 runs) | 2161-2382 ms (2 runs) | within noise |
+| tos_854x356 (42.7% share, more loop-filter-heavy) | 888.9 ms | 954.3 ms | ~6.9% faster |
+
+Total decode MP/s (72.7-72.8 SIMD-on vs 42.3-45.4 forced-scalar on tos_1920x800) is still
+dominated by wave 2's already-shipped InterPredict win, not this wave. Vectorizing vertical
+edges too (see above) is the clearest path to a bigger loop-filter win in a future wave.
+
+**READY FOR FULL-SWEEP VERIFICATION.** Reviewer should run: (1) `cargo test` (release not
+required, ~50s), (2) the official 304-vector sweep with SIMD on, (3) the same sweep with
+`VP9DEC_NO_SIMD=1`, (4) the ffmpeg cross-decode gate. All are expected to pass 304/304 /
+byte-identical, matching wave 2's proof pattern (SIMD output == scalar output == reference).

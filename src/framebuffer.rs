@@ -57,6 +57,13 @@ impl Plane {
         &self.data
     }
 
+    /// Mutable counterpart of [`Plane::as_slice`], for the AVX2 loop-filter kernel
+    /// (`src/simd.rs`), which writes its filtered samples directly into the raw buffer.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     /// Returns a row-major byte sequence cropped to the display size `(crop_width, crop_height)`.
     pub fn crop(&self, crop_width: usize, crop_height: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(crop_width * crop_height);
