@@ -18,6 +18,8 @@ pub mod ivf;
 // Every module below is internal; public only so the pure-std integration tests in
 // tests/ can reach it -- not a stable API.
 #[doc(hidden)]
+pub mod bench_timing;
+#[doc(hidden)]
 pub mod bit_reader;
 #[doc(hidden)]
 pub mod bool_coder;
@@ -348,7 +350,11 @@ impl Decoder {
     /// frame. Internal state (reference frame buffers, frame context, previous frame's
     /// MVs, etc.) is updated whether or not the frame is shown.
     fn decode_one_frame(&mut self, frame_data: &[u8]) -> Result<DecodedFrame, DecodeError> {
-        let (parsed, consumed) = parse_uncompressed_header(frame_data, &self.persist)?;
+        let _total_t = bench_timing::StageTimer::start(bench_timing::Stage::Total);
+        let (parsed, consumed) = {
+            let _t = bench_timing::StageTimer::start(bench_timing::Stage::HeaderParse);
+            parse_uncompressed_header(frame_data, &self.persist)?
+        };
         let header = match parsed {
             FrameHeader::New(h) => h,
             FrameHeader::ShowExistingFrame {
@@ -435,8 +441,10 @@ impl Decoder {
         // backward adaptation.
         let starting_probs = self.frame_contexts.load(header.frame_context_idx);
 
-        let compressed =
-            parse_compressed_header(compressed_bytes, &header, starting_probs.clone())?;
+        let compressed = {
+            let _t = bench_timing::StageTimer::start(bench_timing::Stage::CompressedHeader);
+            parse_compressed_header(compressed_bytes, &header, starting_probs.clone())?
+        };
 
         // Resolve the pixel data of the DPB slots this frame references, for motion
         // compensation (spec §8.5.2.3-8.5.2.4). Not referenced when `FrameIsIntra == 1`.
@@ -462,15 +470,23 @@ impl Decoder {
             resolved_refs,
             self.prev_segment_ids.clone(),
         );
-        tile_decoder.decode_tiles(tile_data)?;
+        {
+            let _t = bench_timing::StageTimer::start(bench_timing::Stage::TileDecode);
+            tile_decoder.decode_tiles(tile_data)?;
+        }
         // Spec §8.1 step 2: "If loop_filter_level is not equal to 0, the loop filter
         // process ... is invoked" -- the whole process (including §8.8.1's frame init,
         // which can raise a per-block level above 0 via loop_filter_ref_deltas even when
         // the frame-level loop_filter_level is 0) is gated on this frame-level value, not
         // just the per-edge computed level.
         if header.loop_filter.level != 0 {
+            let _t = bench_timing::StageTimer::start(bench_timing::Stage::LoopFilter);
             tile_decoder.apply_loop_filter(&header.loop_filter);
         }
+        // Remainder of decode_one_frame (PrevSegmentIds refresh, probability adaptation,
+        // DPB update, output Frame construction) is timed as one "DpbOutput" bucket; this
+        // timer lives to the end of the function (no more fallible `?` calls follow).
+        let _dpb_t = bench_timing::StageTimer::start(bench_timing::Stage::DpbOutput);
 
         // spec §8.1 step 3: PrevSegmentIds is refreshed from this frame's SegmentIds only
         // when segmentation_enabled && segmentation_update_map (not gated by show_frame).

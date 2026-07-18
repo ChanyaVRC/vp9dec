@@ -20,8 +20,13 @@ needs ~62 MP/s plus headroom, so this blocks practical Noiria integration for HD
 - Hard gate: bit-exact output — 304/304 official sweep + 150-test suite + 8-way ffmpeg
   cross-decode must stay green with SIMD enabled AND disabled (integer ops only, so
   exact equality is achievable; any "close enough" result is a bug).
-- First wave = measurement: a benchmark harness (large-clip decode MP/s, per-stage
-  profile) so optimization targets are data-driven, not guessed.
+- First wave = measurement: DONE (2026-07-17, `examples/bench.rs` +
+  `bench-timing` feature; see implementation-notes "SIMD wave 1"). Result (release,
+  inter-heavy 1920x800 movie): **35.7 MP/s single-thread**, split InterPredict 54.5% /
+  LoopFilter 18.6% / Token+Dequant+Transform 17.7% / Intra 0.4%. Wave-2 target order is
+  therefore: (1) `predict.rs::block_inter_predict` 8-tap subpel convolution [dominant],
+  (2) `loop_filter.rs`, (3) `transform.rs` butterflies. `is_x86_feature_detected!`
+  dispatch, scalar fallback kept, bit-exact gate (integer ops).
 
 ## P1.5 — Noiria integration: in-engine validation
 

@@ -2395,3 +2395,58 @@ The two decoder defects the corpus surfaced were both output-policy/gating bugs 
 above the pixel pipeline -- transforms, prediction, dequant, tiles, MC (scaled and unscaled),
 and probability adaptation needed no changes at any point in M4. Out of scope and still open:
 10-bit/12-bit (profiles 2/3) and 4:2:2/4:4:4 (profiles 1/3) -- see README "Known limits".
+
+## SIMD wave 1: decode-speed profiling (measurement only, 2026-07-17)
+
+### Infrastructure
+
+`examples/bench.rs` (pure std) decodes `.ivf` files and reports MP/s (sum of displayed
+`width*height` / wall time), per-clip + aggregate, with `--iters`, `--max-frames=N` (cap
+displayed frames -- the tos/sintel movies are 17k+ frames/iteration), and `--stages`.
+`src/bench_timing.rs` (behind the `bench-timing` Cargo feature; a no-op empty module when
+off, so a normal build/`cargo test` is byte-for-byte unaffected -- confirmed 150/150 with the
+feature off) accumulates coarse per-stage nanosecond counters via `Instant`s placed at the
+stage boundaries in `decode_one_frame` and, inside tile decode, around
+token/dequant/transform, inter prediction, and intra prediction. Overhead is one `Instant::now`
+pair per stage per frame -- negligible at the granularity measured.
+
+### Numbers (release, first 300 displayed frames, bench-timing on)
+
+| clip | res | MP/s | InterPredict | LoopFilter | Token+Dequant+Transform | IntraPredict | DpbOutput |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| tos_1920x800 | 1920x800 | 35.7 | **54.5%** | 18.6% | 17.7% | 0.4% | 3.7% |
+| tos_854x356 | 854x356 | 26.4 | **46.7%** | 42.7% | 5.4% | 0.2% | 1.4% |
+
+(Header/compressed-header parse are <0.1% each; the untimed ~1% gap is TileDecoder per-frame
+setup + superframe split. Intra is negligible on these inter-heavy clips -- an all-intra clip
+would shift its share up but those are rare in real content.) These are inter-heavy real-movie
+clips; stage *proportions* are what drive target selection and are content-type-stable, so the
+first-300-frame sample is representative for ranking even though absolute MP/s varies with
+content. The ~35 MP/s here is faster than the whole-movie ~19 MP/s quoted in the M4 close-out
+(different frame mix + no repeated-iteration cache effects); both are single-thread scalar.
+
+### Target ranking for SIMD wave 2
+
+1. **Inter prediction / subpel convolution** (`predict.rs::block_inter_predict`, the two-pass
+   8-tap `SUBPEL_FILTERS` convolution + compound averaging) -- **47-55%**, the dominant cost.
+   Classic SIMD territory: 8-tap FIR over `u8` source into `i32`, `pmaddubsw`/`pmaddwd`-shaped
+   on AVX2, `vmlal` on NEON; data layout is already contiguous (wave 4b fixed scratch buffers).
+   Highest priority by a wide margin.
+2. **Loop filter** (`loop_filter.rs`) -- 19-43% (share rises on lower-bitrate/softer content).
+   Branchier (per-edge filter-mask/hev decisions) but vectorizable across the 8/16 samples of an
+   edge; the narrow/wide filters are fixed integer sequences.
+3. **Inverse transform** (`transform.rs` idct/iadst butterflies) -- 5-18%. Butterfly networks
+   vectorize along the non-butterfly dimension (whole rows/columns); wave 4b already made the
+   row/col temporaries fixed stack arrays.
+
+Intra prediction and the token/coefficient reader (inherently serial arithmetic-coding
+dependency) are NOT worthwhile SIMD targets. Recommended wave-2 scope: target #1 alone first
+(largest single win; ~3x on it would cut total time ~37% -> ~57 MP/s at 1920-wide, close to
+the 62 MP/s 1080p30 bar), gated on bit-exact output (integer ops -> exact equality achievable;
+runtime `is_x86_feature_detected!` dispatch with the scalar path kept as the always-available
+fallback, staying zero-dependency).
+
+### No decoder behavior change
+
+Measurement only. `cargo test` 150/150 with the feature off; clippy adds no new warnings with
+the feature on. The `bench-timing` counters and `examples/bench.rs` are the only additions.

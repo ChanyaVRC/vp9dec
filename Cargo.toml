@@ -13,6 +13,9 @@ vp9dec = { path = ".", features = ["test-support"] }
 
 [features]
 test-support = []
+# Per-stage wall-clock accounting (src/bench_timing.rs), read by examples/bench.rs's
+# `--stages` report. Zero-cost when off: see src/bench_timing.rs for how.
+bench-timing = []
 
 [[example]]
 name = "decode_to_png"
@@ -20,3 +23,6 @@ test = true
 
 [[example]]
 name = "webm_to_ivf"
+
+[[example]]
+name = "bench"
