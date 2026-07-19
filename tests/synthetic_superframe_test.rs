@@ -98,8 +98,9 @@ fn superframe_with_multiple_shown_constituents_only_outputs_the_last() {
     // (`src/predict.rs::predict_intra`: `base - 1`/`base + 1` when a neighbor is unavailable).
     // Frame A's would-be content (flat 128, from DC_PRED with no neighbors) is deliberately
     // never checked -- it must never surface at all, which the assertion above already covers.
-    assert_eq!(shown.y[0], 127, "must be frame B's content, not frame A's");
-    assert_eq!(shown.y[(HEIGHT as usize / 2) * WIDTH as usize], 129);
+    let shown_y = shown.y.as_u8();
+    assert_eq!(shown_y[0], 127, "must be frame B's content, not frame A's");
+    assert_eq!(shown_y[(HEIGHT as usize / 2) * WIDTH as usize], 129);
 }
 
 /// A single-frame chunk (no superframe index) is unaffected: the sole constituent's own

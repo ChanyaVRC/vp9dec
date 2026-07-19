@@ -170,15 +170,19 @@ fn yuv_to_rgb_bt601(frame: &Frame) -> Vec<u8> {
     let w = frame.width as usize;
     let h = frame.height as usize;
     let uv_w = w.div_ceil(2);
+    // This example only ever writes 8-bit RGB PNGs, so 10/12-bit input isn't handled here.
+    let y_plane = frame.y.as_u8();
+    let u_plane = frame.u.as_u8();
+    let v_plane = frame.v.as_u8();
 
     let mut rgb = vec![0u8; w * h * 3];
     for y in 0..h {
         for x in 0..w {
-            let y_val = frame.y[y * w + x] as f32;
+            let y_val = y_plane[y * w + x] as f32;
             let cx = x / 2;
             let cy = y / 2;
-            let u_val = frame.u[cy * uv_w + cx] as f32;
-            let v_val = frame.v[cy * uv_w + cx] as f32;
+            let u_val = u_plane[cy * uv_w + cx] as f32;
+            let v_val = v_plane[cy * uv_w + cx] as f32;
 
             let yy = 1.164 * (y_val - 16.0);
             let cb = u_val - 128.0;

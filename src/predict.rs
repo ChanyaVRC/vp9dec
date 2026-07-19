@@ -273,7 +273,7 @@ pub fn predict_intra(
 
     for i in 0..size {
         for j in 0..size {
-            plane.set(x + j, y + i, pred[at(i, j)] as u8);
+            plane.set(x + j, y + i, pred[at(i, j)] as u16);
         }
     }
 }
@@ -484,9 +484,9 @@ fn block_inter_predict(
     // for the horizontal pass's column, `r` alone for the vertical pass's row -- see
     // `simd.rs`'s doc comment for the derivation). Falls through to the scalar loop for:
     // the scaled path (rarer, harder to vectorize -- kept scalar per this wave's scope),
-    // bit_depth != 8 (never actually reached today, lib.rs rejects non-8-bit streams
-    // before decode, but the scalar loop handles it generically so the guard is free to
-    // keep), width 4 (not a multiple of the AVX2 kernel's 8-wide lane group), and any
+    // bit_depth != 8 (10/12-bit frames: the AVX2 kernel's arithmetic -- clip1 to 0..=255 --
+    // is only valid at 8-bit; the scalar loop below handles every depth generically), width
+    // 4 (not a multiple of the AVX2 kernel's 8-wide lane group), and any
     // block whose source window would need the scalar path's per-pixel edge clamp
     // (border replication) -- only near reference-frame edges; replicating that with
     // AVX2 would need a byte gather, which x86 doesn't have.
@@ -618,7 +618,7 @@ pub fn predict_inter(
             } else {
                 preds[0][i * w + j]
             };
-            dst.set(x + j, y + i, value as u8);
+            dst.set(x + j, y + i, value as u16);
         }
     }
 }
@@ -632,7 +632,7 @@ mod tests {
         let mut p = Plane::new(width, height);
         for y in 0..height {
             for x in 0..width {
-                p.set(x, y, fill);
+                p.set(x, y, fill as u16);
             }
         }
         p
@@ -650,12 +650,12 @@ mod tests {
     fn v_pred_copies_above_row() {
         let mut plane = make_plane(8, 8, 0);
         for x in 0..4 {
-            plane.set(x, 3, 50 + x as u8);
+            plane.set(x, 3, 50 + x as u16);
         }
         predict_intra(&mut plane, 0, 4, false, true, false, TX4, V_PRED, 7, 7, 8);
         for x in 0..4 {
-            assert_eq!(plane.get(x, 4), 50 + x as u8);
-            assert_eq!(plane.get(x, 5), 50 + x as u8);
+            assert_eq!(plane.get(x, 4), 50 + x as u16);
+            assert_eq!(plane.get(x, 5), 50 + x as u16);
         }
     }
 
@@ -663,12 +663,12 @@ mod tests {
     fn h_pred_copies_left_col() {
         let mut plane = make_plane(8, 8, 0);
         for y in 0..4 {
-            plane.set(3, y, 60 + y as u8);
+            plane.set(3, y, 60 + y as u16);
         }
         predict_intra(&mut plane, 4, 0, true, false, false, TX4, H_PRED, 7, 7, 8);
         for y in 0..4 {
-            assert_eq!(plane.get(4, y), 60 + y as u8);
-            assert_eq!(plane.get(5, y), 60 + y as u8);
+            assert_eq!(plane.get(4, y), 60 + y as u16);
+            assert_eq!(plane.get(5, y), 60 + y as u16);
         }
     }
 

@@ -2590,3 +2590,113 @@ edges too (see above) is the clearest path to a bigger loop-filter win in a futu
 required, ~50s), (2) the official 304-vector sweep with SIMD on, (3) the same sweep with
 `VP9DEC_NO_SIMD=1`, (4) the ffmpeg cross-decode gate. All are expected to pass 304/304 /
 byte-identical, matching wave 2's proof pattern (SIMD output == scalar output == reference).
+
+## P2: 10/12-bit foundation + Frame API (2026-07-19)
+
+Removed the 8-bit-only assumption throughout the decode pipeline (VP9 profile 2, 4:2:0,
+10/12-bit) and reshaped the public output type accordingly. Most of the pipeline was already
+bit_depth-parameterized (quant tables, intra/inter clip bounds, transforms); the 8-bit
+assumption lived in exactly 4 places, all now fixed:
+
+### `Plane` is `u16`-backed unconditionally
+
+`framebuffer::Plane`'s storage changed from `Vec<u8>` to `Vec<u16>` -- for every bit depth,
+including 8-bit (samples 0..=255 stored widened, not packed). This gives every plane
+operation (get/set/predict/loop-filter) exactly one code path across all 3 depths instead of
+branching on bit_depth everywhere a pixel is touched. Narrowing to `u8` happens only at the
+output boundary: `Plane::crop_u8` (new) produces the `PlaneData::U8` variant when
+`bit_depth == 8`; `Plane::crop` (now returns `Vec<u16>`) feeds `PlaneData::U16` otherwise, and
+still feeds `crop_to_plane` (DPB storage, unchanged shape). All narrowing stores that used to
+write `as u8` (`predict.rs`'s intra/inter block writes, `residual.rs`'s reconstruct add) now
+write `as u16` -- pure widen-the-store-type changes, since every value was already clipped to
+`(1<<bit_depth)-1` upstream.
+
+### AVX2 kernels: widened loads, same arithmetic
+
+Both AVX2 kernels (`simd.rs`) are gated to `bit_depth == 8` at their call sites (inter-predict's
+gate already existed; the loop filter's did not -- see below), so their *arithmetic* (0..=255
+clip bounds, the narrow-filter's 128 base, etc.) stays hardcoded and correct. Only the
+load/store intrinsics changed to match `Plane`'s new `u16` storage: `block_inter_predict_avx2`
+now widens `u16 -> i32` via `_mm256_cvtepu16_epi32(_mm_loadu_si128(..))` (was `u8 -> i32` via
+`_mm256_cvtepu8_epi32(_mm_loadl_epi64(..))`); `loop_filter_horiz8_avx2` mirrors this on load,
+and on store now packs `i32 -> u16` only (`_mm256_packus_epi32` + `_mm_storeu_si128`) instead of
+double-packing down to `u8` bytes. Since every value in scope is still 0..=255 (the bit_depth==8
+gate), this is bit-exact with the pre-change byte-oriented version -- confirmed by
+`avx2_horiz8_matches_scalar_sample_filtering`'s 500-trial randomized cross-check (unchanged,
+still passing) and the full conformance/sweep gates below.
+
+### LANDMINE closed: loop filter's AVX2 dispatch now gated on `bit_depth == 8`
+
+Before this wave, `superblock_loop_filter`'s AVX2 fast-path dispatch (`pass == 1 &&
+crate::simd::avx2_enabled()`) had no bit-depth check -- harmless only because non-8-bit frames
+were rejected earlier (`DecodeError::UnsupportedBitDepth`). Removing that rejection without
+also gating the dispatch would have silently corrupted 10/12-bit output (the kernel's
+constants -- 128, +-128, flat threshold 1 -- are 8-bit-only). Fixed by adding `bit_depth == 8`
+to the dispatch condition; 10/12-bit frames now always take the (correctly bit_depth-scaled)
+scalar path.
+
+### Loop filter: bit_depth threaded through, spec §8.8.4/§8.8.5 constants scaled
+
+`bit_depth: u8` now flows from `TileDecoder::apply_loop_filter` (passes `self.bit_depth`)
+through `loop_filter_frame` -> `superblock_loop_filter` -> `adaptive_filter_strength` /
+`sample_filtering` -> `compute_filter_mask` / `narrow_filter`. Three constants scale by
+`<< (bit_depth - 8)` (identity at `bit_depth == 8`, so 8-bit behavior is provably unchanged):
+`adaptive_filter_strength`'s `(limit, blimit, thresh)` result (these are compared directly
+against pixel differences, which widen by the same factor); `compute_filter_mask`'s flat/flat2
+threshold (was a bare `1`); `narrow_filter`'s `0x80` base (now `1 << (bit_depth-1)`) and its
+`clamp4` range (was `clip3(-128, 127, ..)`, now `clip3(-(128<<(bd-8)), (128<<(bd-8))-1, ..)`).
+`wide_filter` needed no constant change (pure averaging of already-valid-range pixel sums) --
+only the ambient pixel type changed. `set_off`'s old `debug_assert!((0..=255).contains(&v))`
+was dropped rather than threaded a `bit_depth` parameter just for an assert (the mission
+explicitly allowed either choice; dropping is simpler and every write site already has its own
+upstream clamp).
+
+### `Frame`/`PlaneData` public API
+
+```rust
+pub enum PlaneData { U8(Vec<u8>), U16(Vec<u16>) }
+pub struct Frame {
+    pub width: u32, pub height: u32, pub bit_depth: u8,
+    pub subsampling_x: u32, pub subsampling_y: u32,
+    pub y: PlaneData, pub u: PlaneData, pub v: PlaneData,
+}
+```
+
+8-bit decodes produce `PlaneData::U8` (no memory bloat vs. the old `Vec<u8>` shape); >8-bit
+produce `PlaneData::U16`. `PlaneData::len()` counts samples (not bytes, so existing
+`width*height`-style assertions in tests needed no change); `PlaneData::as_u8()` panics on a
+`U16` plane, for 8-bit-only consumers (tests, `decode_to_png` example) that already assumed
+8-bit -- it isn't a silent lossy conversion, it's an explicit "this caller doesn't handle
+10/12-bit yet" boundary. `DecodeError::UnsupportedBitDepth` and its reject in `decode_one_frame`
+are gone, along with `tile.rs`'s `assert_eq!(bit_depth, 8)`.
+
+### Test/example fallout
+
+Every direct `frame.y`/`.u`/`.v` consumer across `tests/api_test.rs`,
+`tests/synthetic_seg_test.rs`, `tests/synthetic_superframe_test.rs`, and
+`examples/decode_to_png.rs` now goes through `.as_u8()` (all of them are 8-bit-only synthetic
+or existing-vector paths, so this is a mechanical fix, not a scope change).
+`tests/common::i420_bytes` now matches libvpx's high-bit-depth `.ivf.md5` convention: `U8`
+samples copied as-is, `U16` samples emitted as 2 little-endian bytes each -- this is what
+made the 10/12-bit vector check below possible without any md5-file preprocessing.
+`tests/sweep_test.rs`, `tests/conformance_test.rs`, and `examples/bench.rs` needed no changes
+(they only ever called `i420_bytes`/`.len()`, both already depth-agnostic).
+
+### Verification
+
+`cargo build`/`cargo test` (all 152 tests, unchanged pass count) both clean.
+`cargo test --test conformance_test` 12/12 with SIMD on **and** with `VP9DEC_NO_SIMD=1` --
+the fast 8-bit-bit-exactness proxy the mission asked for, both green. `cargo clippy
+--all-targets`: no new warnings (still exactly the same 3 pre-existing baseline warnings, none
+in any file this wave touched). `cargo fmt --check`: clean.
+
+Profile-2 targeted check (throwaway test, not committed to the suite): both
+`vp92-2-20-10bit-yuv420.ivf` (10 frames) and `vp92-2-20-12bit-yuv420.ivf` (10 frames) decode
+and MD5-match their official `.ivf.md5` exactly, confirming `bit_depth=10`/`12` and
+`PlaneData::U16` end-to-end -- not just the 8-bit invariant, but the actual new feature.
+
+**READY FOR FULL-SWEEP VERIFICATION.** Reviewer should run the same two release sweeps as
+prior waves: (1) `cargo test --release --test sweep_test official_vector_sweep -- --ignored
+--nocapture`, (2) the same with `VP9DEC_NO_SIMD=1` set first. Both are expected to stay at
+304/304 (the 8-bit invariant), and the local vp92 10/12-bit vectors (not part of the official
+304-vector sweep manifest) are already confirmed bit-exact above.

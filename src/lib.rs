@@ -86,9 +86,6 @@ pub enum DecodeError {
     Tile(TileError),
     /// Frame data is malformed, e.g. `header_size_in_bytes` exceeds the frame data length.
     TruncatedFrame,
-    /// A frame that isn't 8-bit (`BitDepth == 8`). [`framebuffer::Plane`] is fixed to `u8`,
-    /// so 10-bit/12-bit frames are currently unsupported.
-    UnsupportedBitDepth(u8),
     /// The DPB slot referenced by `show_existing_frame` has no frame stored
     /// (does not occur with normal conformance bitstreams).
     MissingReferenceFrame,
@@ -112,8 +109,41 @@ impl From<TileError> for DecodeError {
     }
 }
 
-/// One decoded frame. Cropped to the display size (`FrameWidth`/`FrameHeight`),
-/// holding the 3 YUV420 planes as row-major `Vec<u8>`.
+/// One decoded plane's pixel data. 8-bit streams (`BitDepth == 8`) decode into `U8` (no
+/// memory bloat from widening the overwhelmingly common case); 10/12-bit streams (VP9
+/// profile 2) decode into `U16` (each sample 0..=1023 or 0..=4095).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaneData {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+
+impl PlaneData {
+    /// Number of samples (not bytes) -- e.g. `width * height` for a cropped plane, the same
+    /// meaning regardless of variant.
+    pub fn len(&self) -> usize {
+        match self {
+            PlaneData::U8(v) => v.len(),
+            PlaneData::U16(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Borrows the samples as 8-bit. Panics if this plane is `U16` (10/12-bit) -- for
+    /// consumers that only ever handle 8-bit output.
+    pub fn as_u8(&self) -> &[u8] {
+        match self {
+            PlaneData::U8(v) => v,
+            PlaneData::U16(_) => panic!("PlaneData::as_u8 called on a 16-bit (10/12-bit) plane"),
+        }
+    }
+}
+
+/// One decoded frame. Cropped to the display size (`FrameWidth`/`FrameHeight`), holding the
+/// 3 YUV420 planes as [`PlaneData`] (row-major).
 ///
 /// The `u`/`v` sizes follow the output process of spec §8.9, computed as
 /// `((width + subsampling_x) >> subsampling_x) x ((height + subsampling_y) >> subsampling_y)`
@@ -122,9 +152,22 @@ impl From<TileError> for DecodeError {
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    pub bit_depth: u8,
+    pub subsampling_x: u32,
+    pub subsampling_y: u32,
+    pub y: PlaneData,
+    pub u: PlaneData,
+    pub v: PlaneData,
+}
+
+/// Crops one plane to `(w, h)` and narrows to `PlaneData::U8`/`U16` depending on `bit_depth`
+/// (8-bit output stays byte-sized; 10/12-bit needs the full `u16` range).
+fn plane_to_plane_data(plane: &framebuffer::Plane, w: usize, h: usize, bit_depth: u8) -> PlaneData {
+    if bit_depth == 8 {
+        PlaneData::U8(plane.crop_u8(w, h))
+    } else {
+        PlaneData::U16(plane.crop(w, h))
+    }
 }
 
 /// Crops the frame buffer (`planes`) to the display size and builds a [`Frame`].
@@ -138,13 +181,17 @@ fn crop_to_frame(
     let sub_y = color_config.subsampling_y as u32;
     let uv_width = ((width + sub_x) >> sub_x) as usize;
     let uv_height = ((height + sub_y) >> sub_y) as usize;
+    let bit_depth = color_config.bit_depth;
 
     Frame {
         width,
         height,
-        y: planes[0].crop(width as usize, height as usize),
-        u: planes[1].crop(uv_width, uv_height),
-        v: planes[2].crop(uv_width, uv_height),
+        bit_depth,
+        subsampling_x: sub_x,
+        subsampling_y: sub_y,
+        y: plane_to_plane_data(&planes[0], width as usize, height as usize, bit_depth),
+        u: plane_to_plane_data(&planes[1], uv_width, uv_height, bit_depth),
+        v: plane_to_plane_data(&planes[2], uv_width, uv_height, bit_depth),
     }
 }
 
@@ -197,9 +244,12 @@ fn ref_frame_data_to_frame(data: &RefFrameData) -> Frame {
     Frame {
         width: data.width,
         height: data.height,
-        y: data.y.crop(data.y.width, data.y.height),
-        u: data.u.crop(data.u.width, data.u.height),
-        v: data.v.crop(data.v.width, data.v.height),
+        bit_depth: data.bit_depth,
+        subsampling_x: data.subsampling_x,
+        subsampling_y: data.subsampling_y,
+        y: plane_to_plane_data(&data.y, data.y.width, data.y.height, data.bit_depth),
+        u: plane_to_plane_data(&data.u, data.u.width, data.u.height, data.bit_depth),
+        v: plane_to_plane_data(&data.v, data.v.width, data.v.height, data.bit_depth),
     }
 }
 
@@ -394,10 +444,6 @@ impl Decoder {
         });
         if header.frame_is_intra {
             self.last_color_config = Some(color_config);
-        }
-
-        if color_config.bit_depth != 8 {
-            return Err(DecodeError::UnsupportedBitDepth(color_config.bit_depth));
         }
 
         let header_size = header.header_size_in_bytes as usize;

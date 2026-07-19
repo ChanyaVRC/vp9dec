@@ -253,14 +253,9 @@ pub struct TileDecoder {
 impl TileDecoder {
     /// Builds a `TileDecoder` from the uncompressed and compressed headers.
     ///
-    /// # Panics
-    /// Panics if `color_config.bit_depth != 8`. Frame buffers for depths other than
-    /// 8bit (10bit/12bit) cannot be represented since [`Plane`] is fixed to `u8`.
-    /// The caller ([`crate::Decoder`]) must check `bit_depth` before calling
-    /// `TileDecoder::new`. `use_prev_frame_mvs`/`prev_mi_grid` are always
-    /// `false`/`None` (a simple constructor for key frames / M2 compatibility).
-    /// `prev_segment_ids` is seeded to all-zero (the "first frame" state of spec
-    /// §7.2.6), sized to this frame's `MiRows x MiCols`.
+    /// `use_prev_frame_mvs`/`prev_mi_grid` are always `false`/`None` (a simple constructor
+    /// for key frames / M2 compatibility). `prev_segment_ids` is seeded to all-zero (the
+    /// "first frame" state of spec §7.2.6), sized to this frame's `MiRows x MiCols`.
     pub fn new(
         header: &NewFrameHeader,
         color_config: ColorConfig,
@@ -303,10 +298,6 @@ impl TileDecoder {
         resolved_refs: [Option<Arc<RefFrameData>>; 3],
         prev_segment_ids: Arc<Vec<u8>>,
     ) -> Self {
-        assert_eq!(
-            color_config.bit_depth, 8,
-            "TileDecoder only supports 8bit frames"
-        );
         let image_size = header::compute_image_size(header.width, header.height);
         let grid_cols = (image_size.sb64_cols * 8) as usize;
         let grid_rows = (image_size.sb64_rows * 8) as usize;
@@ -420,6 +411,7 @@ impl TileDecoder {
             self.subsampling_y,
             lf,
             &self.segmentation,
+            self.bit_depth,
         );
     }
 

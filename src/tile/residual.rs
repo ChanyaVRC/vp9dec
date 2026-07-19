@@ -452,7 +452,7 @@ impl TileDecoder {
             for j in 0..n0 {
                 let old = self.planes[plane].get(start_x + j, start_y + i) as i64;
                 let new_val = (old + dequant[i * n0 + j]).clamp(0, max_val);
-                self.planes[plane].set(start_x + j, start_y + i, new_val as u8);
+                self.planes[plane].set(start_x + j, start_y + i, new_val as u16);
             }
         }
 

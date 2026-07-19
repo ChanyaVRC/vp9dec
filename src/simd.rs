@@ -39,8 +39,12 @@ pub fn avx2_enabled() -> bool {
 ///
 /// `w` must be a multiple of 8 (this processes 8 output columns per AVX2 lane group;
 /// width-4 blocks stay on the scalar path). `h <= MAX_BLOCK_DIM`,
-/// `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`, `bit_depth == 8` (the only
-/// supported depth -- see `lib.rs`'s `UnsupportedBitDepth` rejection).
+/// `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`, `bit_depth == 8` (the caller only
+/// dispatches here for 8-bit frames -- see `predict.rs`'s call site). `ref_data` is
+/// `Plane::as_slice()`'s `u16` buffer (every plane is `u16`-backed regardless of bit
+/// depth, see `framebuffer.rs`); at `bit_depth == 8` every sample is known to fit in
+/// `0..=255`, so widening `u16 -> i32` here is bit-exact with the scalar path's
+/// `u16 as i32`.
 ///
 /// # Safety
 /// The caller must have confirmed `avx2_enabled()` (this fn requires the `avx2` target
@@ -55,7 +59,7 @@ pub fn avx2_enabled() -> bool {
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn block_inter_predict_avx2(
-    ref_data: &[u8],
+    ref_data: &[u16],
     ref_width: usize,
     src_row0: i64,
     src_col0: i64,
@@ -101,11 +105,11 @@ pub unsafe fn block_inter_predict_avx2(
         while c < w {
             let mut acc = zero;
             for (t, &tap) in hcoeffs.iter().enumerate() {
-                // 8 bytes -> 8 x i32 (zero-extend, matching the scalar `.get(..) as i32`
-                // on a u8 sample); reads exactly the columns this chunk's 8 outputs need
-                // for this tap, no more (see the Safety section's bound).
-                let bytes = _mm_loadl_epi64(row_ptr.add(c + t) as *const __m128i);
-                let widened = _mm256_cvtepu8_epi32(bytes);
+                // 8 u16 samples -> 8 x i32 (zero-extend, matching the scalar `.get(..) as
+                // i32` on a u16 sample); reads exactly the columns this chunk's 8 outputs
+                // need for this tap, no more (see the Safety section's bound).
+                let vals = _mm_loadu_si128(row_ptr.add(c + t) as *const __m128i);
+                let widened = _mm256_cvtepu16_epi32(vals);
                 let coeff = _mm256_set1_epi32(tap);
                 acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(widened, coeff));
             }
@@ -150,7 +154,9 @@ pub unsafe fn block_inter_predict_avx2(
 /// Vertical edges (pass==0) and the rarer 16-tap "wide2" filter (`TX_16X16` positions) are
 /// not handled here; `loop_filter.rs`'s dispatch keeps those scalar.
 ///
-/// `plane_data`/`plane_width` is the raw row-major plane buffer (stride == `plane_width`).
+/// `plane_data`/`plane_width` is the raw row-major plane buffer (stride == `plane_width`,
+/// `u16`-backed regardless of bit depth -- see `framebuffer.rs`; the caller only dispatches
+/// here for `bit_depth == 8`, so every sample is known to fit in `0..=255`).
 /// `(x0, y0)` is lane 0's position (loop_filter.rs's `sample_filtering(x, y, ...)` for the
 /// first of the 8 lanes); the other 7 lanes are the next 7 contiguous columns
 /// `x0+1..=x0+7` at the same row `y0` (this orientation's along-edge axis -- see the
@@ -175,7 +181,7 @@ pub unsafe fn block_inter_predict_avx2(
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn loop_filter_horiz8_avx2(
-    plane_data: &mut [u8],
+    plane_data: &mut [u16],
     plane_width: usize,
     x0: usize,
     y0: usize,
@@ -187,12 +193,12 @@ pub unsafe fn loop_filter_horiz8_avx2(
 ) {
     let base = plane_data.as_mut_ptr();
 
-    // Loads 8 contiguous bytes (columns x0..x0+8) from row `y0 + dy`, widened to 8xi32 --
-    // one AVX2 lane per along-edge position, matching `get_off`'s `plane.get(x, y+k)` for
-    // pass==1 (`dx=0,dy=1`).
+    // Loads 8 contiguous u16 samples (columns x0..x0+8) from row `y0 + dy`, widened to
+    // 8xi32 -- one AVX2 lane per along-edge position, matching `get_off`'s
+    // `plane.get(x, y+k)` for pass==1 (`dx=0,dy=1`).
     let load_row = |dy: i64| -> __m256i {
         let row_ptr = base.offset(((y0 as i64 + dy) * plane_width as i64 + x0 as i64) as isize);
-        _mm256_cvtepu8_epi32(_mm_loadl_epi64(row_ptr as *const __m128i))
+        _mm256_cvtepu16_epi32(_mm_loadu_si128(row_ptr as *const __m128i))
     };
     let p3 = load_row(-4);
     let p2 = load_row(-3);
@@ -281,15 +287,14 @@ pub unsafe fn loop_filter_horiz8_avx2(
     );
 
     // Packs 8xi32 (each guaranteed in 0..=255: narrow's clamp4(..)+128 and wide8's
-    // round2(sum-of-8-pixel-values, 3) can't leave that range) down to 8 contiguous bytes
-    // and stores at row `y0 + dy`, columns x0..x0+8 -- the exact reverse of `load_row`.
+    // round2(sum-of-8-pixel-values, 3) can't leave that range) down to 8 contiguous u16
+    // samples and stores at row `y0 + dy`, columns x0..x0+8 -- the exact reverse of `load_row`.
     let store_row = |dy: i64, v: __m256i| {
         let lo = _mm256_castsi256_si128(v);
         let hi = _mm256_extracti128_si256(v, 1);
         let u16x8 = _mm_packus_epi32(lo, hi);
-        let u8x16 = _mm_packus_epi16(u16x8, u16x8);
         let row_ptr = base.offset(((y0 as i64 + dy) * plane_width as i64 + x0 as i64) as isize);
-        _mm_storel_epi64(row_ptr as *mut __m128i, u8x16);
+        _mm_storeu_si128(row_ptr as *mut __m128i, u16x8);
     };
 
     if no_tx8 {

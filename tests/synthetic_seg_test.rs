@@ -126,9 +126,10 @@ fn seg_lvl_skip_forces_exact_copy_without_residual_or_mv_bits() {
     // The key frame really is non-flat (see the module comment above this scenario for why
     // V_PRED/H_PRED rather than 4 distinct modes): confirms the pixel-exact check below isn't
     // vacuously comparing two uniform-grey frames.
+    let key_frame_y = key_frame.y.as_u8();
     for x in 0..WIDTH as usize {
-        assert_eq!(key_frame.y[x], 127, "row0");
-        assert_eq!(key_frame.y[8 * WIDTH as usize + x], 129, "row8");
+        assert_eq!(key_frame_y[x], 127, "row0");
+        assert_eq!(key_frame_y[8 * WIDTH as usize + x], 129, "row8");
     }
     // Proven: `read_skip` took the seg_feature_active(SEG_LVL_SKIP) forced-true path without
     // consuming a bit, `inter_block_mode_info` forced y_mode=ZEROMV without reading
@@ -252,7 +253,7 @@ fn seg_lvl_ref_frame_steers_to_the_specific_slot_not_just_last() {
     // Sanity: content A (the key frame, held by slot 0/LAST) really is flat 127 everywhere --
     // confirms the two slots hold genuinely different content, so the discriminator below isn't
     // vacuously comparing equal pixels.
-    for (i, &px) in key_frame.y.iter().enumerate() {
+    for (i, &px) in key_frame.y.as_u8().iter().enumerate() {
         assert_eq!(
             px, 127,
             "key frame (slot 0/LAST) must be flat A; Y pixel {i}"
@@ -262,7 +263,7 @@ fn seg_lvl_ref_frame_steers_to_the_specific_slot_not_just_last() {
     // (physical slot 1 = B = 129), not to LAST's slot (physical slot 0 = A = 127), in *every*
     // block -- a decoder that ignored FeatureData, or resolved the wrong slot for only some
     // blocks (e.g. a ctx- or position-dependent fallback), would leave 127 somewhere.
-    for (i, &px) in inter_frame.y.iter().enumerate() {
+    for (i, &px) in inter_frame.y.as_u8().iter().enumerate() {
         assert_eq!(
             px, 129,
             "SEG_LVL_REF_FRAME=GOLDEN must copy slot 1's content (B) everywhere; Y pixel {i}"
@@ -288,7 +289,7 @@ fn seg_lvl_ref_frame_steers_to_the_specific_slot_not_just_last() {
     )
     .frame
     .expect("companion has show_frame = 1");
-    for (i, &px) in last_steered.y.iter().enumerate() {
+    for (i, &px) in last_steered.y.as_u8().iter().enumerate() {
         assert_eq!(
             px, 127,
             "LAST-steered companion must copy slot 0's content (A); Y pixel {i}"
@@ -369,45 +370,47 @@ fn seg_lvl_alt_l_loop_filter_level_change_is_observable() {
     // filter targets, not a real edge it's designed to preserve), and lvl > 0 only when
     // `alt_l_level == 63` (segment 1's absolute override), so the level-0 decode leaves the
     // rows untouched instead.
+    let unfiltered_y = unfiltered.y.as_u8();
+    let filtered_y = filtered.y.as_u8();
     for x in 0..WIDTH as usize {
         assert_eq!(
-            unfiltered.y[5 * WIDTH as usize + x],
+            unfiltered_y[5 * WIDTH as usize + x],
             127,
             "row5 (untouched by either level)"
         );
         assert_eq!(
-            unfiltered.y[7 * WIDTH as usize + x],
+            unfiltered_y[7 * WIDTH as usize + x],
             127,
             "row7, alt_l=0: unfiltered"
         );
         assert_eq!(
-            unfiltered.y[8 * WIDTH as usize + x],
+            unfiltered_y[8 * WIDTH as usize + x],
             129,
             "row8, alt_l=0: unfiltered"
         );
         assert_eq!(
-            unfiltered.y[10 * WIDTH as usize + x],
+            unfiltered_y[10 * WIDTH as usize + x],
             129,
             "row10 (untouched by either level)"
         );
 
         assert_eq!(
-            filtered.y[6 * WIDTH as usize + x],
+            filtered_y[6 * WIDTH as usize + x],
             128,
             "row6, alt_l=63: filtered"
         );
         assert_eq!(
-            filtered.y[7 * WIDTH as usize + x],
+            filtered_y[7 * WIDTH as usize + x],
             128,
             "row7, alt_l=63: filtered"
         );
         assert_eq!(
-            filtered.y[8 * WIDTH as usize + x],
+            filtered_y[8 * WIDTH as usize + x],
             128,
             "row8, alt_l=63: filtered"
         );
         assert_eq!(
-            filtered.y[9 * WIDTH as usize + x],
+            filtered_y[9 * WIDTH as usize + x],
             128,
             "row9, alt_l=63: filtered"
         );
@@ -415,12 +418,12 @@ fn seg_lvl_alt_l_loop_filter_level_change_is_observable() {
         // that the level-63 decode touched *only* the edge (a wide/flat-filter mis-selection
         // regression would pull these toward 128 too).
         assert_eq!(
-            filtered.y[5 * WIDTH as usize + x],
+            filtered_y[5 * WIDTH as usize + x],
             127,
             "row5, alt_l=63: must stay untouched"
         );
         assert_eq!(
-            filtered.y[10 * WIDTH as usize + x],
+            filtered_y[10 * WIDTH as usize + x],
             129,
             "row10, alt_l=63: must stay untouched"
         );
@@ -474,14 +477,15 @@ fn loop_filter_level_zero_skips_filtering_despite_nonzero_ref_delta() {
     // instead of 63 (the narrow filter's output magnitude doesn't scale with lvl once the
     // filter_mask/flat_mask gates pass) -- so seeing 127/129 here can only mean the whole
     // process was skipped per spec §8.1 step 2, not that it ran and produced a no-op delta.
+    let frame_y = frame.y.as_u8();
     for x in 0..WIDTH as usize {
         assert_eq!(
-            frame.y[7 * WIDTH as usize + x],
+            frame_y[7 * WIDTH as usize + x],
             127,
             "row7: must stay unfiltered"
         );
         assert_eq!(
-            frame.y[8 * WIDTH as usize + x],
+            frame_y[8 * WIDTH as usize + x],
             129,
             "row8: must stay unfiltered"
         );
@@ -543,9 +547,9 @@ fn dump_synthetic_ivf_for_external_cross_decode() {
         for frame in &frames {
             for df in decoder.decode_frame(frame).expect("frame should decode") {
                 if let Some(decoded) = df.frame {
-                    yuv.extend_from_slice(&decoded.y);
-                    yuv.extend_from_slice(&decoded.u);
-                    yuv.extend_from_slice(&decoded.v);
+                    yuv.extend_from_slice(decoded.y.as_u8());
+                    yuv.extend_from_slice(decoded.u.as_u8());
+                    yuv.extend_from_slice(decoded.v.as_u8());
                     shown_count += 1;
                 }
             }
@@ -666,9 +670,9 @@ fn synthetic_streams_cross_decode_against_ffmpeg() {
                 if let Some(decoded) = df.frame {
                     let mut i420 =
                         Vec::with_capacity(decoded.y.len() + decoded.u.len() + decoded.v.len());
-                    i420.extend_from_slice(&decoded.y);
-                    i420.extend_from_slice(&decoded.u);
-                    i420.extend_from_slice(&decoded.v);
+                    i420.extend_from_slice(decoded.y.as_u8());
+                    i420.extend_from_slice(decoded.u.as_u8());
+                    i420.extend_from_slice(decoded.v.as_u8());
                     shown.push((idx, i420));
                 }
             }

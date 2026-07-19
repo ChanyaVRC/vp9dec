@@ -16,7 +16,7 @@ pub mod md5;
 use std::path::{Path, PathBuf};
 
 use vp9dec::ivf::{IvfHeader, IvfReader};
-use vp9dec::Frame;
+use vp9dec::{Frame, PlaneData};
 
 /// `tests/vectors/`, where downloaded conformance vectors live (see README.md).
 pub fn vectors_dir() -> PathBuf {
@@ -91,11 +91,25 @@ pub fn first_ivf_frame(bytes: &[u8]) -> (IvfHeader, &[u8]) {
     (ivf_header, first_frame.data)
 }
 
+/// Appends one plane's samples to `out` in the layout libvpx's `.ivf.md5` uses: `U8` samples
+/// as-is, `U16` samples (10/12-bit) as 2 little-endian bytes each (libvpx's high-bit-depth
+/// raw/MD5 output is 16-bit LE).
+fn push_plane_bytes(out: &mut Vec<u8>, data: &PlaneData) {
+    match data {
+        PlaneData::U8(v) => out.extend_from_slice(v),
+        PlaneData::U16(v) => {
+            for &sample in v {
+                out.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+    }
+}
+
 /// The `Frame`'s I420 bytes concatenated in Y->U->V order (the layout `.ivf.md5` files use).
 pub fn i420_bytes(frame: &Frame) -> Vec<u8> {
-    let mut out = Vec::with_capacity(frame.y.len() + frame.u.len() + frame.v.len());
-    out.extend_from_slice(&frame.y);
-    out.extend_from_slice(&frame.u);
-    out.extend_from_slice(&frame.v);
+    let mut out = Vec::new();
+    push_plane_bytes(&mut out, &frame.y);
+    push_plane_bytes(&mut out, &frame.u);
+    push_plane_bytes(&mut out, &frame.v);
     out
 }

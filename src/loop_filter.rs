@@ -108,8 +108,10 @@ fn build_lvl_lookup(lf: &LoopFilterParams, seg: &SegmentationParams) -> LvlLooku
 
 /// The `limit`/`blimit`/`thresh` computation from spec §8.8.4 "Adaptive
 /// filter strength process". (`lvl` is looked up from `LvlLookup` by the
-/// caller and passed in.)
-fn adaptive_filter_strength(lvl: i32, sharpness: u8) -> (i32, i32, i32) {
+/// caller and passed in.) The result is scaled by `<< (bit_depth - 8)` (identity at
+/// `bit_depth == 8`) since these three values are compared directly against pixel
+/// differences, which widen by the same factor at higher bit depths.
+fn adaptive_filter_strength(lvl: i32, sharpness: u8, bit_depth: u8) -> (i32, i32, i32) {
     let shift = if sharpness > 4 {
         2
     } else if sharpness > 0 {
@@ -124,7 +126,12 @@ fn adaptive_filter_strength(lvl: i32, sharpness: u8) -> (i32, i32, i32) {
     };
     let blimit = 2 * (lvl + 2) + limit;
     let thresh = lvl >> 4;
-    (limit, blimit, thresh)
+    let depth_shift = (bit_depth - 8) as u32;
+    (
+        limit << depth_shift,
+        blimit << depth_shift,
+        thresh << depth_shift,
+    )
 }
 
 /// Spec §8.8.3 "Filter size process".
@@ -167,19 +174,15 @@ fn get_off(plane: &Plane, x: usize, y: usize, dx: i64, dy: i64, k: i64) -> i32 {
 
 #[inline]
 fn set_off(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, k: i64, v: i32) {
-    debug_assert!(
-        (0..=255).contains(&v),
-        "loop filter output out of 8bit range: {v}"
-    );
     let px = (x as i64 + dx * k) as usize;
     let py = (y as i64 + dy * k) as usize;
-    plane.set(px, py, v as u8);
+    plane.set(px, py, v as u16);
 }
 
 /// Spec §8.8.5.1 "Filter mask process". Returns `(hevMask, filterMask, flatMask, flatMask2)`.
-/// Since `BitDepth == 8` is fixed (this decoder only supports 8bit, see
-/// `DecodeError::UnsupportedBitDepth`), the spec's bit-depth scaling via `<< (BitDepth - 8)`
-/// is omitted as an identity operation (shift amount 0).
+/// `limit`/`blimit`/`thresh` arrive already scaled by `<< (bit_depth - 8)` (see
+/// `adaptive_filter_strength`); the flat-mask threshold (fixed at `1` in the spec's 8-bit
+/// text) is scaled here the same way.
 #[allow(clippy::too_many_arguments)]
 fn compute_filter_mask(
     plane: &Plane,
@@ -191,6 +194,7 @@ fn compute_filter_mask(
     blimit: i32,
     thresh: i32,
     filter_size: u8,
+    bit_depth: u8,
 ) -> (bool, bool, bool, bool) {
     let g = |k: i64| get_off(plane, x, y, dx, dy, k);
     let q0 = g(0);
@@ -213,15 +217,16 @@ fn compute_filter_mask(
     mask |= (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > blimit;
     let filter_mask = !mask;
 
+    let threshold = 1i32 << (bit_depth - 8);
+
     let mut flat_mask = false;
     if filter_size >= TX_8X8 {
-        const THRESHOLD: i32 = 1;
-        let mut m = (p1 - p0).abs() > THRESHOLD;
-        m |= (q1 - q0).abs() > THRESHOLD;
-        m |= (p2 - p0).abs() > THRESHOLD;
-        m |= (q2 - q0).abs() > THRESHOLD;
-        m |= (p3 - p0).abs() > THRESHOLD;
-        m |= (q3 - q0).abs() > THRESHOLD;
+        let mut m = (p1 - p0).abs() > threshold;
+        m |= (q1 - q0).abs() > threshold;
+        m |= (p2 - p0).abs() > threshold;
+        m |= (q2 - q0).abs() > threshold;
+        m |= (p3 - p0).abs() > threshold;
+        m |= (q3 - q0).abs() > threshold;
         flat_mask = !m;
     }
 
@@ -235,49 +240,61 @@ fn compute_filter_mask(
         let p5 = g(-6);
         let p6 = g(-7);
         let p7 = g(-8);
-        const THRESHOLD: i32 = 1;
-        let mut m = (p7 - p0).abs() > THRESHOLD;
-        m |= (q7 - q0).abs() > THRESHOLD;
-        m |= (p6 - p0).abs() > THRESHOLD;
-        m |= (q6 - q0).abs() > THRESHOLD;
-        m |= (p5 - p0).abs() > THRESHOLD;
-        m |= (q5 - q0).abs() > THRESHOLD;
-        m |= (p4 - p0).abs() > THRESHOLD;
-        m |= (q4 - q0).abs() > THRESHOLD;
+        let mut m = (p7 - p0).abs() > threshold;
+        m |= (q7 - q0).abs() > threshold;
+        m |= (p6 - p0).abs() > threshold;
+        m |= (q6 - q0).abs() > threshold;
+        m |= (p5 - p0).abs() > threshold;
+        m |= (q5 - q0).abs() > threshold;
+        m |= (p4 - p0).abs() > threshold;
+        m |= (q4 - q0).abs() > threshold;
         flat_mask2 = !m;
     }
 
     (hev_mask, filter_mask, flat_mask, flat_mask2)
 }
 
-/// Spec §8.8.5.2 "Narrow filter process" (`filter4`). `BitDepth == 8` fixed.
-fn narrow_filter(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, hev_mask: bool) {
-    let clamp4 = |v: i32| clip3(-128, 127, v);
+/// Spec §8.8.5.2 "Narrow filter process" (`filter4`). The `0x80` base and the `clamp4`
+/// range scale by bit depth (spec §8.8.5.2's `Round2(1, BitDepth-1)`-style base and the
+/// `<< (BitDepth - 8)` clamp range); both are identity at `bit_depth == 8`.
+fn narrow_filter(
+    plane: &mut Plane,
+    x: usize,
+    y: usize,
+    dx: i64,
+    dy: i64,
+    hev_mask: bool,
+    bit_depth: u8,
+) {
+    let half = 1i32 << (bit_depth - 1);
+    let clamp_hi = (128i32 << (bit_depth - 8)) - 1;
+    let clamp_lo = -(clamp_hi + 1);
+    let clamp4 = |v: i32| clip3(clamp_lo, clamp_hi, v);
 
     let q0 = get_off(plane, x, y, dx, dy, 0);
     let q1 = get_off(plane, x, y, dx, dy, 1);
     let p0 = get_off(plane, x, y, dx, dy, -1);
     let p1 = get_off(plane, x, y, dx, dy, -2);
 
-    let ps1 = p1 - 0x80;
-    let ps0 = p0 - 0x80;
-    let qs0 = q0 - 0x80;
-    let qs1 = q1 - 0x80;
+    let ps1 = p1 - half;
+    let ps0 = p0 - half;
+    let qs0 = q0 - half;
+    let qs1 = q1 - half;
 
     let mut filter = if hev_mask { clamp4(ps1 - qs1) } else { 0 };
     filter = clamp4(filter + 3 * (qs0 - ps0));
     let filter1 = clamp4(filter + 4) >> 3;
     let filter2 = clamp4(filter + 3) >> 3;
 
-    let oq0 = clamp4(qs0 - filter1) + 0x80;
-    let op0 = clamp4(ps0 + filter2) + 0x80;
+    let oq0 = clamp4(qs0 - filter1) + half;
+    let op0 = clamp4(ps0 + filter2) + half;
     set_off(plane, x, y, dx, dy, 0, oq0);
     set_off(plane, x, y, dx, dy, -1, op0);
 
     if !hev_mask {
         let filter = round2(filter1, 1);
-        let oq1 = clamp4(qs1 - filter) + 0x80;
-        let op1 = clamp4(ps1 + filter) + 0x80;
+        let oq1 = clamp4(qs1 - filter) + half;
+        let op1 = clamp4(ps1 + filter) + half;
         set_off(plane, x, y, dx, dy, 1, oq1);
         set_off(plane, x, y, dx, dy, -2, op1);
     }
@@ -321,15 +338,26 @@ fn sample_filtering(
     blimit: i32,
     thresh: i32,
     filter_size: u8,
+    bit_depth: u8,
 ) {
-    let (hev_mask, filter_mask, flat_mask, flat_mask2) =
-        compute_filter_mask(plane, x, y, dx, dy, limit, blimit, thresh, filter_size);
+    let (hev_mask, filter_mask, flat_mask, flat_mask2) = compute_filter_mask(
+        plane,
+        x,
+        y,
+        dx,
+        dy,
+        limit,
+        blimit,
+        thresh,
+        filter_size,
+        bit_depth,
+    );
 
     if !filter_mask {
         return;
     }
     if filter_size == TX_4X4 || !flat_mask {
-        narrow_filter(plane, x, y, dx, dy, hev_mask);
+        narrow_filter(plane, x, y, dx, dy, hev_mask, bit_depth);
     } else if filter_size == TX_8X8 || !flat_mask2 {
         wide_filter(plane, x, y, dx, dy, 3);
     } else {
@@ -434,6 +462,7 @@ fn superblock_loop_filter(
     pass: u32,
     row: u32,
     col: u32,
+    bit_depth: u8,
 ) {
     let (sub_x, sub_y) = if plane_idx == 0 {
         (0u32, 0u32)
@@ -453,9 +482,11 @@ fn superblock_loop_filter(
         // contiguous in memory for this orientation, see docs/implementation-notes.md
         // "SIMD wave 3". Vertical edges (pass==0) stay on the scalar loop below (along-edge
         // there is consecutive ROWS, i.e. strided by the plane stride, not a natural AVX2
-        // fit without a byte gather).
+        // fit without a byte gather). Also gated on `bit_depth == 8`: the kernel's constants
+        // (128, +/-128, flat threshold 1) are only valid at that depth -- 10/12-bit frames
+        // always take the scalar path below, which scales those constants itself.
         #[cfg(target_arch = "x86_64")]
-        if pass == 1 && crate::simd::avx2_enabled() {
+        if pass == 1 && bit_depth == 8 && crate::simd::avx2_enabled() {
             superblock_loop_filter_horiz_edge_avx2(
                 planes,
                 mi_grid,
@@ -500,7 +531,7 @@ fn superblock_loop_filter(
             );
 
             if apply_filter && lvl > 0 {
-                let (limit, blimit, thresh) = adaptive_filter_strength(lvl, sharpness);
+                let (limit, blimit, thresh) = adaptive_filter_strength(lvl, sharpness, bit_depth);
                 sample_filtering(
                     &mut planes[plane_idx],
                     (x >> sub_x) as usize,
@@ -511,6 +542,7 @@ fn superblock_loop_filter(
                     blimit,
                     thresh,
                     filter_size,
+                    bit_depth,
                 );
             }
         }
@@ -589,8 +621,10 @@ fn superblock_loop_filter_horiz_edge_avx2(
             if apply_filter && lvl > 0 {
                 if filter_size == TX_16X16 {
                     // Rare 16-tap ("wide2") case: unchanged scalar path, not part of this
-                    // wave's SIMD scope.
-                    let (l, bl, th) = adaptive_filter_strength(lvl, sharpness);
+                    // wave's SIMD scope. bit_depth is hardcoded to 8 here: the caller
+                    // (`superblock_loop_filter`) only reaches this whole function under its
+                    // own `bit_depth == 8` gate.
+                    let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, 8);
                     sample_filtering(
                         &mut planes[plane_idx],
                         px,
@@ -601,11 +635,12 @@ fn superblock_loop_filter_horiz_edge_avx2(
                         bl,
                         th,
                         filter_size,
+                        8,
                     );
                 } else {
                     eligible[lane as usize] = -1;
                     is_tx8[lane as usize] = -((filter_size == TX_8X8) as i32);
-                    let (l, bl, th) = adaptive_filter_strength(lvl, sharpness);
+                    let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, 8);
                     limit[lane as usize] = l;
                     blimit[lane as usize] = bl;
                     thresh[lane as usize] = th;
@@ -659,6 +694,7 @@ pub fn loop_filter_frame(
     subsampling_y: u32,
     lf: &LoopFilterParams,
     seg: &SegmentationParams,
+    bit_depth: u8,
 ) {
     let lvl_lookup = build_lvl_lookup(lf, seg);
 
@@ -681,6 +717,7 @@ pub fn loop_filter_frame(
                         pass,
                         row,
                         col,
+                        bit_depth,
                     );
                 }
             }
@@ -796,7 +833,7 @@ mod tests {
 
     #[test]
     fn adaptive_filter_strength_zero_sharpness() {
-        let (limit, blimit, thresh) = adaptive_filter_strength(20, 0);
+        let (limit, blimit, thresh) = adaptive_filter_strength(20, 0, 8);
         assert_eq!(limit, 20);
         assert_eq!(blimit, 2 * (20 + 2) + 20);
         assert_eq!(thresh, 20 >> 4);
@@ -809,7 +846,7 @@ mod tests {
         for x in 0..8 {
             p.set(x, 0, 128);
         }
-        narrow_filter(&mut p, 4, 0, 1, 0, false);
+        narrow_filter(&mut p, 4, 0, 1, 0, false, 8);
         for x in 0..8 {
             assert_eq!(p.get(x, 0), 128);
         }
@@ -854,7 +891,7 @@ mod tests {
             let mut plane_scalar = Plane::new(width, height);
             for y in 0..height {
                 for x in 0..width {
-                    plane_scalar.set(x, y, (xorshift32(&mut seed) & 0xFF) as u8);
+                    plane_scalar.set(x, y, (xorshift32(&mut seed) & 0xFF) as u16);
                 }
             }
             let mut plane_simd = plane_scalar.clone();
@@ -888,6 +925,7 @@ mod tests {
                         blimit[lane],
                         thresh[lane],
                         filter_size,
+                        8,
                     );
                 }
             }

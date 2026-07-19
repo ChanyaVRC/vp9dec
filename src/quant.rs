@@ -6,8 +6,7 @@
 //! `dc_qlookup` / `ac_qlookup` are 256-entry lookup tables per BitDepth
 //! (8bit / 10bit / 12bit), used to derive the actual quantization step value
 //! from a quantization index `b` (0..=255). This module transcribes all 3
-//! profiles exactly as listed in the spec, but as of the M2 milestone this
-//! decoder targets, only 8bit (`bit_depth == 8`) is expected to be used.
+//! profiles exactly as listed in the spec.
 
 use crate::header::{SegmentationParams, SEG_LVL_ALT_Q};
 

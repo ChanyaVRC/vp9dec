@@ -222,12 +222,12 @@ struct YStats {
 }
 
 fn y_stats(frame: &Frame) -> YStats {
-    let min = *frame.y.iter().min().expect("non-empty Y plane");
-    let max = *frame.y.iter().max().expect("non-empty Y plane");
-    let n = frame.y.len() as f64;
-    let mean = frame.y.iter().map(|&v| v as f64).sum::<f64>() / n;
-    let variance = frame
-        .y
+    let y = frame.y.as_u8();
+    let min = *y.iter().min().expect("non-empty Y plane");
+    let max = *y.iter().max().expect("non-empty Y plane");
+    let n = y.len() as f64;
+    let mean = y.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let variance = y
         .iter()
         .map(|&v| {
             let d = v as f64 - mean;
