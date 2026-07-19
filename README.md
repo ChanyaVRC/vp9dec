@@ -33,14 +33,15 @@ is consulted (clean-room implementation).
 - `DecodedFrame { info: Option<FrameDecodeInfo>, frame: Option<Frame> }`: `info` is `None` only
   for a `show_existing_frame` chunk (no uncompressed header is parsed on that path); `frame` is
   `None` for a hidden frame (`show_frame == 0`).
-- `Frame { width, height, y, u, v }`: one decoded picture, cropped to display size, as row-major
-  YUV420 `Vec<u8>` planes.
+- `Frame { width, height, bit_depth, subsampling_x, subsampling_y, y, u, v }`: one decoded
+  picture, cropped to display size. Each plane is a `PlaneData` (`enum { U8(Vec<u8>),
+  U16(Vec<u16>) }`, row-major): 8-bit streams decode to `U8`, 10/12-bit (profile 2/3) to `U16`.
 - `FrameDecodeInfo`: read-only per-frame decode statistics (`intra_only`, `frame_is_intra`,
   `reset_frame_context`, `segmentation_enabled`, `seg_features_active`) for observation only
   (e.g. test assertions that a stream actually exercised a given decode path) -- has no effect
   on decode behavior.
 - `DecodeError`: `Header`/`CompressedHeader`/`Tile` (wrapping the corresponding parse-layer
-  error), `TruncatedFrame`, `UnsupportedBitDepth(u8)`, `MissingReferenceFrame`.
+  error), `TruncatedFrame`, `MissingReferenceFrame`.
 - `ivf`: the only other module in the public surface. `IvfReader`/`IvfHeader`/`IvfFrame`/
   `IvfError` for reading an IVF container, and `write_ivf(fourcc, width, height,
   timebase_den, timebase_num, frames) -> Vec<u8>` (the inverse), used by
@@ -118,7 +119,7 @@ vectors (`vp91-2-04-yuv{422,440,444}`, `vp92-2-20-{10,12}bit-yuv420`,
 `vp93-2-20-{10,12}bit-yuv{422,440,444}`), both with SIMD enabled and forced scalar. To reproduce: fetch the corpus with
 `scripts/fetch-vectors.{sh,ps1}`, then run the sweep harness --
 `RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_sweep --
---ignored --nocapture`. The sweep surfaced two decoder bugs, both fixed (full analyses in
+--nocapture`. The sweep surfaced two decoder bugs, both fixed (full analyses in
 [docs/implementation-notes.md](docs/implementation-notes.md), "M4 wave 2" / "M4 wave 3"):
 
 - The loop filter ran even when the frame-level `loop_filter_level` is 0; spec §8.1 gates the
@@ -144,7 +145,7 @@ vectors (`vp91-2-04-yuv{422,440,444}`, `vp92-2-20-{10,12}bit-yuv420`,
 | Limit | Detail |
 | --- | --- |
 | No SIMD for 10/12-bit or the scaled inter path | The AVX2 kernels (`src/simd.rs`) cover 8-bit unscaled inter prediction and 8-bit horizontal loop-filter edges; 10/12-bit, reference-scaling, and vertical loop-filter edges use the (correct, bit-exact) scalar path. High-bit-depth content is rare, so this is a perf gap only, tracked in `docs/backlog.md` P1. |
-| 19 corpus clips ship no upstream `.md5` | The 7 `vp90-2-bbb_*` and 12 `vp90-2-tos_*`/`vp90-2-sintel_*` movie clips ship only a `.webm` upstream (no `.md5` -- libvpx uses them for its own perf tests, not md5 conformance), so the sweep cannot MD5-check them; the fetch scripts still download/remux them, and they are excluded from the sweep's 304. The 12 tos/sintel clips (full-length movies, up to 1920x800, real-content 1x2/1x4 tile columns + frame-parallel) were instead cross-checked once against ffmpeg's `libvpx-vp9` per-frame MD5s: all 268,832 displayed frames byte-identical (see docs/implementation-notes.md "M4 final wave") |
+| 19 corpus clips ship no upstream `.md5` | The 7 `vp90-2-bbb_*` and 12 `vp90-2-tos_*`/`vp90-2-sintel_*` movie clips ship only a `.webm` upstream (no `.md5` -- libvpx uses them for its own perf tests, not md5 conformance), so the sweep cannot MD5-check them; the fetch scripts still download/remux them, and they are excluded from the sweep's 315. The 12 tos/sintel clips (full-length movies, up to 1920x800, real-content 1x2/1x4 tile columns + frame-parallel) were instead cross-checked once against ffmpeg's `libvpx-vp9` per-frame MD5s: all 268,832 displayed frames byte-identical (see docs/implementation-notes.md "M4 final wave") |
 
 ## Tests & verification
 
@@ -156,7 +157,7 @@ cargo fmt --check
 
 `cargo test` runs 8 binaries: the library's own unit tests (`src/`, colocated `#[cfg(test)]
 mod tests` next to the code they check), `tests/api_test.rs`, `tests/conformance_test.rs`,
-`tests/sweep_test.rs` (whose one test is `#[ignore]`d -- see below), `tests/synthetic_seg_test.rs`,
+`tests/sweep_test.rs` (whose one test runs only in a release build with the full corpus present -- see below), `tests/synthetic_seg_test.rs`,
 `tests/synthetic_superframe_test.rs`, the `decode_to_png` example's own `#[cfg(test)]` tests
 (PNG/CRC32/Adler32 encoding checks), and the (currently empty) doc-tests.
 
@@ -169,13 +170,14 @@ mod tests` next to the code they check), `tests/api_test.rs`, `tests/conformance
   `FrameDecodeInfo`) confirming the vector actually exercises the decode path it's meant to
   prove, not just that the output happens to match; also carries the from-scratch MD5 (RFC
   1321) implementation's own unit tests (`mod md5_tests`).
-- **`tests/sweep_test.rs`**: the full-corpus sweep behind the 304/304 result in the status
+- **`tests/sweep_test.rs`**: the full-corpus sweep behind the 315/315 result in the status
   section -- decodes every `tests/vectors/*.ivf` that has a matching `.ivf.md5` and MD5-checks
   every displayed frame, collecting all failures (with per-vector reasons written to
-  `target/sweep-report.txt`) instead of stopping at the first. `#[ignore]`d because it needs
-  the downloaded corpus and a release build; run it explicitly:
+  `target/sweep-report.txt`) instead of stopping at the first. It runs only in a release build
+  with the full corpus present (a debug build or partial checkout skips cleanly, keeping routine
+  `cargo test` fast); run it explicitly:
   `RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_sweep --
-  --ignored --nocapture`.
+  --nocapture`.
 - **`tests/synthetic_superframe_test.rs`**: pins the superframe display-output policy (only
   the last constituent of a multi-shown superframe is display output; a single-frame chunk is
   unaffected) with self-built two-keyframe superframes.
