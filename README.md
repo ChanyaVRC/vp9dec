@@ -264,10 +264,10 @@ cargo run --example decode_to_png -- vp90-2-12-droppable_1 50
 
 ## History
 
-For the milestone-by-milestone build narrative (M1 through M3 second half) this section used
-to contain, see [docs/history.md](docs/history.md). For dated design decisions, tradeoffs, and
-fixes made along the way (including the six design-debt waves that produced the architecture
-described above), see [docs/implementation-notes.md](docs/implementation-notes.md).
+[docs/history.md](docs/history.md) is a concise milestone-by-milestone record of how the
+decoder was built (M1 through profiles 1-3). Still-relevant design rationale, landmines, and
+known gaps are in [docs/implementation-notes.md](docs/implementation-notes.md); the detailed,
+change-by-change history is in the git log.
 
 ## License
 

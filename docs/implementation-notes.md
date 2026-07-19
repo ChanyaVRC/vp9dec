@@ -4,8 +4,8 @@ Still-relevant, non-obvious design rationale, landmines, and known gaps — the 
 aren't clear from the code, the spec, or `README.md` (which holds the architecture and module
 map). **Keep this concise.** Once an issue is resolved and the current behavior is captured
 here, the blow-by-blow (root-cause analyses, per-change verification logs, the wave-by-wave
-build narrative) belongs in git history and `docs/history.md`, not here. A resolved bug needs
-no entry.
+build narrative) belongs in the git log; `docs/history.md` keeps only a concise milestone
+overview. A resolved bug needs no entry.
 
 ## Current state
 
