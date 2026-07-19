@@ -104,15 +104,18 @@ The decode pipeline, roughly in the order data flows through it:
 
 ### Current decode support
 
-8-bit (`BitDepth == 8`) key frames, intra-only frames, and inter frames, 4:2:0 chroma
-subsampling, profile 0. Full segmentation (segment-id decode including temporal prediction,
-and all four `SEG_LVL_*` features), superframes, and `show_existing_frame` are all supported.
+**All four VP9 profiles**: 8/10/12-bit depth and 4:2:0 / 4:2:2 / 4:4:0 / 4:4:4 chroma
+subsampling. Key frames, intra-only frames, and inter frames; full segmentation (segment-id
+decode including temporal prediction, and all four `SEG_LVL_*` features); superframes;
+`show_existing_frame`. 10/12-bit output is exposed via `PlaneData::U16` on the decoded `Frame`.
 See the status table below for what's verified against an external oracle vs. unit-test-only.
 
 ## Status / limitations
 
-M4 (full official-vector sweep) is complete: **304/304 MD5-checkable vectors in the official
-libvpx `vp90-2-*` conformance corpus decode bit-exact**. To reproduce: fetch the corpus with
+The full official-vector sweep is complete across all profiles: **315/315 MD5-checkable
+vectors decode bit-exact** -- the 304 `vp90-2-*` (profile 0) corpus plus the profile 1/2/3
+vectors (`vp91-2-04-yuv{422,440,444}`, `vp92-2-20-{10,12}bit-yuv420`,
+`vp93-2-20-{10,12}bit-yuv{422,440,444}`), both with SIMD enabled and forced scalar. To reproduce: fetch the corpus with
 `scripts/fetch-vectors.{sh,ps1}`, then run the sweep harness --
 `RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_sweep --
 --ignored --nocapture`. The sweep surfaced two decoder bugs, both fixed (full analyses in
@@ -129,7 +132,8 @@ libvpx `vp90-2-*` conformance corpus decode bit-exact**. To reproduce: fetch the
 
 | Area | Evidence |
 | --- | --- |
-| Key frame + inter frame decode, motion compensation, probability adaptation, DPB, loop filter, tiles (1x1 through 4x4), superframes, `show_existing_frame`, frame-parallel-mode streams, mid-stream resize, intra-only frames, SVC | The full official sweep: 304/304 vectors, every displayed frame bit-exact against the official `.ivf.md5` |
+| Key frame + inter frame decode, motion compensation, probability adaptation, DPB, loop filter, tiles (1x1 through 4x4), superframes, `show_existing_frame`, frame-parallel-mode streams, mid-stream resize, intra-only frames, SVC | The full official sweep: 315/315 vectors, every displayed frame bit-exact against the official `.ivf.md5` |
+| All four profiles: 8/10/12-bit depth, 4:2:0 / 4:2:2 / 4:4:0 / 4:4:4 subsampling | The profile 1/2/3 official vectors (`vp91-2-04-yuv{422,440,444}`, `vp92-2-20-{10,12}bit-yuv420`, `vp93-2-20-{10,12}bit-yuv{422,440,444}`) all decode bit-exact in the sweep (10/12-bit MD5 over the 16-bit LE output, per libvpx convention) |
 | Reference-frame scaling (spec §8.5.2.3, a reference whose size differs from the current frame) | Verified end-to-end by the sweep: the SVC vectors (`vp90-2-22-svc_1280x720_*`, 2:1 inter-layer scaling), the resize families (`vp90-2-05/14/18/21-*resize*`, scaling across mid-stream size changes), and `vp90-2-13-largescaling` all decode bit-exact |
 | Segmentation: seg-id decode, `SEG_LVL_ALT_Q` | Included in the `vp90-2-15-segkey*` bit-exact matches in the sweep |
 | Segmentation: `SEG_LVL_ALT_L`, `SEG_LVL_REF_FRAME`, `SEG_LVL_SKIP` (no official vector exists for these -- see below) | Synthetic round-trip vectors (`tests/synthetic_seg_test.rs`) cross-decoded byte-identically by two independent third-party VP9 decoders (ffmpeg's `libvpx-vp9` and its native `vp9`), 8/8 `[xdecode]` checks (4 scenarios x 2 decoders) |
@@ -139,7 +143,7 @@ libvpx `vp90-2-*` conformance corpus decode bit-exact**. To reproduce: fetch the
 
 | Limit | Detail |
 | --- | --- |
-| 8-bit only | `Plane` (`src/framebuffer.rs`) is fixed to `u8`; a 10-bit/12-bit stream returns `DecodeError::UnsupportedBitDepth` rather than decoding |
+| No SIMD for 10/12-bit or the scaled inter path | The AVX2 kernels (`src/simd.rs`) cover 8-bit unscaled inter prediction and 8-bit horizontal loop-filter edges; 10/12-bit, reference-scaling, and vertical loop-filter edges use the (correct, bit-exact) scalar path. High-bit-depth content is rare, so this is a perf gap only, tracked in `docs/backlog.md` P1. |
 | 19 corpus clips ship no upstream `.md5` | The 7 `vp90-2-bbb_*` and 12 `vp90-2-tos_*`/`vp90-2-sintel_*` movie clips ship only a `.webm` upstream (no `.md5` -- libvpx uses them for its own perf tests, not md5 conformance), so the sweep cannot MD5-check them; the fetch scripts still download/remux them, and they are excluded from the sweep's 304. The 12 tos/sintel clips (full-length movies, up to 1920x800, real-content 1x2/1x4 tile columns + frame-parallel) were instead cross-checked once against ffmpeg's `libvpx-vp9` per-frame MD5s: all 268,832 displayed frames byte-identical (see docs/implementation-notes.md "M4 final wave") |
 
 ## Tests & verification

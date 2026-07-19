@@ -44,21 +44,18 @@ this crate's API, run Noiria's `cargo check -p noiria-core` as the break detecto
 8-bit 4:2:0 only until P2 lands. HEVC stays Media Foundation (patents — separate
 decision, not backlog).
 
-## P2 — VP9 profiles 1-3 (4:2:2 / 4:4:4, 10/12-bit)
+## P2 — VP9 profiles 1-3 (4:2:2 / 4:4:4, 10/12-bit) — DONE 2026-07-19
 
-Approved for the backlog 2026-07-17 (previously out of scope). No patent concern; pure
-implementation volume. Large:
+Decoder support landed (commits `116183d`→`54e693b`): the sweep is now 315/315 across all
+profiles, both SIMD-on and forced-scalar. `Plane` is u16-backed; the public `Frame` exposes
+`enum PlaneData { U8, U16 }` + `bit_depth`/`subsampling_x/y`; the loop filter's 8-bit constants
+scale `<< (bit_depth-8)` (identity at 8-bit, so 8-bit output stayed byte-identical). Profile 1
+needed no code change (the pipeline was already subsampling-general); the exploration's
+`residual.rs:158` "4:2:2 bug" hypothesis was empirically refuted (applying it regressed the
+official 4:2:2 vector). Noiria's display path now handles 8-bit all-subsampling → RGBA;
+10/12-bit → RGBA (tonemapping) is Noiria-side backlog. See implementation-notes "P2".
 
-- `Plane` is `u8`-fixed — 10/12-bit needs u16 pixel storage through framebuffer,
-  predict, transform ranges, loop filter, MC, DPB, and output (`Frame` API shape
-  change for >8-bit output — design decision needed).
-- 4:2:2/4:4:4 relaxes the subsampling assumptions wherever chroma is halved today
-  (`subsampling_x/y` are already parsed and threaded; the hardcoded assumptions are in
-  plane sizing and MC/loop-filter chroma paths).
-- Gates exist upstream: the official `vp91-2-*` / `vp92-2-*` / `vp93-2-*` vector
-  families (extend `scripts/vectors.txt` + the sweep).
-- Suggested order: profile 2 (10/12-bit 4:2:0) first — touches depth only; then
-  profiles 1/3 (subsampling) on top.
+Remaining (moved to P1's SIMD scope, not blocking): a u16 SIMD path for 10/12-bit content.
 
 ## P3 — small recorded items
 

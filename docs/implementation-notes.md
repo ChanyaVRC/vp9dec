@@ -2700,3 +2700,27 @@ prior waves: (1) `cargo test --release --test sweep_test official_vector_sweep -
 --nocapture`, (2) the same with `VP9DEC_NO_SIMD=1` set first. Both are expected to stay at
 304/304 (the 8-bit invariant), and the local vp92 10/12-bit vectors (not part of the official
 304-vector sweep manifest) are already confirmed bit-exact above.
+
+## Profile 1-3: P1 finding + P4 Noiria (addendum, 2026-07-19)
+
+### P1 (profile 1, 8-bit non-4:2:0): no code change; a refuted hypothesis
+
+All three official profile-1 vectors (`vp91-2-04-yuv{422,440,444}`) decode bit-exact with
+NO decoder change -- the reconstruct/predict/loop-filter paths already derive every chroma
+dimension from `subsampling_x/subsampling_y`. The pre-implementation exploration flagged
+`tile/residual.rs`'s sub-8x8 inter chroma block index `y*num4x4w+x` as a 4:2:2 bug that
+"should" be `y*2+x` (citing libvpx's `i=y*2+x`). Applying that change **regressed**
+`vp91-2-04-yuv422` (md5-mismatch@frame 1) and was reverted: the original `y*num4x4w+x` is the
+bit-exact-correct value, and the 4:2:2 vector genuinely exercises that path. Lesson reaffirmed
+(same as the M4 loop-filter triage): trust the bit-exact official sweep over static analysis.
+
+### P4 (Noiria display consumer)
+
+`noiria-core`'s `codec/video.rs::Vp9Ivf` was adapted to the new `PlaneData` `Frame`:
+`next_frame` extracts `PlaneData::U8` and now `ensure!(frame.bit_depth == 8, ...)` -- 10/12-bit
+display needs tonemapping and is deferred (Noiria backlog). `yuv420_to_rgba_bt601` was
+generalized to `yuv_to_rgba_bt601`, upsampling chroma by `x>>sub_x, y>>sub_y` (chroma plane
+width `((w+sub_x)>>sub_x)`) so 8-bit 4:2:0/4:2:2/4:4:0/4:4:4 all render. A new Noiria test
+`vp9_ivf_8bit_yuv444_decodes_to_rgba` drives a real vp91 4:4:4 vector end-to-end (skip-if-absent
+against the sibling vp9dec vectors, matching the existing droppable_1 test convention). Noiria
+workspace fully green.
