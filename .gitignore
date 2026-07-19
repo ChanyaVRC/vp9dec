@@ -4,3 +4,6 @@
 tests/vectors/*
 !tests/vectors/.gitkeep
 /target-bt
+
+# Local, machine-specific Claude Code guidance (project-wide guidance lives in CLAUDE.md)
+CLAUDE.local.md
