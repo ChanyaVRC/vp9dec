@@ -203,6 +203,31 @@ fn vp90_2_16_intra_only_exercises_intra_only_frame() {
     );
 }
 
+/// The official profile 1/2/3 vectors: profile 1 (8-bit non-4:2:0), profile 2 (10/12-bit
+/// 4:2:0), profile 3 (10/12-bit non-4:2:0). Each is md5-checked frame-by-frame exactly like
+/// the profile-0 vectors above (`i420_bytes` emits 10/12-bit output as 16-bit LE, matching
+/// libvpx's high-depth `.ivf.md5`), skipping cleanly if not fetched. These are tiny (~350 KB
+/// total), so profile 1-3 conformance runs in the DEFAULT suite -- otherwise it would live
+/// only in the sweep, which skips on a partial checkout.
+#[test]
+fn profile_1_3_vectors_match_official_md5() {
+    for name in [
+        "vp91-2-04-yuv422.ivf",
+        "vp91-2-04-yuv440.ivf",
+        "vp91-2-04-yuv444.ivf",
+        "vp92-2-20-10bit-yuv420.ivf",
+        "vp92-2-20-12bit-yuv420.ivf",
+        "vp93-2-20-10bit-yuv422.ivf",
+        "vp93-2-20-10bit-yuv440.ivf",
+        "vp93-2-20-10bit-yuv444.ivf",
+        "vp93-2-20-12bit-yuv422.ivf",
+        "vp93-2-20-12bit-yuv440.ivf",
+        "vp93-2-20-12bit-yuv444.ivf",
+    ] {
+        check_all_frames(name, None);
+    }
+}
+
 /// Unit tests for `common::md5`'s RFC 1321 implementation. Kept in this single dedicated place
 /// rather than inside `tests/common/md5.rs` itself: everything under `tests/common/` is
 /// recompiled once per consuming test binary, so a `#[test]` there would rerun once per binary

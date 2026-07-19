@@ -7,11 +7,14 @@
 //! panics with a detailed diff on the first mismatch), this is a triage tool: one vector's
 //! decode error, MD5 mismatch, or even a panic must not stop the sweep from covering the
 //! rest, so every failure mode is caught and recorded rather than propagated. See
-//! docs/implementation-notes.md "M4 wave 1" for the resulting failure categorization -- this
-//! wave reports failures, it does not fix them, so `official_vector_sweep` is expected to
-//! fail (hence `#[ignore]`, so the normal suite that must stay green never runs it). Invoke
-//! explicitly:
-//! `cargo test --release --test sweep_test official_vector_sweep -- --ignored --nocapture`
+//! docs/implementation-notes.md "M4 wave 1" for the original failure categorization.
+//!
+//! The whole corpus now passes (315/315), so this is NOT `#[ignore]`d -- but it runs only in a
+//! **release** build with the **full corpus present**, so it enforces conformance in CI /
+//! `cargo test --release` without slowing routine debug `cargo test` (debug decode is ~10x
+//! slower). A debug build or a partial checkout skips cleanly; the curated + profile-1-3
+//! vectors are covered always-on in `conformance_test.rs` regardless. Enforcing run:
+//! `RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_sweep -- --nocapture`
 
 mod common;
 
@@ -97,9 +100,27 @@ fn sweep_one(ivf_path: &Path, md5_path: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Number of md5-checkable vectors in the full official corpus (profile 0-3), as of 2026-07.
+/// The sweep runs only when at least this many are present, so a partial checkout skips rather
+/// than passing a small subset and looking like full conformance. Bump if the corpus grows.
+const FULL_CORPUS_MD5_MIN: usize = 300;
+
 #[test]
-#[ignore]
 fn official_vector_sweep() {
+    // Release-only: debug decode is ~10x slower, so sweeping the whole corpus in a debug
+    // `cargo test` would add many minutes to every routine run. In debug we skip (the curated +
+    // profile-1-3 vectors still run always-on in conformance_test.rs); the enforcing run is
+    // `cargo test --release`, which CI/conformance uses and which is where this gate lives now
+    // that it's no longer #[ignore]d.
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[skip] debug build -- run the full-corpus sweep with `cargo test --release` \
+             (debug decode is ~10x slower; the curated + profile-1-3 vectors are covered \
+             always-on in conformance_test.rs)"
+        );
+        return;
+    }
+
     let vectors_dir = common::vectors_dir();
     let mut ivf_paths: Vec<PathBuf> = std::fs::read_dir(&vectors_dir)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", vectors_dir.display()))
@@ -110,10 +131,12 @@ fn official_vector_sweep() {
         .collect();
     ivf_paths.sort();
 
-    if ivf_paths.is_empty() {
+    if ivf_paths.len() < FULL_CORPUS_MD5_MIN {
         eprintln!(
-            "[skip] no *.ivf with a matching *.ivf.md5 found under {}; \
-             run `bash scripts/fetch-vectors.sh` first",
+            "[skip] only {} md5-checkable *.ivf present under {} (< {FULL_CORPUS_MD5_MIN}); \
+             the full-corpus sweep needs `scripts/fetch-vectors.{{sh,ps1}}` first \
+             (the curated + profile-1-3 vectors are covered always-on in conformance_test.rs)",
+            ivf_paths.len(),
             vectors_dir.display()
         );
         return;
