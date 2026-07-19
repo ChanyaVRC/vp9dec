@@ -18,8 +18,9 @@ conformance**: every official test vector must decode to the exact bytes libvpx 
 - **Trust the empirical sweep over static / spec reasoning.** Do not "fix" conformance-passing
   code because a spec reading or another decoder says it "should" differ — verify against the
   sweep first. When a hypothesis and the sweep disagree, the sweep wins.
-- **Record spec-external decisions in `docs/implementation-notes.md`** (append-only: never edit
-  an old entry, add a new dated one that supersedes it).
+- **Keep `docs/implementation-notes.md` concise** — it holds still-relevant design rationale,
+  landmines, and known gaps, not a blow-by-blow log. A resolved bug needs no entry; that detail
+  lives in git history.
 
 ## Build & test
 
@@ -44,6 +45,6 @@ Before finalizing any decode-path change, run the full acceptance gate — see t
 - **Architecture & module map** → [README.md](README.md) ("Current architecture").
 - **Public API, core output types, change-navigation, and gotchas** → the
   **`vp9dec-architecture`** skill.
-- **Why a decision was made** (dated design log + "Current state index") →
+- **Design rationale, landmines, and known gaps** →
   [docs/implementation-notes.md](docs/implementation-notes.md).
 - **Deferred work** → [docs/backlog.md](docs/backlog.md).

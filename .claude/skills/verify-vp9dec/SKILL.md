@@ -55,9 +55,9 @@ kernel, or module move must not alter a single output byte of any 8-bit decode.
 
 - `cargo clippy --all-targets`: no **new** warnings beyond the repo's small known baseline.
 - `cargo fmt --check` clean.
-- `docs/implementation-notes.md` has a dated entry for the change (decision → why → impact),
-  and the "Current state index" at its top points at the latest authoritative entries.
-  Deferred work goes in `docs/backlog.md`.
+- `docs/implementation-notes.md` is updated only if the change adds a still-relevant landmine,
+  non-obvious rationale, or known gap — keep it concise (resolved-bug detail lives in git
+  history, not the notes). Deferred work goes in `docs/backlog.md`.
 
 ## Principle: empirical bit-exactness beats static reasoning
 

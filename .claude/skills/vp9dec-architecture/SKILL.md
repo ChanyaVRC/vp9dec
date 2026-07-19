@@ -10,8 +10,8 @@ A from-scratch, clean-room VP9 decoder (Rust, std-only). Decode logic follows th
 is bit-exact conformance — the `verify-vp9dec` skill is the acceptance gate.
 
 This is a navigation aid: where things live and what not to break. For the full descriptive
-module map with spec-section references, see README.md "Current architecture"; for *why* a given
-decision was made, `docs/implementation-notes.md` (start at its "Current state index").
+module map with spec-section references, see README.md "Current architecture"; for the
+still-relevant design rationale, landmines, and known gaps, `docs/implementation-notes.md`.
 
 ## Mental model
 
