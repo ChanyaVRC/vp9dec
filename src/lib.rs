@@ -302,8 +302,11 @@ impl Decoder {
         setup_past_independence: bool,
     ) {
         if setup_past_independence || self.prev_frame_dims != Some(dims) {
-            self.prev_segment_ids =
-                Arc::new(vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize]);
+            self.prev_segment_ids = Arc::new(vec![
+                0u8;
+                (image_size.mi_cols * image_size.mi_rows)
+                    as usize
+            ]);
         }
     }
 
@@ -850,7 +853,10 @@ mod tests {
         );
         // The first frame of any IVF stream is a key frame (spec §7.2 conformance requirement).
         assert!(info.frame_is_intra, "key frames have FrameIsIntra == true");
-        assert!(!info.intra_only, "intra_only is only read for non-key frames");
+        assert!(
+            !info.intra_only,
+            "intra_only is only read for non-key frames"
+        );
         assert_eq!(
             info.reset_frame_context, 0,
             "reset_frame_context is only read for non-key, non-error-resilient frames"
@@ -906,7 +912,10 @@ mod tests {
         let err = decoder
             .decode_frame(truncated)
             .expect_err("truncated tile data must be rejected, not silently accepted");
-        assert_eq!(err, DecodeError::Tile(TileError::BoolCoder(BoolCoderError::EmptyBuffer)));
+        assert_eq!(
+            err,
+            DecodeError::Tile(TileError::BoolCoder(BoolCoderError::EmptyBuffer))
+        );
 
         // The regression check itself: a further valid frame must decode without panicking,
         // even though the previous frame errored out mid-decode.

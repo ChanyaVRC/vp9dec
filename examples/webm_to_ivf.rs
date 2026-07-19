@@ -59,7 +59,8 @@ fn main() {
         }
     };
 
-    let buf = std::fs::read(&in_path).unwrap_or_else(|e| fail(format!("failed to read {in_path}: {e}")));
+    let buf =
+        std::fs::read(&in_path).unwrap_or_else(|e| fail(format!("failed to read {in_path}: {e}")));
 
     let segment = find_segment(&buf, &in_path);
     let track = find_vp9_track(&buf, segment.clone(), &in_path);
@@ -100,11 +101,23 @@ fn read_header(buf: &[u8], pos: usize, outer_end: usize, ctx: &str) -> Elem {
                 .checked_add(size as usize)
                 .filter(|&e| e <= outer_end)
                 .unwrap_or_else(|| {
-                    fail(format!("{ctx}: element 0x{id:X} size {size} overruns its container"))
+                    fail(format!(
+                        "{ctx}: element 0x{id:X} size {size} overruns its container"
+                    ))
                 });
-            Elem { id, start: after_size, end, size_known: true }
+            Elem {
+                id,
+                start: after_size,
+                end,
+                size_known: true,
+            }
         }
-        None => Elem { id, start: after_size, end: outer_end, size_known: false },
+        None => Elem {
+            id,
+            start: after_size,
+            end: outer_end,
+            size_known: false,
+        },
     }
 }
 
@@ -161,15 +174,21 @@ fn first_byte_mask(length: usize) -> u8 {
 /// Determines a vint's length from its leading byte and validates it fits in `[pos, end)`.
 fn vint_len(buf: &[u8], pos: usize, end: usize, ctx: &str) -> (u8, usize) {
     if pos >= end {
-        fail(format!("{ctx}: unexpected end of data while reading a vint"));
+        fail(format!(
+            "{ctx}: unexpected end of data while reading a vint"
+        ));
     }
     let first = buf[pos];
     if first == 0 {
-        fail(format!("{ctx}: invalid vint (leading byte 0x00) at offset {pos}"));
+        fail(format!(
+            "{ctx}: invalid vint (leading byte 0x00) at offset {pos}"
+        ));
     }
     let length = first.leading_zeros() as usize + 1; // 0x80 -> 1, 0x40 -> 2, ...
     if pos + length > end {
-        fail(format!("{ctx}: vint of length {length} runs past the container at offset {pos}"));
+        fail(format!(
+            "{ctx}: vint of length {length} runs past the container at offset {pos}"
+        ));
     }
     (first, length)
 }
@@ -184,10 +203,16 @@ fn find_segment(buf: &[u8], ctx: &str) -> std::ops::Range<usize> {
             return elem.start..elem.end;
         }
         if !elem.size_known {
-            fail(format!("{ctx}: unexpected unknown-sized top-level element 0x{:X}", elem.id));
+            fail(format!(
+                "{ctx}: unexpected unknown-sized top-level element 0x{:X}",
+                elem.id
+            ));
         }
         if elem.id != ID_EBML_HEADER {
-            eprintln!("[note] {ctx}: skipping top-level element 0x{:X} before Segment", elem.id);
+            eprintln!(
+                "[note] {ctx}: skipping top-level element 0x{:X} before Segment",
+                elem.id
+            );
         }
         pos = elem.end;
     }
@@ -211,7 +236,10 @@ fn find_vp9_track(buf: &[u8], segment: std::ops::Range<usize>, ctx: &str) -> Vp9
         if !elem.size_known {
             // Only Cluster is expected unknown-sized; Tracks always precedes the clusters
             // in these files, so an unknown size before Tracks means we mis-parsed.
-            fail(format!("{ctx}: reached unknown-sized element 0x{:X} before Tracks", elem.id));
+            fail(format!(
+                "{ctx}: reached unknown-sized element 0x{:X} before Tracks",
+                elem.id
+            ));
         }
         pos = elem.end;
     }
@@ -253,10 +281,15 @@ fn parse_track_entry(buf: &[u8], entry: std::ops::Range<usize>, ctx: &str) -> Op
     }
 
     if track_type == Some(TRACK_TYPE_VIDEO) && codec_id.as_deref() == Some("V_VP9") {
-        let number = number.unwrap_or_else(|| fail(format!("{ctx}: V_VP9 track has no TrackNumber")));
-        let (width, height) =
-            dims.unwrap_or_else(|| fail(format!("{ctx}: V_VP9 track has no Video/pixel dimensions")));
-        Some(Vp9Track { number, width, height })
+        let number =
+            number.unwrap_or_else(|| fail(format!("{ctx}: V_VP9 track has no TrackNumber")));
+        let (width, height) = dims
+            .unwrap_or_else(|| fail(format!("{ctx}: V_VP9 track has no Video/pixel dimensions")));
+        Some(Vp9Track {
+            number,
+            width,
+            height,
+        })
     } else {
         None
     }
@@ -278,13 +311,19 @@ fn parse_video(buf: &[u8], video: std::ops::Range<usize>, ctx: &str) -> (u16, u1
     let width = width.unwrap_or_else(|| fail(format!("{ctx}: Video element has no PixelWidth")));
     let height = height.unwrap_or_else(|| fail(format!("{ctx}: Video element has no PixelHeight")));
     let to_u16 = |v: u64, name: &str| {
-        u16::try_from(v).unwrap_or_else(|_| fail(format!("{ctx}: {name} {v} exceeds IVF's u16 field")))
+        u16::try_from(v)
+            .unwrap_or_else(|_| fail(format!("{ctx}: {name} {v} exceeds IVF's u16 field")))
     };
     (to_u16(width, "PixelWidth"), to_u16(height, "PixelHeight"))
 }
 
 /// Walks all Clusters in file order and extracts every block payload on `track_number`.
-fn collect_frames(buf: &[u8], segment: std::ops::Range<usize>, track_number: u64, ctx: &str) -> Vec<Vec<u8>> {
+fn collect_frames(
+    buf: &[u8],
+    segment: std::ops::Range<usize>,
+    track_number: u64,
+    ctx: &str,
+) -> Vec<Vec<u8>> {
     let mut payloads: Vec<Vec<u8>> = Vec::new();
     let mut pos = segment.start;
     while pos < segment.end {
@@ -295,12 +334,21 @@ fn collect_frames(buf: &[u8], segment: std::ops::Range<usize>, track_number: u64
             } else {
                 find_unknown_master_end(buf, elem.start, segment.end, ctx)
             };
-            parse_cluster(buf, elem.start..cluster_end, track_number, ctx, &mut payloads);
+            parse_cluster(
+                buf,
+                elem.start..cluster_end,
+                track_number,
+                ctx,
+                &mut payloads,
+            );
             pos = cluster_end;
         } else if elem.size_known {
             pos = elem.end;
         } else {
-            fail(format!("{ctx}: unexpected unknown-sized element 0x{:X} at Segment level", elem.id));
+            fail(format!(
+                "{ctx}: unexpected unknown-sized element 0x{:X} at Segment level",
+                elem.id
+            ));
         }
     }
     payloads
@@ -308,7 +356,12 @@ fn collect_frames(buf: &[u8], segment: std::ops::Range<usize>, track_number: u64
 
 /// For an unknown-sized master at Segment level, scans forward and returns the offset of
 /// the next equal-or-higher-level element (or the Segment end), which is where it ends.
-fn find_unknown_master_end(buf: &[u8], content_start: usize, segment_end: usize, ctx: &str) -> usize {
+fn find_unknown_master_end(
+    buf: &[u8],
+    content_start: usize,
+    segment_end: usize,
+    ctx: &str,
+) -> usize {
     let mut pos = content_start;
     while pos < segment_end {
         let elem = read_header(buf, pos, segment_end, ctx);
@@ -348,7 +401,9 @@ fn parse_cluster(
                 while gpos < elem.end {
                     let inner = read_header(buf, gpos, elem.end, ctx);
                     if inner.id == ID_BLOCK {
-                        if let Some(p) = block_payload(buf, inner.start..inner.end, track_number, ctx) {
+                        if let Some(p) =
+                            block_payload(buf, inner.start..inner.end, track_number, ctx)
+                        {
                             payloads.push(p.to_vec());
                         }
                     }

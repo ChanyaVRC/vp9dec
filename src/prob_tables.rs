@@ -1634,9 +1634,7 @@ pub fn mode2txfm_map(mode: u8) -> crate::transform::TxType {
         D63_PRED => TxType::AdstDct,
         TM_PRED => TxType::AdstAdst,
         NEARESTMV | NEARMV | ZEROMV | NEWMV => TxType::DctDct,
-        _ => unreachable!(
-            "mode2txfm_map only accepts 0..=13 (intra 0..=9 + inter 10..=13)"
-        ),
+        _ => unreachable!("mode2txfm_map only accepts 0..=13 (intra 0..=9 + inter 10..=13)"),
     }
 }
 

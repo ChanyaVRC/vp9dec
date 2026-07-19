@@ -106,7 +106,9 @@ impl TileDecoder {
                 // SIMD wave 1 measurement (docs/implementation-notes.md): times the whole
                 // per-plane inter-predict section below (all sub-4x4 predict_inter calls when
                 // MiSize < BLOCK_8X8 included), not per-call -- see bench_timing module docs.
-                let _t = crate::bench_timing::StageTimer::start(crate::bench_timing::Stage::InterPredict);
+                let _t = crate::bench_timing::StageTimer::start(
+                    crate::bench_timing::Stage::InterPredict,
+                );
                 // `predict_inter()` (spec §8.5.2): motion compensation / sub-pixel interpolation.
                 let refs: [Option<&RefFrameData>; 2] = [
                     if info.ref_frame[0] > INTRA_FRAME {

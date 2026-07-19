@@ -48,8 +48,8 @@ fn md5_sidecar_path(ivf_path: &Path) -> PathBuf {
 /// or index out of bounds inside the decoder) still unwinds out of this function, and is
 /// caught by the `catch_unwind` around this function's call site instead.
 fn sweep_one(ivf_path: &Path, md5_path: &Path) -> Result<(), Failure> {
-    let ivf_bytes = std::fs::read(ivf_path)
-        .map_err(|e| Failure::Mismatch(format!("read-error: {e}")))?;
+    let ivf_bytes =
+        std::fs::read(ivf_path).map_err(|e| Failure::Mismatch(format!("read-error: {e}")))?;
     let md5_text = std::fs::read_to_string(md5_path)
         .map_err(|e| Failure::Mismatch(format!("md5-read-error: {e}")))?;
     let expected: Vec<String> = md5_text
@@ -80,7 +80,9 @@ fn sweep_one(ivf_path: &Path, md5_path: &Path) -> Result<(), Failure> {
                 )));
             };
             if &actual != expected_hash {
-                return Err(Failure::Mismatch(format!("md5-mismatch@frame {output_idx}")));
+                return Err(Failure::Mismatch(format!(
+                    "md5-mismatch@frame {output_idx}"
+                )));
             }
             output_idx += 1;
         }
@@ -198,7 +200,8 @@ fn official_vector_sweep() {
     eprintln!("[report] written to {}", report_path.display());
 
     assert_eq!(
-        pass, total,
+        pass,
+        total,
         "{fail}/{total} vector(s) failed the sweep -- see {} for the full per-vector report",
         report_path.display()
     );

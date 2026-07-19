@@ -37,7 +37,10 @@ fn main() {
     if let Some(stem) = args.first() {
         let target_index: usize = args
             .get(1)
-            .map(|s| s.parse().expect("frame number must be a non-negative integer"))
+            .map(|s| {
+                s.parse()
+                    .expect("frame number must be a non-negative integer")
+            })
             .unwrap_or(0);
         let path = vectors_dir.join(format!("{stem}.ivf"));
         if !path.exists() {
