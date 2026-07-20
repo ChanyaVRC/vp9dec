@@ -47,9 +47,9 @@ use crate::framebuffer::Plane;
 use crate::header::{self, ColorConfig, NewFrameHeader, SegmentationParams, MAX_SEGMENTS};
 use crate::prob_tables::{
     BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID, B_HEIGHT_LOG2_LOOKUP, B_WIDTH_LOG2_LOOKUP, DC_PRED,
-    KF_PARTITION_PROBS, MI_WIDTH_LOG2_LOOKUP, NUM_8X8_BLOCKS_HIGH_LOOKUP,
+    KF_PARTITION_PROBS, LAST_FRAME, MI_WIDTH_LOG2_LOOKUP, NUM_8X8_BLOCKS_HIGH_LOOKUP,
     NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_TREE,
-    PARTITION_VERT, REF_NONE, SUBSIZE_LOOKUP, TX_4X4,
+    PARTITION_VERT, REF_NONE, SS_SIZE_LOOKUP, SUBSIZE_LOOKUP, TX_4X4,
 };
 
 /// Errors that can occur while decoding tiles/partitions.
@@ -59,8 +59,11 @@ pub enum TileError {
     BoolCoder(BoolCoderError),
     /// Tile partitioning is invalid, e.g. the tile size field exceeds the data length.
     InvalidTileSize,
-    /// `subsize_lookup` returned `BLOCK_INVALID` (bitstream inconsistency).
+    /// A size lookup (`subsize_lookup`/`ss_size_lookup`) returned `BLOCK_INVALID` -- the block
+    /// size is inconsistent for this frame's chroma subsampling (malformed bitstream).
     InvalidPartition,
+    /// An inter block references a DPB slot that holds no decoded frame (malformed bitstream).
+    MissingReference,
 }
 
 /// Information held by a single 8x8 mode info unit (spec §2.37 "Mode info").
@@ -622,6 +625,26 @@ impl TileDecoder {
             self.inter_frame_mode_info(r, row, col, subsize, avail_u, avail_l)?
         };
         let is_inter = info.ref_frame[0] != INTRA_FRAME;
+
+        // Guard the residual/predict path against malformed bitstreams before entering it: it
+        // indexes fixed size/tx tables and unwraps reference views without re-validating, so a
+        // corrupted block size or reference would panic there rather than surface as a decode
+        // error. A conformant stream never trips these (they reject only values it cannot
+        // produce), so this changes no valid-input output. Both were found by tests/robustness_test.
+        let bsize = info.mi_size.max(BLOCK_8X8);
+        if SS_SIZE_LOOKUP[bsize as usize][self.subsampling_x as usize][self.subsampling_y as usize]
+            == BLOCK_INVALID
+        {
+            return Err(TileError::InvalidPartition);
+        }
+        if is_inter {
+            for &rf in &info.ref_frame {
+                if rf > INTRA_FRAME && self.resolved_refs[(rf - LAST_FRAME) as usize].is_none() {
+                    return Err(TileError::MissingReference);
+                }
+            }
+        }
+
         let eob_total = self.residual(r, row, col, &info, avail_u, avail_l, is_inter);
         // Spec §6.4.4: when is_inter && subsize >= BLOCK_8X8 && EobTotal == 0, retroactively
         // set skip to 1 (since it turns out there was actually no residual at all).

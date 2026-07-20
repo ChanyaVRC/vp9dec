@@ -44,6 +44,11 @@ skill; change-navigation is the `vp9dec-architecture` skill.
 - **The whole per-frame loop filter is gated on the frame-level `loop_filter_level` (spec §8.1),
   before per-block ref/mode deltas apply.** Those deltas can raise a block's level above 0, so
   running the filter on a frame that signaled "no filtering" is wrong.
+- **`decode_block` rejects two malformed-bitstream conditions before the residual/predict path**
+  (which indexes fixed size/tx tables and unwraps reference views without re-checking): a
+  `BLOCK_INVALID` chroma block size, and an inter block referencing an empty DPB slot. Conformant
+  streams never trip these, so they change no valid-input output -- don't remove them as "dead"
+  checks. Regression-guarded by `tests/robustness_test.rs` (a fuzz for no-panic-on-bad-input).
 
 ## Conventions worth knowing
 
