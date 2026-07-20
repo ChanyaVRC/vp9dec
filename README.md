@@ -96,7 +96,7 @@ RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_s
 | Limit | Detail |
 | --- | --- |
 | No SIMD for 10/12-bit or the scaled inter path | The AVX2 kernels (`src/simd.rs`) cover 8-bit unscaled inter prediction and 8-bit horizontal loop-filter edges; 10/12-bit, reference-scaling, and vertical loop-filter edges use the (correct, bit-exact) scalar path. High-bit-depth content is rare, so this is a perf gap only, tracked in `docs/backlog.md`. |
-| 19 corpus clips ship no upstream `.md5` | The 7 `vp90-2-bbb_*` and 12 `vp90-2-tos_*`/`vp90-2-sintel_*` movie clips ship only a `.webm` upstream (libvpx uses them for its own perf tests, not md5 conformance), so the sweep cannot MD5-check them; the fetch scripts still download/remux them, and they are excluded from the sweep's 315. The 12 tos/sintel clips (full-length movies, up to 1920x800) were instead cross-checked once against ffmpeg's `libvpx-vp9` per-frame MD5s: all 268,832 displayed frames byte-identical. |
+| 19 corpus clips ship no upstream `.md5` | The 7 `vp90-2-bbb_*` and 12 `vp90-2-tos_*`/`vp90-2-sintel_*` movie clips ship only a `.webm` upstream (libvpx uses them for its own perf tests, not md5 conformance), so the sweep cannot MD5-check them; the fetch scripts still download/remux them, and they are excluded from the sweep's 315. They are instead cross-checked against ffmpeg's `libvpx-vp9`: the 12 tos/sintel clips (full-length movies, up to 1920x800) in full (all 268,832 displayed frames byte-identical), and the 7 bbb clips as a spot-check (first 1000 frames each, `tests/bbb_cross_check.rs`). |
 
 ## Tests & verification
 

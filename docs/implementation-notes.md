@@ -62,5 +62,6 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   cross-decoded byte-identically by ffmpeg's `libvpx-vp9` and native `vp9` decoders.
 - **19 corpus clips ship no upstream `.md5`** (`vp90-2-bbb_*` / `vp90-2-tos_*` /
   `vp90-2-sintel_*` movies), so the sweep can't MD5-check them and they're excluded from the 315.
-  They were cross-checked once against ffmpeg `libvpx-vp9` per-frame MD5s — all 268,832 displayed
-  frames byte-identical.
+  Instead they're cross-checked against ffmpeg's `libvpx-vp9`: the 12 tos/sintel clips in full
+  (268,832 displayed frames byte-identical), and the 7 bbb clips as a spot-check — first 1000
+  frames each, 7000 total, byte-identical (`tests/bbb_cross_check.rs`).

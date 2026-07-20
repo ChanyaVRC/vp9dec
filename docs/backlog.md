@@ -24,10 +24,13 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
 - Wave 2 (AVX2 inter-pred subpel convolution): DONE 2026-07-17 (`src/simd.rs`).
   **35.7 -> 56.5 MP/s, 1.58x**, bit-exact (sweep passed both SIMD-on and forced-scalar).
   Scaled path + width-4 + edge blocks stay scalar.
-- Wave 3+ (NEXT): the profile is now balanced -- LoopFilter 28.8% / Token+Dequant+Transform
-  27.5% / InterPredict 29.8%. Target `loop_filter.rs` and/or `transform.rs` butterflies to
-  clear the 62 MP/s 1080p30 bar (currently 56.5 at 1920-wide). Same dispatch/bit-exact rules.
-  Also still scalar: the scaled (SVC/resize) inter path and width-4 blocks.
+- Wave 3 (AVX2 horizontal loop-filter edges): DONE 2026-07-18
+  (`src/simd.rs::loop_filter_horiz8_avx2`), bit-exact both configs. After waves 2+3 the
+  profile is balanced (LoopFilter / Token+Dequant+Transform / InterPredict each ~28-30%).
+- Wave 4 (NEXT): the remaining scalar hot spots are the **vertical** loop-filter edges, the
+  inverse transforms (`transform.rs` butterflies), and intra prediction. Same dispatch/bit-exact
+  rules. Also still scalar: the 10/12-bit u16 path, the scaled (SVC/resize) inter path, and
+  width-4 blocks.
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 
@@ -44,9 +47,6 @@ Remaining (moved to P1's SIMD scope, not blocking): a u16 SIMD path for 10/12-bi
 
 ## P3 — small recorded items
 
-- **bbb clips ffmpeg cross-check** (small): the 7 `vp90-2-bbb_*` clips have no upstream
-  `.md5` and were NOT cross-checked against ffmpeg (the 12 tos/sintel were —
-  268,832 frames byte-identical). Run the same framemd5 comparison once.
 - **fetch script exit-code bug** (trivial): `rc=$?` is captured after the `fi`, reading
   the if-statement's status instead of curl's (cosmetic — failures still surface via the
   summary).
