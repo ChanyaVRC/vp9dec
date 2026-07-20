@@ -2,7 +2,7 @@
 name = "vp9dec"
 version = "0.1.0"
 edition = "2021"
-description = "Fully from-scratch VP9 decoder (zero dependencies, built for future integration into Noiria)"
+description = "A from-scratch, clean-room VP9 video decoder (Rust, zero dependency crates)"
 license = "MIT"
 publish = false
 

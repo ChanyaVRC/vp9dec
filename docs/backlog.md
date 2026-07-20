@@ -1,14 +1,13 @@
 # Backlog
 
 Open work items, ordered by priority. Each entry names its evidence/context so a fresh
-session can pick it up cold. Completed milestones live in `history.md`; decisions and
-their reasoning live in `implementation-notes.md` (see its Current state index).
+session can pick it up cold. Completed milestones live in `history.md`; decisions and their
+reasoning live in `implementation-notes.md`.
 
 ## P1 — SIMD optimization of the decode hot paths
 
 Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 426-width:
-245 fps — see implementation-notes "M4 final wave" for the measurement). Realtime 1080p30
-needs ~62 MP/s plus headroom, so this blocks practical Noiria integration for HD content.
+245 fps). Realtime 1080p30 playback needs ~62 MP/s plus headroom — the target for HD content.
 
 - Approach: `core::arch` intrinsics (AVX2 on x86_64, NEON on aarch64) with runtime
   detection (`is_x86_feature_detected!`) and the existing scalar code as the always-kept
@@ -17,14 +16,14 @@ needs ~62 MP/s plus headroom, so this blocks practical Noiria integration for HD
   convolution (`predict.rs::block_inter_predict`), loop filter, inverse transforms,
   intra prediction. Wave 4b already replaced heap allocation with fixed scratch, so the
   data layout is SIMD-ready.
-- Hard gate: bit-exact output — 304/304 official sweep + 150-test suite + 8-way ffmpeg
+- Hard gate: bit-exact output — the full official sweep + the test suite + the ffmpeg
   cross-decode must stay green with SIMD enabled AND disabled (integer ops only, so
   exact equality is achievable; any "close enough" result is a bug).
 - Wave 1 (measurement): DONE 2026-07-17 (`examples/bench.rs` + `bench-timing` feature).
   Baseline 35.7 MP/s; InterPredict 54.5% / LoopFilter 18.6% / Token+Dequant+Transform 17.7%.
-- Wave 2 (AVX2 inter-pred subpel convolution): DONE 2026-07-17 (`src/simd.rs`; see
-  implementation-notes "SIMD wave 2"). **35.7 -> 56.5 MP/s, 1.58x**, bit-exact (sweep
-  304/304 both SIMD-on and forced-scalar). Scaled path + width-4 + edge blocks stay scalar.
+- Wave 2 (AVX2 inter-pred subpel convolution): DONE 2026-07-17 (`src/simd.rs`).
+  **35.7 -> 56.5 MP/s, 1.58x**, bit-exact (sweep passed both SIMD-on and forced-scalar).
+  Scaled path + width-4 + edge blocks stay scalar.
 - Wave 3+ (NEXT): the profile is now balanced -- LoopFilter 28.8% / Token+Dequant+Transform
   27.5% / InterPredict 29.8%. Target `loop_filter.rs` and/or `transform.rs` butterflies to
   clear the 62 MP/s 1080p30 bar (currently 56.5 at 1920-wide). Same dispatch/bit-exact rules.
@@ -32,28 +31,14 @@ needs ~62 MP/s plus headroom, so this blocks practical Noiria integration for HD
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 
-## P1.5 — Noiria integration: in-engine validation
-
-CORRECTION (2026-07-17): the integration itself already exists — Noiria's
-`crates/noiria-core/src/codec/video.rs` has a `Vp9Ivf` `VideoSource` backed by this
-crate (path dependency), sniffed by `open_video_file()` ahead of Media Foundation. The
-2026-07-16 API break was adapted there on 2026-07-17 (Noiria workspace fully green).
-Remaining work: in-engine playback validation of HD content once P1 (SIMD) lands, and
-whatever the Noiria-side backlog's frame-seek discussion (its B4) decides. When changing
-this crate's API, run Noiria's `cargo check -p noiria-core` as the break detector.
-8-bit 4:2:0 only until P2 lands. HEVC stays Media Foundation (patents — separate
-decision, not backlog).
-
 ## P2 — VP9 profiles 1-3 (4:2:2 / 4:4:4, 10/12-bit) — DONE 2026-07-19
 
-Decoder support landed (commits `116183d`→`54e693b`): the sweep is now 315/315 across all
-profiles, both SIMD-on and forced-scalar. `Plane` is u16-backed; the public `Frame` exposes
-`enum PlaneData { U8, U16 }` + `bit_depth`/`subsampling_x/y`; the loop filter's 8-bit constants
-scale `<< (bit_depth-8)` (identity at 8-bit, so 8-bit output stayed byte-identical). Profile 1
-needed no code change (the pipeline was already subsampling-general); the exploration's
-`residual.rs:158` "4:2:2 bug" hypothesis was empirically refuted (applying it regressed the
-official 4:2:2 vector). Noiria's display path now handles 8-bit all-subsampling → RGBA;
-10/12-bit → RGBA (tonemapping) is Noiria-side backlog. See implementation-notes "P2".
+Decoder support landed: the sweep is now 315/315 across all profiles, both SIMD-on and
+forced-scalar. `Plane` is u16-backed; the public `Frame` exposes `enum PlaneData { U8, U16 }`
+plus `bit_depth`/`subsampling_x/y`; the loop filter's 8-bit constants scale `<< (bit_depth-8)`
+(identity at 8-bit, so 8-bit output stayed byte-identical). Profile 1 needed no code change
+(the pipeline was already subsampling-general); the exploration's `residual.rs:158` "4:2:2 bug"
+hypothesis was empirically refuted (applying it regressed the official 4:2:2 vector).
 
 Remaining (moved to P1's SIMD scope, not blocking): a u16 SIMD path for 10/12-bit content.
 
@@ -63,15 +48,14 @@ Remaining (moved to P1's SIMD scope, not blocking): a u16 SIMD path for 10/12-bi
   `.md5` and were NOT cross-checked against ffmpeg (the 12 tos/sintel were —
   268,832 frames byte-identical). Run the same framemd5 comparison once.
 - **fetch script exit-code bug** (trivial): `rc=$?` is captured after the `fi`, reading
-  the if-statement's status instead of curl's (recorded in implementation-notes
-  "M4 final wave"; cosmetic — failures still surface via the summary).
+  the if-statement's status instead of curl's (cosmetic — failures still surface via the
+  summary).
 - **ALTREF slot-steering test** (small): SEG_LVL_REF_FRAME steering is proven for
-  GOLDEN-vs-LAST; an ALTREF-direction case would complete the matrix
-  (implementation-notes "Synthetic round-trip coverage", noted as future addition).
-- **Invalid-input robustness** (medium, conditional): the decoder trusts conformant
-  input by design (documented judgment calls). If Noiria ever plays user-supplied
-  files rather than shipped assets, run the libvpx `invalid-*` family (generated
-  locally, not hosted) and/or fuzz the container/header layer.
+  GOLDEN-vs-LAST; an ALTREF-direction case would complete the matrix.
+- **Invalid-input robustness** (medium, conditional): the decoder trusts conformant input
+  by design (documented judgment calls). If it is ever fed untrusted / user-supplied files
+  rather than known-good assets, run the libvpx `invalid-*` family (generated locally, not
+  hosted) and/or fuzz the container/header layer.
 
 ## P3 — retrospective "G group" residue (approved for the backlog 2026-07-17)
 
@@ -93,6 +77,5 @@ decision is now that they MAY be done. What "doing" each means, honestly:
 
 ## Non-goals (decided, not deferred)
 
-- HEVC decoding (patents — stays Media Foundation on the Noiria side).
-- Consulting libvpx/other decoder SOURCE for decode logic (clean-room rule; ffmpeg
+- Consulting libvpx / other decoder SOURCE for decode logic (clean-room rule; ffmpeg
   OUTPUT comparison as an oracle is fine and established).

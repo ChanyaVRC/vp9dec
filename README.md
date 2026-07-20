@@ -4,8 +4,7 @@ A fully from-scratch VP9 video decoder (Rust, zero dependency crates).
 
 ## Purpose
 
-With an eye toward eventual integration into the visual novel engine Noiria, this implements a
-clean-room decoder for VP9 (a royalty-free video codec). The decoder itself -- everything under
+vp9dec is a clean-room decoder for VP9 (a royalty-free video codec). The decoder itself -- everything under
 `src/` -- depends on no external crates: Rust standard library only, no runtime dependencies.
 (Test tooling may use `[dev-dependencies]`; in practice the only one is a self-referential
 dev-dep on this crate for test-only encoder helpers, with no effect on a normal `cargo build`.)
