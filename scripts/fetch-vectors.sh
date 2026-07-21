@@ -39,12 +39,13 @@ fetch() {
     if curl -fSL -o "$out" "$url"; then
         dl_ok+=("$out")
         return 0
+    else
+        local rc=$? # curl's status: after `fi` it would be the if's status (0), not curl's
+        echo "[FAIL] download failed (curl exit $rc): $url" >&2
+        rm -f "$out" # curl -o may leave a truncated/empty file behind on failure
+        dl_fail+=("$url")
+        return 1
     fi
-    local rc=$?
-    echo "[FAIL] download failed (curl exit $rc): $url" >&2
-    rm -f "$out" # curl -o may leave a truncated/empty file behind on failure
-    dl_fail+=("$url")
-    return 1
 }
 
 # Pre-build once so the ~300 subsequent `cargo run --example webm_to_ivf` invocations below

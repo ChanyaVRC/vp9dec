@@ -52,9 +52,11 @@ Remaining (moved to P1's SIMD scope, not blocking): a u16 SIMD path for 10/12-bi
 
 ## P3 — small recorded items
 
-- **fetch script exit-code bug** (trivial): `rc=$?` is captured after the `fi`, reading
-  the if-statement's status instead of curl's (cosmetic — failures still surface via the
-  summary).
+- **fetch script exit-code bug**: DONE 2026-07-22. `fetch-vectors.sh` captured `rc=$?` after
+  the `fi`, reading the if-statement's status (always 0 when curl failed) instead of curl's, so
+  the FAIL line always printed "curl exit 0"; moved the failure handling into an `else` branch
+  where `$?` still holds curl's real status. (The PowerShell script reports via the exception
+  and was already correct.)
 - **ALTREF slot-steering test**: DONE 2026-07-22.
   `seg_lvl_ref_frame_steers_to_the_altref_slot` (`tests/synthetic_seg_test.rs`) plants distinct
   content in ALTREF's slot (physical slot 2 under `ref_frame_idx = [0, 1, 2]`) and forces
