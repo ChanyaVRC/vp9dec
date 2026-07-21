@@ -230,9 +230,8 @@ pub unsafe fn block_inter_predict_avx2_w4(
 /// "wide2" filter) deblocking filters, applied to 8 contiguous along-edge positions on a
 /// HORIZONTAL edge (loop_filter.rs pass==1: taps run in the row direction, i.e. `dx=0,dy=1`
 /// in that file's terms) -- see docs/implementation-notes.md "SIMD wave 3".
-/// Vertical edges (pass==0) stay scalar (along-edge there is consecutive ROWS, strided by the
-/// plane stride, not a natural AVX2 fit without a byte gather); `loop_filter.rs`'s dispatch
-/// keeps those on the scalar loop.
+/// Vertical edges (pass==0) are handled by [`loop_filter_vert8_avx2`], which transposes the tap
+/// window into this kernel's row-major layout and reuses this exact arithmetic.
 ///
 /// `plane_data`/`plane_width` is the raw row-major plane buffer (stride == `plane_width`,
 /// `u16`-backed regardless of bit depth -- see `framebuffer.rs`; the caller only dispatches
@@ -730,6 +729,151 @@ pub unsafe fn loop_filter_horiz8_avx2(
     store_row(4, q4_out);
     store_row(5, q5_out);
     store_row(6, q6_out);
+}
+
+/// Transposes an 8x8 matrix of `u16` (`r[i]` = input row `i`, 8 lanes) so the returned
+/// `out[j]` holds input column `j` across all 8 rows. The standard SSE2 unpack network
+/// (interleave by 16-, then 32-, then 64-bit granularity); it is its own inverse. Only SSE2
+/// (baseline on x86_64), so callable from any x86_64 context. Used by [`loop_filter_vert8_avx2`]
+/// to turn a vertical edge (taps along a row) into the row-major layout the horizontal kernel
+/// expects, and to turn the filtered result back.
+#[inline]
+unsafe fn transpose8x8_u16(r: &[__m128i; 8]) -> [__m128i; 8] {
+    let a0 = _mm_unpacklo_epi16(r[0], r[1]);
+    let a1 = _mm_unpackhi_epi16(r[0], r[1]);
+    let a2 = _mm_unpacklo_epi16(r[2], r[3]);
+    let a3 = _mm_unpackhi_epi16(r[2], r[3]);
+    let a4 = _mm_unpacklo_epi16(r[4], r[5]);
+    let a5 = _mm_unpackhi_epi16(r[4], r[5]);
+    let a6 = _mm_unpacklo_epi16(r[6], r[7]);
+    let a7 = _mm_unpackhi_epi16(r[6], r[7]);
+    let b0 = _mm_unpacklo_epi32(a0, a2);
+    let b1 = _mm_unpackhi_epi32(a0, a2);
+    let b2 = _mm_unpacklo_epi32(a1, a3);
+    let b3 = _mm_unpackhi_epi32(a1, a3);
+    let b4 = _mm_unpacklo_epi32(a4, a6);
+    let b5 = _mm_unpackhi_epi32(a4, a6);
+    let b6 = _mm_unpacklo_epi32(a5, a7);
+    let b7 = _mm_unpackhi_epi32(a5, a7);
+    [
+        _mm_unpacklo_epi64(b0, b4),
+        _mm_unpackhi_epi64(b0, b4),
+        _mm_unpacklo_epi64(b1, b5),
+        _mm_unpackhi_epi64(b1, b5),
+        _mm_unpacklo_epi64(b2, b6),
+        _mm_unpackhi_epi64(b2, b6),
+        _mm_unpacklo_epi64(b3, b7),
+        _mm_unpackhi_epi64(b3, b7),
+    ]
+}
+
+/// AVX2 VERTICAL-edge deblocking filter (`loop_filter.rs` pass==0: taps run along a row, i.e.
+/// `dx=1,dy=0`), the transpose of [`loop_filter_horiz8_avx2`]. The 8 along-edge positions here
+/// are 8 consecutive ROWS `y0..y0+7` at column `x0` (the along-edge axis is strided by the
+/// plane, the taps `x0-8..x0+7` are contiguous within each row) -- so this transposes the tap
+/// window into the row-major layout the horizontal kernel wants, runs that already-proven
+/// kernel unchanged, and transposes the result back. All the bit-exact filter arithmetic (mask,
+/// narrow, wide8, wide16) is thus shared verbatim; only the load/store orientation differs.
+///
+/// `plane_data`/`plane_width`, the 0/-1 lane masks, and `limit`/`blimit`/`thresh` mean exactly
+/// what they do for [`loop_filter_horiz8_avx2`]; `(x0, y0)` is lane 0's position and the other 7
+/// lanes are the next 7 rows `y0+1..=y0+7` at the same column `x0`.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and that the tap window is in bounds: columns
+/// `x0-4..=x0+3` across rows `y0..=y0+7` always, AND -- whenever any lane's `is_tx16` is set --
+/// the wider columns `x0-8..=x0+7`. This is the transpose of the horizontal kernel's contract
+/// (rows<->cols swapped) and holds under the same reasoning: planes are allocated out to
+/// superblock boundaries in both dimensions (see `framebuffer::Plane`), the wider window is only
+/// read when an eligible `is_tx16` lane forces a 16-aligned interior edge, and non-eligible
+/// lanes/columns are written back with their original transposed-in value (a no-op).
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn loop_filter_vert8_avx2(
+    plane_data: &mut [u16],
+    plane_width: usize,
+    x0: usize,
+    y0: usize,
+    eligible: &[i32; 8],
+    is_tx8: &[i32; 8],
+    is_tx16: &[i32; 8],
+    limit: &[i32; 8],
+    blimit: &[i32; 8],
+    thresh: &[i32; 8],
+) {
+    // Wide window (16 tap columns x0-8..x0+7) iff a lane needs the TX_16X16 wide16 filter, else
+    // the narrow window (8 tap columns x0-4..x0+3). Mirrors the horizontal kernel's own is_tx16
+    // branch and its memory-window contract: the wider columns are only read when an is_tx16
+    // lane is present, which the caller sets only for eligible TX_16X16 (16-aligned) lanes.
+    let wide = is_tx16.iter().any(|&t| t != 0);
+    let center = if wide { 8usize } else { 4usize }; // q0's tap-row in the scratch
+    let col0 = x0 - center; // leftmost tap column (p3 for the narrow window, p7 for the wide)
+
+    let base = plane_data.as_mut_ptr();
+    // scratch: up to 16 tap-rows x 8 lane-cols, row-major stride 8 -- the layout the horizontal
+    // kernel reads (tap axis = scratch rows, along-edge axis = scratch cols). Only the first
+    // `_win` rows are filled/used; the narrow case leaves rows 8..15 untouched (never read).
+    let mut scratch = [0u16; 16 * 8];
+
+    // Transpose the plane tap-window (8 rows y0..y0+7 x `_win` cols from col0) into scratch, one
+    // 8x8 block per 8 columns. Afterwards scratch row `tr` is tap column `col0+tr` across the 8
+    // lanes -- so scratch row `center` is q0's column x0, matching a horizontal edge at row
+    // `center`.
+    let mut rows = [_mm_setzero_si128(); 8];
+    for (r, slot) in rows.iter_mut().enumerate() {
+        *slot = _mm_loadu_si128(base.add((y0 + r) * plane_width + col0) as *const __m128i);
+    }
+    let t = transpose8x8_u16(&rows);
+    for (tr, &v) in t.iter().enumerate() {
+        _mm_storeu_si128(scratch.as_mut_ptr().add(tr * 8) as *mut __m128i, v);
+    }
+    if wide {
+        for (r, slot) in rows.iter_mut().enumerate() {
+            *slot = _mm_loadu_si128(base.add((y0 + r) * plane_width + col0 + 8) as *const __m128i);
+        }
+        let t = transpose8x8_u16(&rows);
+        for (tr, &v) in t.iter().enumerate() {
+            _mm_storeu_si128(scratch.as_mut_ptr().add((8 + tr) * 8) as *mut __m128i, v);
+        }
+    }
+
+    // Apply the proven horizontal kernel to the scratch: a width-8 "plane" whose edge is at row
+    // `center` (q0). Its own narrow/wide8/wide16 selection and p3..q3 / p7..q7 window reads land
+    // exactly on the scratch rows filled above.
+    loop_filter_horiz8_avx2(
+        &mut scratch,
+        8,
+        0,
+        center,
+        eligible,
+        is_tx8,
+        is_tx16,
+        limit,
+        blimit,
+        thresh,
+    );
+
+    // Transpose the (now filtered) scratch back to the plane. Rows the kernel left unwritten keep
+    // the original values transposed in above, so writing the whole window back is a no-op there.
+    for (tr, slot) in rows.iter_mut().enumerate() {
+        *slot = _mm_loadu_si128(scratch.as_ptr().add(tr * 8) as *const __m128i);
+    }
+    let out = transpose8x8_u16(&rows);
+    for (r, &v) in out.iter().enumerate() {
+        _mm_storeu_si128(base.add((y0 + r) * plane_width + col0) as *mut __m128i, v);
+    }
+    if wide {
+        for (tr, slot) in rows.iter_mut().enumerate() {
+            *slot = _mm_loadu_si128(scratch.as_ptr().add((8 + tr) * 8) as *const __m128i);
+        }
+        let out = transpose8x8_u16(&rows);
+        for (r, &v) in out.iter().enumerate() {
+            _mm_storeu_si128(
+                base.add((y0 + r) * plane_width + col0 + 8) as *mut __m128i,
+                v,
+            );
+        }
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]

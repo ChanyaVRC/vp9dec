@@ -33,9 +33,17 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   inter-pred now has a 128-bit width-4 kernel (`block_inter_predict_avx2_w4`) for the 4x4/4x8
   blocks that had stayed scalar. Bit-exact both SIMD configs (full sweep); unit-checked in
   `loop_filter.rs`/`simd.rs` (wide16 selection + w4-vs-w8 equivalence).
-- Wave 4 (NEXT): the remaining scalar hot spots are the **vertical** loop-filter edges, the
-  inverse transforms (`transform.rs` butterflies), and intra prediction. Same dispatch/bit-exact
-  rules. Also still scalar: the 10/12-bit u16 path and the scaled (SVC/resize) inter path.
+- Wave 4a (AVX2 vertical loop-filter edges): DONE 2026-07-22
+  (`src/simd.rs::loop_filter_vert8_avx2` + `superblock_loop_filter_vert_edge_avx2`). Transposes
+  the tap window (8x8 / 8x16) into the row-major layout the horizontal kernel wants, reuses that
+  proven kernel unchanged, and transposes back -- so all mask / narrow / wide8 / wide16
+  arithmetic is shared verbatim; only the load/store orientation differs. Bit-exact both SIMD
+  configs (full sweep 315/315) + ffmpeg cross-decode; a 500-trial `loop_filter/tests.rs` unit
+  test pins the kernel against the scalar `sample_filtering`. **37.65 -> 41.63 MP/s, 1.11x** on
+  1920x800 (tos, 17620 frames). Both loop-filter passes are now AVX2.
+- Wave 4 (NEXT): the remaining scalar hot spots are the inverse transforms (`transform.rs`
+  butterflies) and intra prediction. Same dispatch/bit-exact rules. Also still scalar: the
+  10/12-bit u16 path and the scaled (SVC/resize) inter path.
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 

@@ -247,3 +247,105 @@ fn avx2_horiz8_matches_scalar_sample_filtering() {
         }
     }
 }
+
+/// Direct equivalence test for `simd::loop_filter_vert8_avx2` (SIMD wave 4), the transpose of
+/// `avx2_horiz8_matches_scalar_sample_filtering` above. The vertical kernel transposes the tap
+/// window, reuses the horizontal kernel, and transposes back; this checks the round trip is
+/// bit-exact against the scalar `sample_filtering` on a vertical edge (`dx=1,dy=0`) across the
+/// same narrow/wide8/wide16/ineligible mix. The plane is 8 rows (the 8 lanes) by 16 columns, so
+/// both the narrow tap window (x0-4..=x0+3) and the wide16 window (x0-8..=x0+7, == cols 0..=15
+/// with x0==8) are in bounds.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn avx2_vert8_matches_scalar_sample_filtering() {
+    if !crate::simd::avx2_enabled() {
+        return;
+    }
+
+    let width = 16usize; // taps x0-8..=x0+7 == columns 0..=15
+    let height = 8usize; // 8 along-edge lanes == rows 0..=7
+    let x0 = 8usize;
+    let mut seed = 0x1234BEEFu32;
+
+    for trial in 0..500u32 {
+        let flat = trial % 2 == 1;
+        let base = (xorshift32(&mut seed) & 0xFF) as i32;
+        let mut plane_scalar = Plane::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let v = if flat {
+                    (base + (xorshift32(&mut seed) % 2) as i32).clamp(0, 255) as u16
+                } else {
+                    (xorshift32(&mut seed) & 0xFF) as u16
+                };
+                plane_scalar.set(x, y, v);
+            }
+        }
+        let mut plane_simd = plane_scalar.clone();
+
+        let mut eligible = [0i32; 8];
+        let mut is_tx8 = [0i32; 8];
+        let mut is_tx16 = [0i32; 8];
+        let mut limit = [0i32; 8];
+        let mut blimit = [0i32; 8];
+        let mut thresh = [0i32; 8];
+        for lane in 0..8usize {
+            let elig = !xorshift32(&mut seed).is_multiple_of(5);
+            let filter_size = match xorshift32(&mut seed) % 3 {
+                1 => TX_8X8,
+                2 => TX_16X16,
+                _ => TX_4X4,
+            };
+            eligible[lane] = if elig { -1 } else { 0 };
+            is_tx8[lane] = if filter_size == TX_8X8 { -1 } else { 0 };
+            is_tx16[lane] = if filter_size == TX_16X16 { -1 } else { 0 };
+            limit[lane] = (xorshift32(&mut seed) % 64) as i32;
+            blimit[lane] = (xorshift32(&mut seed) % 200) as i32;
+            thresh[lane] = (xorshift32(&mut seed) % 16) as i32;
+
+            if elig {
+                // Vertical edge: position (x0, lane), taps along the row (dx=1, dy=0).
+                sample_filtering(
+                    &mut plane_scalar,
+                    x0,
+                    lane,
+                    1,
+                    0,
+                    limit[lane],
+                    blimit[lane],
+                    thresh[lane],
+                    filter_size,
+                    8,
+                );
+            }
+        }
+
+        // SAFETY: avx2_enabled() confirmed above; the plane is 16 columns wide with x0==8, so
+        // both the narrow columns x0-4..=x0+3 and the wide16 columns x0-8..=x0+7 (== columns
+        // 0..=15) are in bounds across all 8 rows (y0==0, rows 0..=7).
+        unsafe {
+            crate::simd::loop_filter_vert8_avx2(
+                plane_simd.as_mut_slice(),
+                width,
+                x0,
+                0,
+                &eligible,
+                &is_tx8,
+                &is_tx16,
+                &limit,
+                &blimit,
+                &thresh,
+            );
+        }
+
+        for y in 0..height {
+            for x in 0..width {
+                assert_eq!(
+                    plane_scalar.get(x, y),
+                    plane_simd.get(x, y),
+                    "trial {trial}: mismatch at column {x}, row (lane) {y}"
+                );
+            }
+        }
+    }
+}

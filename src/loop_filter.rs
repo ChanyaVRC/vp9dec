@@ -478,16 +478,22 @@ fn superblock_loop_filter(
 
     let num_edges = 16u32 >> sub;
     for edge in 0..num_edges {
-        // AVX2 fast path: horizontal edges (pass==1) only -- the along-edge axis (x) is
-        // contiguous in memory for this orientation, see docs/implementation-notes.md
-        // "SIMD wave 3". Vertical edges (pass==0) stay on the scalar loop below (along-edge
-        // there is consecutive ROWS, i.e. strided by the plane stride, not a natural AVX2
-        // fit without a byte gather). Also gated on `bit_depth == 8`: the kernel's constants
-        // (128, +/-128, flat threshold 1) are only valid at that depth -- 10/12-bit frames
-        // always take the scalar path below, which scales those constants itself.
+        // AVX2 fast path (both passes), gated on `bit_depth == 8`: the kernels' constants (128,
+        // +/-128, flat threshold 1) are only valid at that depth -- 10/12-bit frames take the
+        // scalar path below, which scales those constants itself. pass==1 (horizontal) has the
+        // along-edge axis contiguous in memory (SIMD wave 3); pass==0 (vertical) transposes the
+        // tap window into that same layout (SIMD wave 4, see
+        // `superblock_loop_filter_vert_edge_avx2` / `simd::loop_filter_vert8_avx2`). Both decide
+        // WHICH positions filter and how strongly via the same `edge_position_params` the scalar
+        // loop uses -- only the pixel arithmetic is vectorized.
         #[cfg(target_arch = "x86_64")]
-        if pass == 1 && bit_depth == 8 && crate::simd::avx2_enabled() {
-            superblock_loop_filter_horiz_edge_avx2(
+        if bit_depth == 8 && crate::simd::avx2_enabled() {
+            let edge_avx2 = if pass == 1 {
+                superblock_loop_filter_horiz_edge_avx2
+            } else {
+                superblock_loop_filter_vert_edge_avx2
+            };
+            edge_avx2(
                 planes,
                 mi_grid,
                 mi_cols,
@@ -642,6 +648,117 @@ fn superblock_loop_filter_horiz_edge_avx2(
             let plane_width = planes[plane_idx].width;
             unsafe {
                 crate::simd::loop_filter_horiz8_avx2(
+                    planes[plane_idx].as_mut_slice(),
+                    plane_width,
+                    x0,
+                    y0,
+                    &eligible,
+                    &is_tx8,
+                    &is_tx16,
+                    &limit,
+                    &blimit,
+                    &thresh,
+                );
+            }
+        }
+
+        i += 8;
+    }
+}
+
+/// AVX2 fast path for one pass==0 (vertical) edge: the transpose of
+/// `superblock_loop_filter_horiz_edge_avx2`. Batches `edge_len` (a multiple of 8) along-edge
+/// positions into groups of 8 consecutive plane ROWS (the vertical orientation's along-edge
+/// axis) and dispatches the narrow/wide8/wide16 arithmetic to `simd::loop_filter_vert8_avx2`,
+/// which transposes the tap window and reuses the horizontal kernel. WHICH positions get
+/// filtered and how strongly is decided by the exact same `edge_position_params` the scalar loop
+/// uses -- only the pixel arithmetic is vectorized (SIMD wave 4).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn superblock_loop_filter_vert_edge_avx2(
+    planes: &mut [Plane; 3],
+    mi_grid: &MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    lvl_lookup: &LvlLookup,
+    sharpness: u8,
+    plane_idx: usize,
+    pass: u32,
+    row: u32,
+    col: u32,
+    sub_x: u32,
+    sub_y: u32,
+    sub: u32,
+    edge_len: u32,
+    edge: u32,
+) {
+    let mut i = 0u32;
+    while i < edge_len {
+        let mut eligible = [0i32; 8];
+        let mut is_tx8 = [0i32; 8];
+        let mut is_tx16 = [0i32; 8];
+        let mut limit = [0i32; 8];
+        let mut blimit = [0i32; 8];
+        let mut thresh = [0i32; 8];
+        let mut x0 = 0usize;
+        let mut y0 = 0usize;
+
+        for lane in 0..8u32 {
+            let (x, y, apply_filter, lvl, filter_size) = edge_position_params(
+                mi_grid,
+                mi_cols,
+                mi_rows,
+                subsampling_x,
+                subsampling_y,
+                lvl_lookup,
+                plane_idx,
+                pass,
+                row,
+                col,
+                sub_x,
+                sub_y,
+                sub,
+                edge,
+                i + lane,
+            );
+            let px = (x >> sub_x) as usize;
+            let py = (y >> sub_y) as usize;
+            if lane == 0 {
+                x0 = px;
+                y0 = py;
+            }
+            debug_assert_eq!(px, x0, "pass==0 edge: x is constant along the edge");
+            debug_assert_eq!(py, y0 + lane as usize, "pass==0 edge: y is contiguous");
+
+            if apply_filter && lvl > 0 {
+                // bit_depth is hardcoded to 8: the caller (`superblock_loop_filter`) only reaches
+                // this whole function under its own `bit_depth == 8` gate.
+                eligible[lane as usize] = -1;
+                is_tx8[lane as usize] = -((filter_size == TX_8X8) as i32);
+                is_tx16[lane as usize] = -((filter_size == TX_16X16) as i32);
+                let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, 8);
+                limit[lane as usize] = l;
+                blimit[lane as usize] = bl;
+                thresh[lane as usize] = th;
+            }
+        }
+
+        if eligible.iter().any(|&e| e != 0) {
+            // SAFETY: `avx2_enabled()` was checked by the caller (`superblock_loop_filter`). The
+            // column window the kernel touches at rows y0..y0+8 (pass==0's dx=1,dy=0 taps run in
+            // the column direction) is exactly what the already-proven-bit-exact scalar
+            // `compute_filter_mask`/`wide_filter` reads for an eligible lane at this same
+            // edge-constant `x0`: columns x0-4..=x0+3 always, and -- only when an eligible
+            // TX_16X16 lane is present (`is_tx16` set only for eligible lanes) -- the wider
+            // x0-8..=x0+7 the wide16 filter needs. Both are in-bounds whenever the respective lane
+            // is eligible; planes are allocated out to superblock boundaries in both dimensions
+            // (see `framebuffer::Plane`), so the extra rows read/written for the group's other
+            // lanes are valid memory too (the write blends in the original value there).
+            let plane_width = planes[plane_idx].width;
+            unsafe {
+                crate::simd::loop_filter_vert8_avx2(
                     planes[plane_idx].as_mut_slice(),
                     plane_width,
                     x0,
