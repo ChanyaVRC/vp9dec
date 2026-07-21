@@ -758,7 +758,6 @@ mod tests {
             refresh_frame_context: true,
             frame_parallel_decoding_mode: false,
             frame_context_idx: 0,
-            frame_context_idx_raw: 0,
             loop_filter: LoopFilterParams {
                 level: 0,
                 sharpness: 0,

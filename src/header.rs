@@ -224,15 +224,13 @@ pub struct NewFrameHeader {
     pub interpolation_filter: u8,
     pub refresh_frame_context: bool,
     pub frame_parallel_decoding_mode: bool,
-    /// `frame_context_idx` as it is used for `load_probs`/`save_probs` (spec §7.1.2):
-    /// the raw bitstream value, forced to 0 when `FrameIsIntra || error_resilient_mode`
-    /// (`setup_past_independence()`, spec §7.2).
+    /// `frame_context_idx` as read from the bitstream (`f(2)`, spec §7.1.2) — the raw value,
+    /// the single source of truth. The index actually used for `load_probs`/`save_probs` is
+    /// [`Self::effective_frame_context_idx`], which forces this to 0 when
+    /// `FrameIsIntra || error_resilient_mode` (`setup_past_independence()`, spec §7.2). The
+    /// `save_probs` reset in the `reset_frame_context == 2` case (spec §7.2) targets this raw
+    /// value directly (it runs before the forcing), so both consumers derive from this one field.
     pub frame_context_idx: u8,
-    /// The raw `frame_context_idx` value as read from the bitstream, i.e. before
-    /// `setup_past_independence()` forces it to 0. Needed because `save_probs`
-    /// (spec §7.2, the `reset_frame_context == 2` case) targets this raw index,
-    /// not the forced one.
-    pub frame_context_idx_raw: u8,
     pub loop_filter: LoopFilterParams,
     pub quantization: QuantizationParams,
     pub segmentation: SegmentationParams,
@@ -241,6 +239,20 @@ pub struct NewFrameHeader {
     /// Size in bytes of the compressed header (`compressed_header`). The bool
     /// decoder starts right after this via `init_bool(header_size_in_bytes)`.
     pub header_size_in_bytes: u16,
+}
+
+impl NewFrameHeader {
+    /// The `frame_context_idx` actually used for `load_probs`/`save_probs` (spec §7.1.2): the
+    /// raw bitstream value ([`Self::frame_context_idx`]), forced to 0 when
+    /// `FrameIsIntra || error_resilient_mode` — the reset `setup_past_independence()` applies
+    /// (spec §7.2). Derived on read so the raw value stays the single source of truth.
+    pub fn effective_frame_context_idx(&self) -> u8 {
+        if self.frame_is_intra || self.error_resilient_mode {
+            0
+        } else {
+            self.frame_context_idx
+        }
+    }
 }
 
 const MAX_TILE_WIDTH_B64: u32 = 64;
@@ -770,14 +782,10 @@ pub fn parse_uncompressed_header(
     } else {
         (false, true)
     };
-    let frame_context_idx_raw = r.f(2) as u8;
-    // When FrameIsIntra || error_resilient_mode, setup_past_independence() is
-    // called, and per the spec frame_context_idx is reset to 0 here.
-    let frame_context_idx = if frame_is_intra || error_resilient_mode {
-        0
-    } else {
-        frame_context_idx_raw
-    };
+    // The raw f(2) value is the single source of truth; the index used for load_probs/save_probs
+    // (forced to 0 when FrameIsIntra || error_resilient_mode) is derived on read by
+    // NewFrameHeader::effective_frame_context_idx().
+    let frame_context_idx = r.f(2) as u8;
 
     // setup_past_independence(): when FrameIsIntra || error_resilient_mode, the
     // loop filter deltas and segmentation feature data are also reset to their
@@ -816,7 +824,6 @@ pub fn parse_uncompressed_header(
             refresh_frame_context,
             frame_parallel_decoding_mode,
             frame_context_idx,
-            frame_context_idx_raw,
             loop_filter,
             quantization,
             segmentation,
@@ -1021,6 +1028,42 @@ mod tests {
                 assert_eq!(f.frame_context_idx, 0);
             }
             FrameHeader::ShowExistingFrame { .. } => panic!("unexpected"),
+        }
+    }
+
+    #[test]
+    fn effective_frame_context_idx_forces_zero_only_for_intra_or_error_resilient() {
+        // Fold check (backlog "frame_context_idx dual field"): the raw f(2) value is the single
+        // stored field, and effective_frame_context_idx() derives the load/save index by forcing
+        // it to 0 exactly when FrameIsIntra || error_resilient_mode -- reproducing the old
+        // parse-time computation. The raw field itself is never mutated by the reset.
+        let mut prev = PersistentState::default();
+        prev.ref_frame_sizes[0] = (8, 8);
+        let (header, _) =
+            parse_uncompressed_header(&build_minimal_inter_frame_header(), &prev).expect("parse");
+        let FrameHeader::New(base) = header else {
+            panic!("expected a New frame header");
+        };
+        for raw in 0u8..4 {
+            for frame_is_intra in [false, true] {
+                for error_resilient_mode in [false, true] {
+                    let mut h = base.clone();
+                    h.frame_context_idx = raw;
+                    h.frame_is_intra = frame_is_intra;
+                    h.error_resilient_mode = error_resilient_mode;
+                    let expected = if frame_is_intra || error_resilient_mode {
+                        0
+                    } else {
+                        raw
+                    };
+                    assert_eq!(
+                        h.effective_frame_context_idx(),
+                        expected,
+                        "raw={raw} intra={frame_is_intra} er={error_resilient_mode}"
+                    );
+                    assert_eq!(h.frame_context_idx, raw, "raw field must be preserved");
+                }
+            }
         }
     }
 

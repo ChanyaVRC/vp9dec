@@ -228,7 +228,7 @@ pub fn build_inter_header(
     w.push_bits(0, 2); // -> EIGHTTAP_SMOOTH (LITERAL_TO_TYPE[0]); never read per-block
     w.push_flag(false); // refresh_frame_context
     w.push_flag(true); // frame_parallel_decoding_mode
-    w.push_bits(0, 2); // frame_context_idx_raw
+    w.push_bits(0, 2); // frame_context_idx
     w.push_bits(loop_filter_level as u32, 6);
     w.push_bits(0, 3);
     w.push_flag(false);

@@ -479,14 +479,15 @@ impl Decoder {
         // setup_past_independence() (spec §7.2): called only when FrameIsIntra ||
         // error_resilient_mode. Its `save_probs` calls reset 0, 1, or all 4 stored
         // frame context slots to defaults depending on reset_frame_context (see
-        // `frame_context_reset`). frame_context_idx itself is pinned to 0 for the
-        // subsequent load/save (already corrected on the header.rs side).
+        // `frame_context_reset`). The load/save below use `effective_frame_context_idx()`,
+        // which is 0 in this branch; the raw `frame_context_idx` passed here is the
+        // pre-forcing value the `reset_frame_context == 2` `save_probs` targets.
         if header.frame_is_intra || header.error_resilient_mode {
             match frame_context_reset(
                 header.frame_type,
                 header.error_resilient_mode,
                 header.reset_frame_context,
-                header.frame_context_idx_raw,
+                header.frame_context_idx,
             ) {
                 FrameContextReset::All => self.frame_contexts.reset_all(),
                 FrameContextReset::Slot(idx) => {
@@ -499,7 +500,9 @@ impl Decoder {
         // `frame()`). Kept around after the compressed_header call because `refresh_probs()`
         // (spec §6.1.2) restores it to this pre-forward-update value before applying
         // backward adaptation.
-        let starting_probs = self.frame_contexts.load(header.frame_context_idx);
+        let starting_probs = self
+            .frame_contexts
+            .load(header.effective_frame_context_idx());
 
         let compressed = {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::CompressedHeader);
@@ -618,7 +621,7 @@ impl Decoder {
         };
         if header.refresh_frame_context {
             self.frame_contexts
-                .save(header.frame_context_idx, final_probs);
+                .save(header.effective_frame_context_idx(), final_probs);
         }
 
         // Reference frame update process (spec §8.10). Arc-wrapped so `Dpb::update` shares
@@ -700,8 +703,9 @@ enum FrameContextReset {
     All,
 }
 
-/// `frame_context_idx` must be the raw bitstream value (`NewFrameHeader::frame_context_idx_raw`),
-/// since `save_probs( frame_context_idx )` runs before `setup_past_independence()` forces it to 0.
+/// `frame_context_idx` must be the raw bitstream value (`NewFrameHeader::frame_context_idx`, not
+/// `effective_frame_context_idx()`), since `save_probs( frame_context_idx )` runs before
+/// `setup_past_independence()` forces the effective index to 0.
 fn frame_context_reset(
     frame_type: FrameType,
     error_resilient_mode: bool,
