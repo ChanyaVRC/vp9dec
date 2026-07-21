@@ -56,6 +56,12 @@ pub struct BoolDecoder<'a> {
     value: u32,
     /// BoolRange.
     range: u32,
+    /// Count of raw bits requested past the end of `data` (the spec's zero-padding: each such
+    /// request returns 0 and leaves `bit_pos` pinned at the end). A conformant stream renorms
+    /// at most a handful of these at the very end; a desynced (corrupt) stream keeps decoding
+    /// symbols off the end and runs this up fast -- the signal `over_read_bits()` exposes so a
+    /// tile/compressed-header decode can reject corruption libvpx catches via `has_error`.
+    over_read_bits: usize,
 }
 
 impl<'a> BoolDecoder<'a> {
@@ -69,6 +75,7 @@ impl<'a> BoolDecoder<'a> {
             bit_pos: 8,
             value: data[0] as u32,
             range: 255,
+            over_read_bits: 0,
         };
         // In a spec-conformant stream, the marker bit read right after initialization is always 0.
         if decoder.read_bool(128) {
@@ -82,6 +89,7 @@ impl<'a> BoolDecoder<'a> {
     fn read_bit_raw(&mut self) -> u32 {
         let total_bits = self.data.len() * 8;
         if self.bit_pos >= total_bits {
+            self.over_read_bits += 1;
             return 0;
         }
         let byte_index = self.bit_pos / 8;
@@ -152,6 +160,20 @@ impl<'a> BoolDecoder<'a> {
             }
         }
         -n
+    }
+
+    /// Number of raw bits this decoder has requested past the end of its buffer (see the field's
+    /// doc). Conformant decodes end with only a small tail of these; a large value means the
+    /// arithmetic decoder desynced and ran off the end -- i.e. the tile/header was corrupt.
+    pub fn over_read_bits(&self) -> usize {
+        self.over_read_bits
+    }
+
+    /// Absolute raw-bit position (pinned at `data.len()*8` once the end is reached; further
+    /// requests bump [`Self::over_read_bits`] instead). Lets a tile decode measure how much of
+    /// its buffer it consumed, to reject a desynced (corrupt) tile that finishes far short.
+    pub fn bit_position(&self) -> usize {
+        self.bit_pos
     }
 
     /// `exit_bool( )` (spec §9.2.3). Discards the remaining padding bits and finishes.

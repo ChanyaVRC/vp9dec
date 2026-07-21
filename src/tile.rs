@@ -64,7 +64,24 @@ pub enum TileError {
     InvalidPartition,
     /// An inter block references a DPB slot that holds no decoded frame (malformed bitstream).
     MissingReference,
+    /// The tile's arithmetic decoder ran far past the end of the tile buffer (see
+    /// [`crate::bool_coder::BoolDecoder::over_read_bits`]). A conformant tile holds just enough
+    /// coded bits for its blocks; running thousands of bits past the end means the decode
+    /// desynced on corrupt data (libvpx rejects the same via its reader's `has_error`).
+    CorruptTile,
 }
+
+/// Over-read (bits requested past the tile buffer end) beyond which a tile is treated as
+/// corrupt. Conformant streams measure 0 here (the whole official corpus); the bound sits well
+/// above the handful of padding bits a valid final renorm could pull, and far below the
+/// thousands a desynced decode runs up. See [`TileError::CorruptTile`].
+const TILE_OVER_READ_LIMIT_BITS: usize = 128;
+
+/// Unused tail (buffer bits the tile decode left unconsumed) beyond which a tile is treated as
+/// corrupt. Conformant tiles leave at most 14 bits (measured across the whole official corpus);
+/// a desynced decode of corrupt data finishes the frame's fixed block count thousands of bits
+/// short (the smallest such case observed left ~10k). See [`TileError::CorruptTile`].
+const TILE_UNDER_READ_LIMIT_BITS: usize = 1024;
 
 /// Information held by a single 8x8 mode info unit (spec §2.37 "Mode info").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,6 +485,21 @@ impl TileDecoder {
 
                 let mut r = BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
                 self.decode_tile(&mut r)?;
+                // A conformant tile's arithmetic decoder finishes flush against its buffer: the
+                // whole official corpus lands within 14 bits of the end and never over-reads.
+                // A tile whose coded data has been corrupted desyncs and ends far off that mark
+                // -- either running thousands of bits PAST the end (`over_read_bits`), or
+                // finishing the frame's fixed block count having consumed thousands of bits too
+                // FEW (a large unused tail). Either way the tile isn't decodable; reject it
+                // rather than emit garbage (libvpx rejects the same class via its reader's
+                // `has_error`). The bounds sit ~70x above the largest conformant slack and ~10x
+                // below the smallest corruption seen, so no valid stream trips them.
+                let unused_bits = (tile_bytes.len() * 8).saturating_sub(r.bit_position());
+                if r.over_read_bits() > TILE_OVER_READ_LIMIT_BITS
+                    || unused_bits > TILE_UNDER_READ_LIMIT_BITS
+                {
+                    return Err(TileError::CorruptTile);
+                }
                 r.exit_bool();
             }
         }

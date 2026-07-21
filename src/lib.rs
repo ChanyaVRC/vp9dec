@@ -462,6 +462,13 @@ impl Decoder {
             && self.prev_frame_dims == Some((header.width, header.height))
             && self.prev_show_frame == Some(true);
 
+        // Reject an absurd frame size before it reaches the buffer allocations below (which
+        // use `vec![]` and would abort the process on failure, not return an error). A
+        // malformed header can signal up to 65536x65536; see `MAX_FRAME_LUMA_SAMPLES`.
+        if header.width as u64 * header.height as u64 > header::MAX_FRAME_LUMA_SAMPLES {
+            return Err(DecodeError::Header(HeaderError::FrameSizeTooLarge));
+        }
+
         let image_size = header::compute_image_size(header.width, header.height);
         self.clear_prev_segment_ids_if_needed(
             (header.width, header.height),
@@ -507,6 +514,18 @@ impl Decoder {
         } else {
             std::array::from_fn(|i| self.dpb.get_arc(header.ref_frame_idx[i]))
         };
+
+        // Spec §8.5.1 / libvpx `valid_ref_frame_img_fmt`: an inter frame's references must share
+        // its bit depth and chroma subsampling. Reject a stream mixing sample formats (the
+        // `mixedrefcsp` vector) here rather than mis-predicting across them below.
+        for r in resolved_refs.iter().flatten() {
+            if r.bit_depth != color_config.bit_depth
+                || r.subsampling_x != color_config.subsampling_x as u32
+                || r.subsampling_y != color_config.subsampling_y as u32
+            {
+                return Err(DecodeError::Header(HeaderError::RefFrameFormatMismatch));
+            }
+        }
 
         let tile_data = &frame_data[compressed_end..];
         let prev_grid = if use_prev_frame_mvs {

@@ -90,6 +90,7 @@ RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_s
 | Segmentation: seg-id decode, `SEG_LVL_ALT_Q` | Included in the `vp90-2-15-segkey*` bit-exact matches in the sweep |
 | Segmentation: `SEG_LVL_ALT_L`, `SEG_LVL_REF_FRAME`, `SEG_LVL_SKIP` (no official vector exists for these -- see below) | Synthetic round-trip vectors (`tests/synthetic_seg_test.rs`) cross-decoded byte-identically by two independent third-party VP9 decoders (ffmpeg's `libvpx-vp9` and its native `vp9`), 8/8 `[xdecode]` checks (4 scenarios x 2 decoders) |
 | Loop filter, including the `SEG_LVL_ALT_L` level-override path and the frame-level `loop_filter_level == 0` gate | Exercised by the whole sweep; the `SEG_LVL_ALT_L` and level-0-gate synthetic vectors additionally pin exact hand-derived pixel values (not just "output changed") that match both ffmpeg decoders |
+| Malformed-input rejection at libvpx parity | The official libvpx `invalid-*` corpus (`kVP9InvalidFileTests`): `tests/invalid_vector_test.rs` decodes each vector packet by packet and requires an `Err` at exactly the packet libvpx's `.res` sidecar first rejects -- 21/21. (`tests/robustness_test.rs` separately fuzzes for no-panic-on-arbitrary-corruption.) |
 
 ### Known limits
 

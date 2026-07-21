@@ -51,6 +51,18 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   `BLOCK_INVALID` chroma block size, and an inter block referencing an empty DPB slot. Conformant
   streams never trip these, so they change no valid-input output -- don't remove them as "dead"
   checks. Regression-guarded by `tests/robustness_test.rs` (a fuzz for no-panic-on-bad-input).
+- **Malformed-input rejection checks are conformance-safe but empirically tuned -- don't loosen
+  them without re-running the full sweep AND `tests/invalid_vector_test.rs`.** To pass the
+  official `invalid-*` gate the decoder rejects, before/without emitting garbage: an absurd frame
+  size (`HeaderError::FrameSizeTooLarge`, cap `MAX_FRAME_LUMA_SAMPLES`, a DoS guard against an
+  8 GB allocation abort), an inter reference whose bit-depth/subsampling differs from the current
+  frame (`RefFrameFormatMismatch`), and a tile whose arithmetic decoder finishes far off its
+  buffer end -- either over-reading past it or leaving a large unused tail
+  (`TileError::CorruptTile`, thresholds `TILE_OVER_READ_LIMIT_BITS` / `TILE_UNDER_READ_LIMIT_BITS`
+  in `tile.rs`). The tile thresholds sit ~70x above the largest slack any of the 315 conformant
+  vectors leaves (measured: ≤14 unused bits, 0 over-read) and ~10x below the smallest corruption
+  the invalid corpus shows, so valid output is untouched -- but they are heuristic margins, not
+  spec constants.
 
 ## Conventions worth knowing
 

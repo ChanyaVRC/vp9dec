@@ -52,7 +52,24 @@ pub enum HeaderError {
     /// `color_space == CS_RGB` and `profile_low_bit == 0`
     /// (violates a spec conformance requirement: RGB is not usable in profiles 0 and 2).
     InvalidColorConfigForProfile,
+    /// `FrameWidth * FrameHeight` exceeds [`MAX_FRAME_LUMA_SAMPLES`] -- a resource-limit
+    /// rejection (not a spec constraint: the bitstream's 16-bit dimensions permit up to
+    /// 65536x65536, whose frame buffer cannot be allocated). Guards against a malformed
+    /// header's absurd size aborting the process on the allocation (an out-of-memory DoS).
+    FrameSizeTooLarge,
+    /// An inter frame's reference has a different bit depth or chroma subsampling than the
+    /// current frame (spec §8.5.1 / libvpx `valid_ref_frame_img_fmt`: motion compensation
+    /// across mismatched sample formats is not permitted). A malformed stream mixing e.g.
+    /// 4:4:4 and 4:2:0 frames is rejected here instead of silently mis-predicting.
+    RefFrameFormatMismatch,
 }
+
+/// Upper bound on `FrameWidth * FrameHeight` (luma samples) this decoder will allocate a frame
+/// buffer for; larger headers are rejected as [`HeaderError::FrameSizeTooLarge`]. Chosen to sit
+/// far above any real content (8K UHD is ~33M samples) yet far below the bitstream's pathological
+/// 65536x65536 (~4.3G) maximum, bounding worst-case allocation. Not a spec limit -- see the
+/// variant's doc.
+pub const MAX_FRAME_LUMA_SAMPLES: u64 = 1 << 27;
 
 /// Loop-filter-related parameters (spec §6.2.8 `loop_filter_params`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

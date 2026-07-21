@@ -90,6 +90,41 @@ while read -r name kind; do
                 cp "$vectors_dir/$name.webm.md5" "$vectors_dir/$name.ivf.md5"
             fi
             ;;
+        invalid)
+            # $name is the full upstream filename; download it and its .res sidecar verbatim.
+            fetch "$base_url/$name" "$vectors_dir/$name" || true
+            fetch "$base_url/$name.res" "$vectors_dir/$name.res"
+
+            # A .webm invalid vector is remuxed to <name>.ivf so the IVF-based test can read it;
+            # its .res (per-decoded-frame codes, container-agnostic) is copied to <name>.ivf.res.
+            case "$name" in
+                *.webm)
+                    if [ -f "$vectors_dir/$name.ivf" ]; then
+                        echo "[skip] $vectors_dir/$name.ivf already present"
+                    elif [ ! -f "$vectors_dir/$name" ]; then
+                        echo "[skip] $name not available, cannot remux"
+                    else
+                        echo "[remux] $name -> $name.ivf"
+                        remux_err="$(mktemp)"
+                        if (cd "$repo_root" && cargo run --quiet --example webm_to_ivf -- \
+                            "tests/vectors/$name" "tests/vectors/$name.ivf") 2>"$remux_err"; then
+                            remux_ok+=("$name")
+                        else
+                            echo "[FAIL] remux failed: $name" >&2
+                            cat "$remux_err" >&2
+                            remux_fail+=("$name: $(tail -n 1 "$remux_err")")
+                        fi
+                        rm -f "$remux_err"
+                    fi
+
+                    if [ -f "$vectors_dir/$name.ivf.res" ]; then
+                        echo "[skip] $vectors_dir/$name.ivf.res already present"
+                    elif [ -f "$vectors_dir/$name.res" ]; then
+                        cp "$vectors_dir/$name.res" "$vectors_dir/$name.ivf.res"
+                    fi
+                    ;;
+            esac
+            ;;
         *)
             echo "[error] unknown vector kind '$kind' for '$name' in scripts/vectors.txt" >&2
             ;;

@@ -104,6 +104,46 @@ Get-Content (Join-Path $ScriptDir "vectors.txt") | ForEach-Object {
                 Copy-Item $webmMd5Path $ivfMd5Path
             }
         }
+        "invalid" {
+            # `name` is the full upstream filename; download it and its `.res` sidecar verbatim.
+            $ok = Get-Vector "$BaseUrl/$name" (Join-Path $VectorsDir $name)
+            Get-Vector "$BaseUrl/$name.res" (Join-Path $VectorsDir "$name.res") | Out-Null
+
+            # A .webm invalid vector is remuxed to <name>.ivf so the IVF-based test can read it;
+            # its .res (per-decoded-frame codes, container-agnostic) is copied to <name>.ivf.res.
+            if ($name -like "*.webm") {
+                $ivfPath = Join-Path $VectorsDir "$name.ivf"
+                $webmPath = Join-Path $VectorsDir $name
+                if (Test-Path $ivfPath) {
+                    Write-Host "[skip] $ivfPath already present"
+                } elseif (-not $ok -and -not (Test-Path $webmPath)) {
+                    Write-Host "[skip] $name not available, cannot remux"
+                } else {
+                    Write-Host "[remux] $name -> $name.ivf"
+                    Push-Location $RepoRoot
+                    try {
+                        $remuxErr = cargo run --quiet --example webm_to_ivf -- "tests/vectors/$name" "tests/vectors/$name.ivf" 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-Warning "[FAIL] remux failed: $name"
+                            $remuxErr | ForEach-Object { Write-Warning $_ }
+                            $RemuxFail.Add("$name`: $($remuxErr | Select-Object -Last 1)")
+                        } else {
+                            $RemuxOk.Add($name)
+                        }
+                    } finally {
+                        Pop-Location
+                    }
+                }
+
+                $ivfResPath = Join-Path $VectorsDir "$name.ivf.res"
+                $webmResPath = Join-Path $VectorsDir "$name.res"
+                if (Test-Path $ivfResPath) {
+                    Write-Host "[skip] $ivfResPath already present"
+                } elseif (Test-Path $webmResPath) {
+                    Copy-Item $webmResPath $ivfResPath
+                }
+            }
+        }
         default {
             Write-Warning "[error] unknown vector kind '$kind' for '$name' in scripts/vectors.txt"
         }
