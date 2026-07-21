@@ -505,8 +505,6 @@ fn superblock_loop_filter(
                 sub,
                 edge_len,
                 edge,
-                dx,
-                dy,
             );
             continue;
         }
@@ -554,10 +552,10 @@ fn superblock_loop_filter(
 /// narrow (4-tap)/wide (8-tap "flat") filter arithmetic to
 /// `simd::loop_filter_horiz8_avx2`. WHICH positions get filtered and how strongly is decided
 /// by the exact same `edge_position_params` the scalar loop uses -- only the pixel
-/// arithmetic is vectorized. Positions whose `filter_size` is `TX_16X16` (the rarer 16-tap
-/// "wide2" filter) are excluded from the SIMD batch and run through the unchanged scalar
-/// `sample_filtering` call instead (see docs/implementation-notes.md "SIMD wave 3": this
-/// wave's scope is narrow+wide8 only).
+/// arithmetic is vectorized. All three filter sizes (TX_4X4 narrow / TX_8X8 wide8 / TX_16X16
+/// wide2) are batched; the kernel's per-lane `is_tx8`/`is_tx16` masks pick each lane's filter,
+/// mirroring `sample_filtering`'s three-way branch (see docs/implementation-notes.md
+/// "SIMD wave 3").
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 fn superblock_loop_filter_horiz_edge_avx2(
@@ -578,13 +576,12 @@ fn superblock_loop_filter_horiz_edge_avx2(
     sub: u32,
     edge_len: u32,
     edge: u32,
-    dx: i64,
-    dy: i64,
 ) {
     let mut i = 0u32;
     while i < edge_len {
         let mut eligible = [0i32; 8];
         let mut is_tx8 = [0i32; 8];
+        let mut is_tx16 = [0i32; 8];
         let mut limit = [0i32; 8];
         let mut blimit = [0i32; 8];
         let mut thresh = [0i32; 8];
@@ -619,45 +616,29 @@ fn superblock_loop_filter_horiz_edge_avx2(
             debug_assert_eq!(px, x0 + lane as usize, "pass==1 edge: x is contiguous");
 
             if apply_filter && lvl > 0 {
-                if filter_size == TX_16X16 {
-                    // Rare 16-tap ("wide2") case: unchanged scalar path, not part of this
-                    // wave's SIMD scope. bit_depth is hardcoded to 8 here: the caller
-                    // (`superblock_loop_filter`) only reaches this whole function under its
-                    // own `bit_depth == 8` gate.
-                    let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, 8);
-                    sample_filtering(
-                        &mut planes[plane_idx],
-                        px,
-                        py,
-                        dx,
-                        dy,
-                        l,
-                        bl,
-                        th,
-                        filter_size,
-                        8,
-                    );
-                } else {
-                    eligible[lane as usize] = -1;
-                    is_tx8[lane as usize] = -((filter_size == TX_8X8) as i32);
-                    let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, 8);
-                    limit[lane as usize] = l;
-                    blimit[lane as usize] = bl;
-                    thresh[lane as usize] = th;
-                }
+                // bit_depth is hardcoded to 8: the caller (`superblock_loop_filter`) only
+                // reaches this whole function under its own `bit_depth == 8` gate.
+                eligible[lane as usize] = -1;
+                is_tx8[lane as usize] = -((filter_size == TX_8X8) as i32);
+                is_tx16[lane as usize] = -((filter_size == TX_16X16) as i32);
+                let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, 8);
+                limit[lane as usize] = l;
+                blimit[lane as usize] = bl;
+                thresh[lane as usize] = th;
             }
         }
 
         if eligible.iter().any(|&e| e != 0) {
             // SAFETY: `avx2_enabled()` was checked by the caller (`superblock_loop_filter`).
-            // The row window read by the kernel (y0-4..=y0+3 at columns x0..x0+8, pass==1's
-            // dx=0,dy=1 taps run in the row direction) is exactly the window the
-            // already-proven-bit-exact scalar `compute_filter_mask`/`wide_filter(3)` reads
-            // for any eligible lane at this same edge-constant `y0` -- so it's in-bounds
-            // whenever at least one lane is eligible (`planes` are allocated out to
-            // superblock boundaries, see `framebuffer::Plane`'s doc comment, so the extra
-            // columns read for non-eligible lanes within the same 8-wide group are always
-            // valid memory too).
+            // The row window the kernel touches at columns x0..x0+8 (pass==1's dx=0,dy=1 taps
+            // run in the row direction) is exactly the window the already-proven-bit-exact
+            // scalar `compute_filter_mask`/`wide_filter` reads for an eligible lane at this
+            // same edge-constant `y0`: rows y0-4..=y0+3 always, and -- only when an eligible
+            // TX_16X16 lane is present (`is_tx16` is set only for eligible lanes) -- the wider
+            // y0-8..=y0+7 the wide16 filter needs. Both are in-bounds whenever the respective
+            // lane is eligible; `planes` are allocated out to superblock boundaries (see
+            // `framebuffer::Plane`'s doc comment), so the extra columns read/written for the
+            // group's other lanes are always valid memory too.
             let plane_width = planes[plane_idx].width;
             unsafe {
                 crate::simd::loop_filter_horiz8_avx2(
@@ -667,6 +648,7 @@ fn superblock_loop_filter_horiz_edge_avx2(
                     y0,
                     &eligible,
                     &is_tx8,
+                    &is_tx16,
                     &limit,
                     &blimit,
                     &thresh,
@@ -888,24 +870,42 @@ mod tests {
         let mut seed = 0xC0FFEEu32;
 
         for trial in 0..500u32 {
+            // Half the trials use a near-flat window (base value +/- {0,1}) so `flat_mask` and
+            // `flat_mask2` (threshold 1) actually hold and wide8/wide16 get *selected*, not
+            // just computed; the other half are fully random (filter_mask false, hev, narrow).
+            let flat = trial % 2 == 1;
+            let base = (xorshift32(&mut seed) & 0xFF) as i32;
             let mut plane_scalar = Plane::new(width, height);
             for y in 0..height {
                 for x in 0..width {
-                    plane_scalar.set(x, y, (xorshift32(&mut seed) & 0xFF) as u16);
+                    let v = if flat {
+                        (base + (xorshift32(&mut seed) % 2) as i32).clamp(0, 255) as u16
+                    } else {
+                        (xorshift32(&mut seed) & 0xFF) as u16
+                    };
+                    plane_scalar.set(x, y, v);
                 }
             }
             let mut plane_simd = plane_scalar.clone();
 
             let mut eligible = [0i32; 8];
             let mut is_tx8 = [0i32; 8];
+            let mut is_tx16 = [0i32; 8];
             let mut limit = [0i32; 8];
             let mut blimit = [0i32; 8];
             let mut thresh = [0i32; 8];
             for lane in 0..8usize {
                 let elig = !xorshift32(&mut seed).is_multiple_of(5); // ~80% eligible
-                let tx8 = xorshift32(&mut seed).is_multiple_of(2);
+                                                                     // filter_size across all three arms (TX_4X4 narrow / TX_8X8 wide8 / TX_16X16
+                                                                     // wide2), so a batch mixes narrow-, wide8- and wide16-selected lanes.
+                let filter_size = match xorshift32(&mut seed) % 3 {
+                    1 => TX_8X8,
+                    2 => TX_16X16,
+                    _ => TX_4X4,
+                };
                 eligible[lane] = if elig { -1 } else { 0 };
-                is_tx8[lane] = if tx8 { -1 } else { 0 };
+                is_tx8[lane] = if filter_size == TX_8X8 { -1 } else { 0 };
+                is_tx16[lane] = if filter_size == TX_16X16 { -1 } else { 0 };
                 // Wide-ranging (not just spec-plausible) limit/blimit/thresh: the kernel and
                 // `sample_filtering` are just fixed integer arithmetic over whatever's passed
                 // in, so exercising a broad range is a stronger, still-valid check.
@@ -914,7 +914,6 @@ mod tests {
                 thresh[lane] = (xorshift32(&mut seed) % 16) as i32;
 
                 if elig {
-                    let filter_size = if tx8 { TX_8X8 } else { TX_4X4 };
                     sample_filtering(
                         &mut plane_scalar,
                         lane,
@@ -930,8 +929,9 @@ mod tests {
                 }
             }
 
-            // SAFETY: avx2_enabled() confirmed above; the plane is 16 rows tall with y0==8,
-            // so rows y0-4..=y0+3 (the kernel's read/write window) are all in bounds.
+            // SAFETY: avx2_enabled() confirmed above; the plane is 16 rows tall with y0==8, so
+            // both the narrow rows y0-4..=y0+3 and the wide16 rows y0-8..=y0+7 (== rows 0..=15)
+            // are all in bounds.
             unsafe {
                 crate::simd::loop_filter_horiz8_avx2(
                     plane_simd.as_mut_slice(),
@@ -940,6 +940,7 @@ mod tests {
                     y0,
                     &eligible,
                     &is_tx8,
+                    &is_tx16,
                     &limit,
                     &blimit,
                     &thresh,

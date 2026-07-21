@@ -27,10 +27,15 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
 - Wave 3 (AVX2 horizontal loop-filter edges): DONE 2026-07-18
   (`src/simd.rs::loop_filter_horiz8_avx2`), bit-exact both configs. After waves 2+3 the
   profile is balanced (LoopFilter / Token+Dequant+Transform / InterPredict each ~28-30%).
+- Wave 3b (polish -- close the existing kernels' scalar fall-throughs): DONE 2026-07-21.
+  The horizontal loop-filter kernel now handles the TX_16X16 "wide2" 16-tap case
+  (`loop_filter_horiz8_avx2`, `is_tx16` lane mask + flat_mask2 + wide16 closed forms), and
+  inter-pred now has a 128-bit width-4 kernel (`block_inter_predict_avx2_w4`) for the 4x4/4x8
+  blocks that had stayed scalar. Bit-exact both SIMD configs (full sweep); unit-checked in
+  `loop_filter.rs`/`simd.rs` (wide16 selection + w4-vs-w8 equivalence).
 - Wave 4 (NEXT): the remaining scalar hot spots are the **vertical** loop-filter edges, the
   inverse transforms (`transform.rs` butterflies), and intra prediction. Same dispatch/bit-exact
-  rules. Also still scalar: the 10/12-bit u16 path, the scaled (SVC/resize) inter path, and
-  width-4 blocks.
+  rules. Also still scalar: the 10/12-bit u16 path and the scaled (SVC/resize) inter path.
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 

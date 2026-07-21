@@ -23,9 +23,11 @@ overview. A resolved bug needs no entry.
 - **Cross-frame ownership.** DPB slots, `prev_mi_grid` / `prev_segment_ids`, and the compressed-
   header probability context are shared via `Arc` or borrowed, not deep-cloned per frame
   (performance only — the sweep is byte-identical before/after).
-- **SIMD.** AVX2 covers 8-bit unscaled inter-prediction and 8-bit horizontal loop-filter edges,
-  runtime-detected and cached; `VP9DEC_NO_SIMD=1` forces scalar. Output must equal the scalar
-  path — the sweep passes 315/315 in both configs.
+- **SIMD.** AVX2 covers 8-bit unscaled inter-prediction (widths 8/16/32/64 via
+  `block_inter_predict_avx2`, width 4 via the 128-bit `block_inter_predict_avx2_w4`) and 8-bit
+  horizontal loop-filter edges (narrow / wide8 / wide16, i.e. all three filter sizes), runtime-
+  detected and cached; `VP9DEC_NO_SIMD=1` forces scalar. Output must equal the scalar path — the
+  sweep passes 315/315 in both configs.
 
 Architecture and the module map live in `README.md`; the acceptance gate is the `verify-vp9dec`
 skill; change-navigation is the `vp9dec-architecture` skill.

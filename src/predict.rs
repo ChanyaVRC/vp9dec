@@ -485,17 +485,18 @@ fn block_inter_predict(
     // `simd.rs`'s doc comment for the derivation). Falls through to the scalar loop for:
     // the scaled path (rarer, harder to vectorize -- kept scalar per this wave's scope),
     // bit_depth != 8 (10/12-bit frames: the AVX2 kernel's arithmetic -- clip1 to 0..=255 --
-    // is only valid at 8-bit; the scalar loop below handles every depth generically), width
-    // 4 (not a multiple of the AVX2 kernel's 8-wide lane group), and any
+    // is only valid at 8-bit; the scalar loop below handles every depth generically), and any
     // block whose source window would need the scalar path's per-pixel edge clamp
     // (border replication) -- only near reference-frame edges; replicating that with
-    // AVX2 would need a byte gather, which x86 doesn't have.
+    // AVX2 would need a byte gather, which x86 doesn't have. Width 4 (the `4x4`/`4x8`
+    // partitions) dispatches to the 128-bit-wide `block_inter_predict_avx2_w4`; widths 8/16/
+    // 32/64 to the 256-bit `block_inter_predict_avx2`.
     #[cfg(target_arch = "x86_64")]
     {
         if x_step == 16
             && y_step == 16
             && bit_depth == 8
-            && w.is_multiple_of(8)
+            && (w == 4 || w.is_multiple_of(8))
             && crate::simd::avx2_enabled()
         {
             let src_row0 = (y >> 4) - 3;
@@ -508,23 +509,38 @@ fn block_inter_predict(
                 let fx = (x & 15) as usize;
                 let fy = (y & 15) as usize;
                 // SAFETY: `avx2_enabled()` proved AVX2 support; `in_bounds` proves every
-                // source pixel `block_inter_predict_avx2` touches (rows
-                // src_row0..src_row0+intermediate_height, columns src_col0..src_col0+w+7)
-                // is within `ref_plane`, matching its documented contract.
+                // source pixel the kernel touches (rows src_row0..src_row0+intermediate_height,
+                // columns src_col0..src_col0+w+7) is within `ref_plane`, matching the kernels'
+                // documented contract.
                 unsafe {
-                    crate::simd::block_inter_predict_avx2(
-                        ref_plane.as_slice(),
-                        ref_plane.width,
-                        src_row0,
-                        src_col0,
-                        fx,
-                        fy,
-                        w,
-                        h,
-                        intermediate_height as usize,
-                        interp_filter,
-                        pred,
-                    );
+                    if w == 4 {
+                        crate::simd::block_inter_predict_avx2_w4(
+                            ref_plane.as_slice(),
+                            ref_plane.width,
+                            src_row0,
+                            src_col0,
+                            fx,
+                            fy,
+                            h,
+                            intermediate_height as usize,
+                            interp_filter,
+                            pred,
+                        );
+                    } else {
+                        crate::simd::block_inter_predict_avx2(
+                            ref_plane.as_slice(),
+                            ref_plane.width,
+                            src_row0,
+                            src_col0,
+                            fx,
+                            fy,
+                            w,
+                            h,
+                            intermediate_height as usize,
+                            interp_filter,
+                            pred,
+                        );
+                    }
                 }
                 return;
             }
