@@ -81,18 +81,23 @@ Remaining (moved to P1's SIMD scope, not blocking): a u16 SIMD path for 10/12-bi
 Items the 2026-07-16 design retrospective rated keep-as-documented; the standing
 decision is now that they MAY be done. What "doing" each means, honestly:
 
-- **`frame_context_idx` dual field** (small): store only the raw `f(2)` value + an
-  `effective_idx()` accessor (one source of truth). The dual field was a deliberate
-  blast-radius call during a 2026-07-12 bugfix; folding it is safe now that
-  conformance pins behavior.
-- **Out-of-line test files for big modules** (small, cosmetic): `transform.rs` +
-  `transform/tests.rs` is the only module with the (nicer) split layout; standardize
-  the convention for the other large modules, or explicitly re-affirm inline tests.
-- **`prob_tables.rs` naming residue** (trivial): W5 already extracted subpel/MV tables;
-  what remains really is probability/tree/geometry data. Optional rename or leave.
-- **examples/-as-tools & single-crate layout** (no action recommended): re-evaluated in
-  the retrospective and still the right call at this size; revisit only if the tool
-  count grows (then: `tools/` crate or workspace).
+- **`frame_context_idx` dual field**: DONE 2026-07-22. Folded to the single raw `f(2)` value
+  plus a `NewFrameHeader::effective_frame_context_idx()` accessor (forces 0 when
+  `FrameIsIntra || error_resilient_mode`); the `reset_frame_context == 2` `save_probs` path
+  keeps using the raw value. Behaviour-preserving by construction (same u8 indices reach
+  load/save/reset); a header unit test pins the accessor over all input combinations.
+- **Out-of-line test files for big modules**: DONE 2026-07-22. Standardized on the split
+  layout for the large modules (following `transform.rs`): `header`, `lib` (crate root ->
+  `src/tests.rs`), `loop_filter`, `tile`, and `tile::mode_info` now keep their unit tests in a
+  sibling `<module>/tests.rs` via `#[cfg(test)] mod tests;`. Convention recorded in
+  `implementation-notes.md`. Smaller modules keep inline tests.
+- **`prob_tables.rs` naming residue**: DECIDED keep (2026-07-22). A rename touches every
+  `prob_tables::` import across the crate for a cosmetic gain; not worth the churn (the module
+  holds probability/tree/geometry constant data, which the name adequately covers). Revisit only
+  if the module is split.
+- **examples/-as-tools & single-crate layout** (no action recommended): re-affirmed — still the
+  right call at this size; revisit only if the tool count grows (then: `tools/` crate or
+  workspace).
 
 ## Non-goals (decided, not deferred)
 
