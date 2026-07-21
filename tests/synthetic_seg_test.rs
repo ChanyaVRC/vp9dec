@@ -34,7 +34,7 @@ use common::encoder::{
     encode_keyframe_tile, header_size, kb, SegSpec, HEIGHT, WIDTH,
 };
 use vp9dec::header::{SEG_LVL_ALT_L, SEG_LVL_REF_FRAME, SEG_LVL_SKIP};
-use vp9dec::prob_tables::{GOLDEN_FRAME, H_PRED, LAST_FRAME, V_PRED};
+use vp9dec::prob_tables::{ALTREF_FRAME, GOLDEN_FRAME, H_PRED, LAST_FRAME, V_PRED};
 use vp9dec::{DecodedFrame, Decoder};
 
 /// Decodes one chunk that must contain exactly one constituent frame (true for every
@@ -298,6 +298,137 @@ fn seg_lvl_ref_frame_steers_to_the_specific_slot_not_just_last() {
 }
 
 // ===========================================================================================
+// Test 1c: SEG_LVL_REF_FRAME steers to the ALTREF slot specifically (completes the
+// LAST/GOLDEN/ALTREF single-reference matrix -- Test 1b covers the GOLDEN-vs-LAST direction).
+//
+// Same shape as Test 1b, but the distinct content B is planted in physical slot 2 (ALTREF's
+// slot under ref_frame_idx = [0, 1, 2]) and the inter frame's feature_data = ALTREF_FRAME. A
+// correct decode resolves ALTREF -> ref_frame_idx[ALTREF - LAST_FRAME] = ref_frame_idx[2] =
+// slot 2 = B = 129; a decoder that mis-steered to LAST (slot 0) or GOLDEN (slot 1), or ignored
+// feature_data (defaulting to LAST), would instead reproduce A = 127. Two in-test companion
+// probes (steer to LAST, then GOLDEN -- both must give A = 127) pin that slots 0 and 1 still
+// hold A when the discriminator runs, so the ALTREF = 129 result came specifically from slot 2
+// and ALTREF is genuinely distinguished from *both* other single references, not just LAST.
+// ===========================================================================================
+
+/// Builds the ordered raw VP9 frame byte-streams for the ALTREF slot-steering scenario:
+/// `[keyframe, intra_only_hidden, inter]`. The hidden frame refreshes ONLY physical slot 2
+/// (ALTREF's slot), so LAST (slot 0) and GOLDEN (slot 1) both keep the key frame's content A.
+/// Shared by `seg_lvl_ref_frame_steers_to_the_altref_slot` and the external-cross-decode dump
+/// harness, so both decode exactly the same bytes.
+fn build_altref_steering_frames() -> Vec<Vec<u8>> {
+    let keyframe_compressed = build_keyframe_compressed_header();
+    let keyframe_header = build_keyframe_header(
+        0,
+        false,
+        &SegSpec::disabled(),
+        header_size(&keyframe_compressed),
+    );
+    let keyframe_tile = encode_keyframe_tile(
+        [
+            kb(None, V_PRED),
+            kb(None, V_PRED),
+            kb(None, V_PRED),
+            kb(None, V_PRED),
+        ],
+        [128; 7],
+    );
+    let keyframe_bytes = assemble_frame(keyframe_header, keyframe_compressed, keyframe_tile);
+
+    // intra_only, hidden: refresh ONLY physical slot 2 -- slots 0 and 1 (LAST/GOLDEN) keep A.
+    let intra_only_compressed = build_keyframe_compressed_header();
+    let intra_only_header = build_intra_only_header(
+        0x04,
+        &SegSpec::disabled(),
+        header_size(&intra_only_compressed),
+    );
+    let intra_only_tile = encode_keyframe_tile(
+        [
+            kb(None, H_PRED),
+            kb(None, H_PRED),
+            kb(None, H_PRED),
+            kb(None, H_PRED),
+        ],
+        [128; 7],
+    );
+    let intra_only_bytes =
+        assemble_frame(intra_only_header, intra_only_compressed, intra_only_tile);
+
+    let mut seg = SegSpec::enabled();
+    seg.feature_enabled[0][SEG_LVL_SKIP] = true;
+    seg.feature_enabled[0][SEG_LVL_REF_FRAME] = true;
+    seg.feature_data[0][SEG_LVL_REF_FRAME] = ALTREF_FRAME as i32;
+
+    let inter_compressed = build_inter_compressed_header();
+    // LAST->slot0 (A), GOLDEN->slot1 (A), ALTREF->slot2 (B); refresh_frame_flags = 0.
+    let inter_header = build_inter_header([0, 1, 2], 0, &seg, header_size(&inter_compressed));
+    let inter_tile = encode_inter_tile_forced([0, 0, 0, 0], seg.tree_probs);
+    let inter_bytes = assemble_frame(inter_header, inter_compressed, inter_tile);
+
+    vec![keyframe_bytes, intra_only_bytes, inter_bytes]
+}
+
+#[test]
+fn seg_lvl_ref_frame_steers_to_the_altref_slot() {
+    let frames = build_altref_steering_frames();
+
+    let mut decoder = Decoder::new();
+    let key_frame = decode_single(&mut decoder, &frames[0], "keyframe")
+        .frame
+        .expect("keyframe has show_frame = 1");
+    let hidden = decode_single(&mut decoder, &frames[1], "intra_only frame");
+    assert!(
+        hidden.frame.is_none(),
+        "intra_only frame has show_frame = 0 -> no visible output"
+    );
+    let inter = decode_single(&mut decoder, &frames[2], "inter frame");
+    let info = inter.info.expect("info recorded for a newly decoded frame");
+    let inter_frame = inter.frame.expect("inter frame has show_frame = 1");
+
+    assert!(info.seg_features_active[SEG_LVL_REF_FRAME]);
+    // Sanity: content A (the key frame, held by slots 0/LAST and 1/GOLDEN) really is flat 127 --
+    // confirms the discriminator below isn't vacuously comparing equal pixels.
+    for (i, &px) in key_frame.y.as_u8().iter().enumerate() {
+        assert_eq!(px, 127, "key frame (slots 0/1) must be flat A; Y pixel {i}");
+    }
+    // Discriminator: feature_data = ALTREF_FRAME must resolve to ref_frame_idx[ALTREF]'s slot
+    // (physical slot 2 = B = 129), not LAST's (slot 0 = A) or GOLDEN's (slot 1 = A), in *every*
+    // block -- a decoder that ignored FeatureData, or resolved the wrong slot, would leave 127.
+    for (i, &px) in inter_frame.y.as_u8().iter().enumerate() {
+        assert_eq!(
+            px, 129,
+            "SEG_LVL_REF_FRAME=ALTREF must copy slot 2's content (B) everywhere; Y pixel {i}"
+        );
+    }
+
+    // Companion probes: the same decoder, steered to LAST then GOLDEN, must both reproduce A.
+    // This pins that slots 0 and 1 still hold A when the discriminator runs (the ALTREF inter
+    // frame refreshed no slots), so the ALTREF = 129 result came specifically from slot 2.
+    for (steer, label) in [(LAST_FRAME, "LAST"), (GOLDEN_FRAME, "GOLDEN")] {
+        let mut seg = SegSpec::enabled();
+        seg.feature_enabled[0][SEG_LVL_SKIP] = true;
+        seg.feature_enabled[0][SEG_LVL_REF_FRAME] = true;
+        seg.feature_data[0][SEG_LVL_REF_FRAME] = steer as i32;
+        let compressed = build_inter_compressed_header();
+        let header = build_inter_header([0, 1, 2], 0, &seg, header_size(&compressed));
+        let tile = encode_inter_tile_forced([0, 0, 0, 0], seg.tree_probs);
+        let steered = decode_single(
+            &mut decoder,
+            &assemble_frame(header, compressed, tile),
+            "companion frame",
+        )
+        .frame
+        .expect("companion has show_frame = 1");
+        for (i, &px) in steered.y.as_u8().iter().enumerate() {
+            assert_eq!(
+                px, 127,
+                "{label}-steered companion must copy slot's content (A); Y pixel {i}"
+            );
+        }
+    }
+}
+
+// ===========================================================================================
 // Test 2: SEG_LVL_ALT_L.
 //
 // A key frame with 2 segments: row 0 (blocks (0,0)/(0,1), segment 0, no ALT_L) is V_PRED with
@@ -503,10 +634,11 @@ fn loop_filter_level_zero_skips_filtering_despite_nonzero_ref_delta() {
 /// The four synthetic scenarios plus the shown-frame count each must produce. The single source
 /// of truth for both the dump harness and the ffmpeg cross-decode test, so the dumped set can
 /// never silently diverge from the cross-checked set.
-fn scenarios() -> [(&'static str, Vec<Vec<u8>>, usize); 4] {
+fn scenarios() -> [(&'static str, Vec<Vec<u8>>, usize); 5] {
     [
         ("skip_ref", build_skip_ref_frames(), 2),
         ("steering", build_steering_frames(), 2),
+        ("altref_steering", build_altref_steering_frames(), 2),
         ("alt_l_0", build_alt_l_frames(0), 1),
         ("alt_l_63", build_alt_l_frames(63), 1),
     ]

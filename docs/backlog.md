@@ -55,8 +55,13 @@ Remaining (moved to P1's SIMD scope, not blocking): a u16 SIMD path for 10/12-bi
 - **fetch script exit-code bug** (trivial): `rc=$?` is captured after the `fi`, reading
   the if-statement's status instead of curl's (cosmetic — failures still surface via the
   summary).
-- **ALTREF slot-steering test** (small): SEG_LVL_REF_FRAME steering is proven for
-  GOLDEN-vs-LAST; an ALTREF-direction case would complete the matrix.
+- **ALTREF slot-steering test**: DONE 2026-07-22.
+  `seg_lvl_ref_frame_steers_to_the_altref_slot` (`tests/synthetic_seg_test.rs`) plants distinct
+  content in ALTREF's slot (physical slot 2 under `ref_frame_idx = [0, 1, 2]`) and forces
+  `feature_data = ALTREF_FRAME`, asserting the decode copies that slot; LAST- and GOLDEN-steered
+  companion probes pin that ALTREF is distinguished from *both* other single references. Cross-
+  decoded byte-identically by ffmpeg's `libvpx-vp9` and native `vp9`. Completes the
+  LAST/GOLDEN/ALTREF single-reference steering matrix (GOLDEN-vs-LAST was already proven).
 - **Invalid-input robustness**: DONE 2026-07-21. A deterministic fuzz (`tests/robustness_test.rs`
   -- truncation + bit-corruption + random) guards against panics on malformed input, and the
   official libvpx `invalid-*` vector family (`kVP9InvalidFileTests`) is now a strict gate:
