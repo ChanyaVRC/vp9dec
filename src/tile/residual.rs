@@ -445,7 +445,12 @@ impl TileDecoder {
             dequant[idx] = (t as i64 * ac_quant) / dq_denom;
         }
         dequant[0] = (tokens[0] as i64 * dc_quant) / dq_denom;
-        inverse_transform_block(&mut dequant[..seg_eob], n, tx_type, self.lossless);
+        {
+            let _t = crate::bench_timing::StageTimer::start(
+                crate::bench_timing::Stage::InverseTransform,
+            );
+            inverse_transform_block(&mut dequant[..seg_eob], n, tx_type, self.lossless);
+        }
 
         let max_val = (1i64 << self.bit_depth) - 1;
         for i in 0..n0 {

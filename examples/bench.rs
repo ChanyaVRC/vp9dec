@@ -51,6 +51,7 @@ const STAGE_NAMES: [&str; vp9dec::bench_timing::STAGE_COUNT] = [
     "  (in TileDecode) TokenDequantTransform",
     "  (in TileDecode) InterPredict",
     "  (in TileDecode) IntraPredict",
+    "    (subset of TokenDequantTransform) InverseTransform",
 ];
 
 fn main() {

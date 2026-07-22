@@ -31,10 +31,14 @@ pub enum Stage {
     InterPredict,
     /// Inside `TileDecode`: `predict_intra` (`predict_intra_block`).
     IntraPredict,
+    /// Inside `TokenDequantTransform` (a SUBSET of it, not additive): just the
+    /// `inverse_transform_block` call -- isolates the inverse-transform cost from token
+    /// decode + dequant + reconstruction, to size a potential transform SIMD wave.
+    InverseTransform,
 }
 
 /// Number of [`Stage`] variants (= array size for [`snapshot`]).
-pub const STAGE_COUNT: usize = 9;
+pub const STAGE_COUNT: usize = 10;
 
 #[cfg(feature = "bench-timing")]
 mod imp {
@@ -46,7 +50,7 @@ mod imp {
         static COUNTERS: [Cell<u64>; super::STAGE_COUNT] = const {
             [
                 Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0),
-                Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0),
+                Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0),
             ]
         };
     }
