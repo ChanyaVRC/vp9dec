@@ -41,9 +41,21 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   configs (full sweep 315/315) + ffmpeg cross-decode; a 500-trial `loop_filter/tests.rs` unit
   test pins the kernel against the scalar `sample_filtering`. **37.65 -> 41.63 MP/s, 1.11x** on
   1920x800 (tos, 17620 frames). Both loop-filter passes are now AVX2.
-- Wave 4 (NEXT): the remaining scalar hot spots are the inverse transforms (`transform.rs`
-  butterflies) and intra prediction. Same dispatch/bit-exact rules. Also still scalar: the
-  10/12-bit u16 path and the scaled (SVC/resize) inter path.
+- Wave 4b (AVX2 8-bit DCT_DCT inverse transform, all sizes 4/8/16/32): DONE 2026-07-23
+  (`src/simd.rs::inverse_transform_dct_dct_avx2`, `idct_pass` / `idct_simd` / `transpose*_i32`).
+  The scalar recursive `transform::idct` is mirrored verbatim on i32 8-lane vectors (8 rows in
+  parallel); the 2D driver runs two transpose-on-store passes (row -> R^T, column -> O with
+  round2). i32 lane storage is bit-exact for 8-bit because spec §8.7.1.1 bounds intermediates to
+  `8 + BitDepth == 16` bits, so every `t*cos64` product fits i32. Dispatched from
+  `tile/residual.rs` only for `bit_depth == 8 && tx_type == DctDct && !lossless`; ADST / WHT /
+  mixed and 10/12-bit stay scalar. Bit-exact both SIMD configs (full sweep 315/315) + ffmpeg
+  cross-decode; unit tests pin the 1D idct and the full 2D vs scalar for every size.
+  **45.07 -> 54.46 MP/s, 1.21x** on 854x356 (the transform was 23.8% of decode -- a profiled
+  `InverseTransform` sub-timer; ~3.6x on the transform itself).
+- Wave 4 (remaining): intra prediction is the only remaining named hot spot, but profiled at
+  ~0.3% on inter content -- not worth SIMD unless targeting intra-heavy / all-intra streams.
+  Still scalar (perf gap only): the 10/12-bit u16 path and the scaled (SVC/resize) inter path,
+  plus the ADST / WHT / mixed inverse transforms (minority of blocks).
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 

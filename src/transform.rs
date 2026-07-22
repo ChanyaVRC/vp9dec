@@ -37,7 +37,7 @@ const COS64_LOOKUP: [i64; 33] = [
 ];
 
 /// Spec §8.7.1.1 `cos64( angle )`.
-fn cos64(angle: i32) -> i64 {
+pub(crate) fn cos64(angle: i32) -> i64 {
     // `angle & 127` is equivalent to `angle.rem_euclid(128)` in two's complement.
     let angle2 = angle.rem_euclid(128);
     match angle2 {
@@ -49,12 +49,12 @@ fn cos64(angle: i32) -> i64 {
 }
 
 /// Spec §8.7.1.1 `sin64( angle ) = cos64( angle - 32 )`.
-fn sin64(angle: i32) -> i64 {
+pub(crate) fn sin64(angle: i32) -> i64 {
     cos64(angle - 32)
 }
 
 /// Spec §8.7.1.1 `brev(numBits, x)` (bit reversal).
-fn brev(num_bits: u32, x: usize) -> usize {
+pub(crate) fn brev(num_bits: u32, x: usize) -> usize {
     let mut t = 0usize;
     for i in 0..num_bits {
         let bit = (x >> i) & 1;
@@ -107,7 +107,7 @@ fn sh_op(t: &mut [i64], s: &[i64], a: usize, b: usize) {
 }
 
 /// Spec §8.7.1.2: input array reordering for the inverse DCT (bit-reversal permutation).
-fn idct_permute(t: &mut [i64], n: u32) {
+pub(crate) fn idct_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
     // Fixed-size scratch: called per row/column of every transform block, so avoiding a
     // heap alloc here matters. 32 is the max n0 (n <= 5, the 32x32 transform).
@@ -121,7 +121,7 @@ fn idct_permute(t: &mut [i64], n: u32) {
 /// Spec §8.7.1.3: the inverse DCT butterfly network itself (`2 <= n <= 5`).
 ///
 /// Assumes [`idct_permute`] has already been applied before this is called.
-fn idct(t: &mut [i64], n: u32) {
+pub(crate) fn idct(t: &mut [i64], n: u32) {
     let n0 = 1i64 << n;
     let n1 = 1i64 << (n - 1);
     let n2 = 1i64 << (n - 2);

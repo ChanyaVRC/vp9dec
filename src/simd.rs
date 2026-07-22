@@ -876,6 +876,302 @@ pub unsafe fn loop_filter_vert8_avx2(
     }
 }
 
+// ===========================================================================================
+// SIMD inverse DCT (SIMD wave 4b). The scalar `transform::idct` is a recursive butterfly network
+// on an i64 array; the functions below mirror it VERBATIM on i32 vectors, each element vector
+// holding that transform element across 8 rows (8 lanes) -- so 8 independent 1D row/column IDCTs
+// run in parallel. Bit-exact with the scalar path at bit_depth == 8: spec §8.7.1.1 bounds the
+// transform values there to 8 + BitDepth == 16 bits, so every product `t * cos64` (16b * 15b)
+// fits i32 and the i32 lane arithmetic reproduces the i64 scalar exactly. Only DCT_DCT (both
+// axes DCT) is vectorized; ADST / WHT / mixed and 10/12-bit stay scalar (negligible on typical
+// content, and outside the 16-bit-safe i32 assumption).
+// ===========================================================================================
+
+/// `round2(x, 14)` (`transform.rs::round2`) lane-wise; the b_op products fit i32 (see the module
+/// comment above), so `(x + 2^13) >> 14` arithmetic-shifted matches the scalar i64 round2.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn round2_14(x: __m256i) -> __m256i {
+    _mm256_srai_epi32(_mm256_add_epi32(x, _mm256_set1_epi32(1 << 13)), 14)
+}
+
+/// Vector `B(a, b, angle, flip)` butterfly (`transform.rs::b_op`) on 8 rows at once.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn b_op_simd(t: &mut [__m256i], a: usize, b: usize, angle: i32, flip: bool) {
+    let cos = _mm256_set1_epi32(crate::transform::cos64(angle) as i32);
+    let sin = _mm256_set1_epi32(crate::transform::sin64(angle) as i32);
+    let ta = t[a];
+    let tb = t[b];
+    // x = ta*cos - tb*sin ; y = ta*sin + tb*cos ; each product fits i32 (mullo is exact there).
+    let x = _mm256_sub_epi32(_mm256_mullo_epi32(ta, cos), _mm256_mullo_epi32(tb, sin));
+    let y = _mm256_add_epi32(_mm256_mullo_epi32(ta, sin), _mm256_mullo_epi32(tb, cos));
+    let na = round2_14(x);
+    let nb = round2_14(y);
+    if flip {
+        t[a] = nb;
+        t[b] = na;
+    } else {
+        t[a] = na;
+        t[b] = nb;
+    }
+}
+
+/// Vector `H(a, b, flip)` Hadamard rotation (`transform.rs::h_op`) on 8 rows.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn h_op_simd(t: &mut [__m256i], a: usize, b: usize, flip: bool) {
+    let (a, b) = if flip { (b, a) } else { (a, b) };
+    let x = t[a];
+    let y = t[b];
+    t[a] = _mm256_add_epi32(x, y);
+    t[b] = _mm256_sub_epi32(x, y);
+}
+
+/// Vector `idct_permute` (`transform.rs::idct_permute`): bit-reversal reorder of the element
+/// vectors (no arithmetic, so trivially the same at i32).
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn idct_permute_simd(t: &mut [__m256i], n: u32) {
+    let n0 = 1usize << n;
+    let mut copy_t = [_mm256_setzero_si256(); 32];
+    copy_t[..n0].copy_from_slice(&t[..n0]);
+    for (i, dst) in t[..n0].iter_mut().enumerate() {
+        *dst = copy_t[crate::transform::brev(n, i)];
+    }
+}
+
+/// Vector inverse-DCT butterfly network -- a verbatim mirror of `transform.rs::idct` (spec
+/// §8.7.1.3), operating on 8-row i32 element vectors. Assumes `idct_permute_simd` ran first.
+#[target_feature(enable = "avx2")]
+unsafe fn idct_simd(t: &mut [__m256i], n: u32) {
+    let n0 = 1i64 << n;
+    let n1 = 1i64 << (n - 1);
+    let n2 = 1i64 << (n - 2);
+
+    if n == 2 {
+        b_op_simd(t, 0, 1, 16, true);
+    } else {
+        idct_simd(t, n - 1);
+    }
+
+    for i in 0..n2 {
+        let a = (n1 + i) as usize;
+        let b = (n0 - 1 - i) as usize;
+        let angle = 32 - crate::transform::brev(5, a) as i32;
+        b_op_simd(t, a, b, angle, false);
+    }
+
+    if n >= 3 {
+        let n3 = 1i64 << (n - 3);
+        for i in 0..n3 {
+            for j in 0..2i64 {
+                let a = (n1 + 4 * i + 2 * j) as usize;
+                let b = (n1 + 1 + 4 * i + 2 * j) as usize;
+                h_op_simd(t, a, b, j == 1);
+            }
+        }
+    }
+
+    if n == 5 {
+        for i in 0..2i64 {
+            for j in 0..2i64 {
+                let a = (n0 - n as i64 + 3 - n2 * j - 4 * i) as usize;
+                let b = (n1 + n as i64 - 4 + n2 * j + 4 * i) as usize;
+                let angle = 28 - 16 * i as i32 + 56 * j as i32;
+                b_op_simd(t, a, b, angle, true);
+            }
+        }
+        let n3 = 1i64 << (n - 3);
+        for i in 0..2i64 {
+            for j in 0..4i64 {
+                let a = (n1 + n3 * j + i) as usize;
+                let b = (n1 + n2 - 5 + n3 * j - i) as usize;
+                h_op_simd(t, a, b, (j & 1) == 1);
+            }
+        }
+    }
+
+    if n >= 4 {
+        let imax_a: i64 = if n == 5 { 1 } else { 0 };
+        for i in 0..=imax_a {
+            for j in 0..2i64 {
+                let a = (n0 - n as i64 + 2 - i - n2 * j) as usize;
+                let b = (n1 + n as i64 - 3 + i + n2 * j) as usize;
+                let angle = 24 + 48 * j as i32;
+                b_op_simd(t, a, b, angle, true);
+            }
+        }
+        let imax_b: i64 = 2 * n as i64 - 7;
+        for j in 0..2i64 {
+            for i in 0..=imax_b {
+                let a = (n1 + n2 * j + i) as usize;
+                let b = (n1 + n2 - 1 + n2 * j - i) as usize;
+                h_op_simd(t, a, b, (j & 1) == 1);
+            }
+        }
+    }
+
+    if n >= 3 {
+        let n3 = 1i64 << (n - 3);
+        for i in 0..n3 {
+            let a = (n0 - n3 - 1 - i) as usize;
+            let b = (n1 + n3 + i) as usize;
+            b_op_simd(t, a, b, 16, true);
+        }
+    }
+
+    for i in 0..n1 {
+        let a = i as usize;
+        let b = (n0 - 1 - i) as usize;
+        h_op_simd(t, a, b, false);
+    }
+}
+
+/// Transposes a 4x4 i32 matrix (`r[i]` = row i) so `out[j]` = column j.
+#[inline]
+unsafe fn transpose4x4_i32(r: &[__m128i; 4]) -> [__m128i; 4] {
+    let a0 = _mm_unpacklo_epi32(r[0], r[1]);
+    let a1 = _mm_unpackhi_epi32(r[0], r[1]);
+    let a2 = _mm_unpacklo_epi32(r[2], r[3]);
+    let a3 = _mm_unpackhi_epi32(r[2], r[3]);
+    [
+        _mm_unpacklo_epi64(a0, a2),
+        _mm_unpackhi_epi64(a0, a2),
+        _mm_unpacklo_epi64(a1, a3),
+        _mm_unpackhi_epi64(a1, a3),
+    ]
+}
+
+/// Transposes an 8x8 i32 matrix (`r[i]` = row i) so `out[j]` = column j. Unpack network within
+/// each 128-bit lane, then a `permute2x128` pass to swap the diagonal 128-bit blocks.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose8x8_i32(r: &[__m256i; 8]) -> [__m256i; 8] {
+    let t0 = _mm256_unpacklo_epi32(r[0], r[1]);
+    let t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+    let t2 = _mm256_unpacklo_epi32(r[2], r[3]);
+    let t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+    let t4 = _mm256_unpacklo_epi32(r[4], r[5]);
+    let t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+    let t6 = _mm256_unpacklo_epi32(r[6], r[7]);
+    let t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+    let s0 = _mm256_unpacklo_epi64(t0, t2);
+    let s1 = _mm256_unpackhi_epi64(t0, t2);
+    let s2 = _mm256_unpacklo_epi64(t1, t3);
+    let s3 = _mm256_unpackhi_epi64(t1, t3);
+    let s4 = _mm256_unpacklo_epi64(t4, t6);
+    let s5 = _mm256_unpackhi_epi64(t4, t6);
+    let s6 = _mm256_unpacklo_epi64(t5, t7);
+    let s7 = _mm256_unpackhi_epi64(t5, t7);
+    [
+        _mm256_permute2x128_si256(s0, s4, 0x20),
+        _mm256_permute2x128_si256(s1, s5, 0x20),
+        _mm256_permute2x128_si256(s2, s6, 0x20),
+        _mm256_permute2x128_si256(s3, s7, 0x20),
+        _mm256_permute2x128_si256(s0, s4, 0x31),
+        _mm256_permute2x128_si256(s1, s5, 0x31),
+        _mm256_permute2x128_si256(s2, s6, 0x31),
+        _mm256_permute2x128_si256(s3, s7, 0x31),
+    ]
+}
+
+/// `round2(x, shift)` with a runtime shift (the 2D column pass's `min(n+2, 6)`), lane-wise.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn round2_var(x: __m256i, shift: u32) -> __m256i {
+    let add = _mm256_set1_epi32(1 << (shift - 1));
+    _mm256_sra_epi32(_mm256_add_epi32(x, add), _mm_cvtsi32_si128(shift as i32))
+}
+
+/// One separable pass of the 2D inverse DCT: transforms every "row" of `input` (n0 x n0,
+/// row-major i32) and writes the result TRANSPOSED into `output`, so running this twice (row
+/// then column) lands the 2D result back in row-major. `round_shift` is `None` for the row pass
+/// and `Some(min(n+2,6))` for the column pass (spec §8.7.2). Vectorizes across 8 rows at a time
+/// (4 for n0==4); each element vector holds one transform coefficient across those rows.
+#[target_feature(enable = "avx2")]
+unsafe fn idct_pass(
+    input: &[i32; 1024],
+    output: &mut [i32; 1024],
+    n: u32,
+    round_shift: Option<u32>,
+) {
+    let n0 = 1usize << n;
+
+    if n0 == 4 {
+        let mut rows4 = [_mm_setzero_si128(); 4];
+        for (r, slot) in rows4.iter_mut().enumerate() {
+            *slot = _mm_loadu_si128(input.as_ptr().add(r * 4) as *const __m128i);
+        }
+        let cols = transpose4x4_i32(&rows4);
+        let mut t = [_mm256_setzero_si256(); 32];
+        for (c, &col) in cols.iter().enumerate() {
+            t[c] = _mm256_castsi128_si256(col);
+        }
+        idct_permute_simd(&mut t, n);
+        idct_simd(&mut t, n);
+        for (k, tk) in t[..4].iter().enumerate() {
+            let v = round_shift.map_or(*tk, |sh| round2_var(*tk, sh));
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(k * 4) as *mut __m128i,
+                _mm256_castsi256_si128(v),
+            );
+        }
+        return;
+    }
+
+    let mut cs = 0usize;
+    while cs < n0 {
+        // Build element vectors t[0..n0] (t[k] = coefficient k across rows cs..cs+8) by
+        // transposing the 8-row chunk one 8-column block at a time.
+        let mut t = [_mm256_setzero_si256(); 32];
+        let mut g = 0usize;
+        while g < n0 {
+            let mut rows8 = [_mm256_setzero_si256(); 8];
+            for (r, slot) in rows8.iter_mut().enumerate() {
+                *slot = _mm256_loadu_si256(input.as_ptr().add((cs + r) * n0 + g) as *const __m256i);
+            }
+            let cols = transpose8x8_i32(&rows8);
+            t[g..g + 8].copy_from_slice(&cols);
+            g += 8;
+        }
+        idct_permute_simd(&mut t, n);
+        idct_simd(&mut t, n);
+        for (k, tk) in t[..n0].iter().enumerate() {
+            let v = round_shift.map_or(*tk, |sh| round2_var(*tk, sh));
+            _mm256_storeu_si256(output.as_mut_ptr().add(k * n0 + cs) as *mut __m256i, v);
+        }
+        cs += 8;
+    }
+}
+
+/// AVX2 DCT_DCT 2D inverse transform (spec §8.7.2), the 8-bit-only vectorization of the DctDct
+/// arm of `transform::inverse_transform_block`. Transforms `dequant` (an n0 x n0 row-major i64
+/// array, n0 = 1 << n) in place. Bit-exact with the scalar path for conformant 8-bit streams
+/// (see the SIMD-inverse-DCT module comment): the i64 values fit i32 there, so the narrower lane
+/// arithmetic is identical. Caller must gate on `avx2_enabled()`, `bit_depth == 8`,
+/// `tx_type == DctDct`, and `!lossless`.
+///
+/// # Safety
+/// `avx2_enabled()` must hold and `dequant.len()` must be `(1 << n) * (1 << n)` with `2 <= n <= 5`.
+#[target_feature(enable = "avx2")]
+pub unsafe fn inverse_transform_dct_dct_avx2(dequant: &mut [i64], n: u32) {
+    let n0 = 1usize << n;
+    let count = n0 * n0;
+    let mut buf = [0i32; 1024];
+    let mut buf2 = [0i32; 1024];
+    for (dst, &src) in buf[..count].iter_mut().zip(dequant[..count].iter()) {
+        *dst = src as i32;
+    }
+    // Row pass (no rounding) -> buf2 == R^T; column pass (round2(min(n+2,6))) -> buf == O.
+    idct_pass(&buf, &mut buf2, n, None);
+    let shift = (n + 2).min(6);
+    idct_pass(&buf2, &mut buf, n, Some(shift));
+    for (dst, &src) in dequant[..count].iter_mut().zip(buf[..count].iter()) {
+        *dst = src as i64;
+    }
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
@@ -959,6 +1255,84 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The vector 1D inverse DCT (`idct_permute_simd` + `idct_simd`) must exactly reproduce the
+    /// scalar `transform::idct_permute` + `transform::idct` on each of its 8 lanes, for every
+    /// size n = 2..=5. Inputs are kept small (structure-validating) so no intermediate exceeds
+    /// i32 -- magnitude-independent index/angle/flip bugs still show up, and the i32-vs-i64
+    /// agreement on realistic ranges is covered end-to-end by the 2D test and the official sweep.
+    #[test]
+    fn idct_simd_1d_matches_scalar() {
+        if !avx2_enabled() {
+            return;
+        }
+        let mut seed = 0x9E3779B9u32;
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            for _ in 0..200 {
+                let mut rows = [[0i64; 32]; 8];
+                for row in rows.iter_mut() {
+                    for v in row[..n0].iter_mut() {
+                        *v = (xorshift32(&mut seed) & 0x7FF) as i64 - 1024;
+                    }
+                }
+                let mut scalar = rows;
+                for row in scalar.iter_mut() {
+                    crate::transform::idct_permute(&mut row[..n0], n);
+                    crate::transform::idct(&mut row[..n0], n);
+                }
+                let mut t = [unsafe { _mm256_setzero_si256() }; 32];
+                for (k, tk) in t[..n0].iter_mut().enumerate() {
+                    let lanes: [i32; 8] = std::array::from_fn(|r| rows[r][k] as i32);
+                    *tk = unsafe { _mm256_loadu_si256(lanes.as_ptr() as *const __m256i) };
+                }
+                unsafe {
+                    idct_permute_simd(&mut t, n);
+                    idct_simd(&mut t, n);
+                }
+                for (k, &tk) in t[..n0].iter().enumerate() {
+                    let mut lanes = [0i32; 8];
+                    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, tk) };
+                    for (r, &lane) in lanes.iter().enumerate() {
+                        assert_eq!(lane as i64, scalar[r][k], "n={n}: row {r}, elem {k}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The full 2D `inverse_transform_dct_dct_avx2` must exactly reproduce the scalar
+    /// `transform::inverse_transform_block` (DctDct, non-lossless) for every size n = 2..=5.
+    /// Inputs are kept small (±64) so no intermediate exceeds i32 even in the worst case, which
+    /// isolates the transpose/driver/mirror structure; the i32-vs-i64 agreement on realistic
+    /// (spec §8.7.1.1 16-bit-bounded) magnitudes is proven end-to-end by the official sweep.
+    #[test]
+    fn inverse_transform_dct_dct_simd_matches_scalar() {
+        if !avx2_enabled() {
+            return;
+        }
+        let mut seed = 0x2468ACE0u32;
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            let count = n0 * n0;
+            for _ in 0..100 {
+                let mut dq = vec![0i64; count];
+                for v in dq.iter_mut() {
+                    *v = (xorshift32(&mut seed) & 0x7F) as i64 - 64;
+                }
+                let mut scalar = dq.clone();
+                crate::transform::inverse_transform_block(
+                    &mut scalar,
+                    n,
+                    crate::transform::TxType::DctDct,
+                    false,
+                );
+                let mut simd = dq.clone();
+                unsafe { inverse_transform_dct_dct_avx2(&mut simd, n) };
+                assert_eq!(scalar, simd, "n={n}: 2D SIMD idct != scalar");
             }
         }
     }

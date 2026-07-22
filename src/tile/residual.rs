@@ -449,6 +449,23 @@ impl TileDecoder {
             let _t = crate::bench_timing::StageTimer::start(
                 crate::bench_timing::Stage::InverseTransform,
             );
+            // AVX2 fast path (SIMD wave 4b) for the common 8-bit DCT_DCT case; ADST/WHT/mixed
+            // and 10/12-bit take the scalar transform, which the SIMD path is bit-exact against
+            // (spec §8.7.1.1's 16-bit conformance bound keeps 8-bit intermediates inside i32).
+            #[cfg(target_arch = "x86_64")]
+            if self.bit_depth == 8
+                && !self.lossless
+                && tx_type == TxType::DctDct
+                && crate::simd::avx2_enabled()
+            {
+                // SAFETY: avx2_enabled() checked; dequant[..seg_eob] is exactly n0*n0 (== seg_eob).
+                unsafe {
+                    crate::simd::inverse_transform_dct_dct_avx2(&mut dequant[..seg_eob], n);
+                }
+            } else {
+                inverse_transform_block(&mut dequant[..seg_eob], n, tx_type, self.lossless);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
             inverse_transform_block(&mut dequant[..seg_eob], n, tx_type, self.lossless);
         }
 

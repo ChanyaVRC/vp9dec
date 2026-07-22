@@ -23,13 +23,14 @@ overview. A resolved bug needs no entry.
 - **Cross-frame ownership.** DPB slots, `prev_mi_grid` / `prev_segment_ids`, and the compressed-
   header probability context are shared via `Arc` or borrowed, not deep-cloned per frame
   (performance only — the sweep is byte-identical before/after).
-- **SIMD.** AVX2 covers 8-bit unscaled inter-prediction (widths 8/16/32/64 via
-  `block_inter_predict_avx2`, width 4 via the 128-bit `block_inter_predict_avx2_w4`) and 8-bit
-  loop-filter edges on **both** passes -- horizontal (`loop_filter_horiz8_avx2`) and vertical
+- **SIMD.** AVX2 covers, for 8-bit content: unscaled inter-prediction (widths 8/16/32/64 via
+  `block_inter_predict_avx2`, width 4 via the 128-bit `block_inter_predict_avx2_w4`); loop-filter
+  edges on **both** passes -- horizontal (`loop_filter_horiz8_avx2`) and vertical
   (`loop_filter_vert8_avx2`, which transposes the tap window into the horizontal kernel's layout
-  and reuses it), each covering narrow / wide8 / wide16. Runtime-detected and cached;
-  `VP9DEC_NO_SIMD=1` forces scalar. Output must equal the scalar path — the sweep passes 315/315
-  in both configs.
+  and reuses it), each covering narrow / wide8 / wide16; and the **DCT_DCT inverse transform**
+  (all sizes 4/8/16/32, `inverse_transform_dct_dct_avx2` -- the scalar recursive idct mirrored on
+  i32 8-lane vectors). Runtime-detected and cached; `VP9DEC_NO_SIMD=1` forces scalar. Output must
+  equal the scalar path — the sweep passes 315/315 in both configs.
 
 Architecture and the module map live in `README.md`; the acceptance gate is the `verify-vp9dec`
 skill; change-navigation is the `vp9dec-architecture` skill.
@@ -43,6 +44,11 @@ skill; change-navigation is the `vp9dec-architecture` skill.
 - **The loop filter's AVX2 dispatch is gated on `bit_depth == 8`.** The AVX2 kernels
   (`src/simd.rs`) are u8-only; letting them run on a 10/12-bit path silently corrupts output.
   The inter-prediction AVX2 path is gated the same way. Any new SIMD kernel must gate likewise.
+- **The AVX2 DCT_DCT inverse transform uses i32 lane storage, valid only at `bit_depth == 8`.**
+  Spec §8.7.1.1 bounds 8-bit transform intermediates to 16 bits, so every `t*cos64` product fits
+  i32; at 10/12-bit they would overflow. The dispatch (`tile/residual.rs`) gates on
+  `bit_depth == 8 && tx_type == DctDct && !lossless` -- do not widen it. ADST / WHT / mixed
+  transforms stay scalar (they are the minority of blocks and outside the i32-safe assumption).
 - **Loop-filter constants are 8-bit and scale by `<< (bit_depth - 8)`** (identity at 8-bit). Any
   loop-filter change must be re-verified at 10/12-bit, not just 8-bit.
 - **The whole per-frame loop filter is gated on the frame-level `loop_filter_level` (spec §8.1),
@@ -80,9 +86,10 @@ skill; change-navigation is the `vp9dec-architecture` skill.
 
 ## Known gaps
 
-- **No SIMD for the 10/12-bit path, reference-scaled inter prediction, the inverse transforms, or
-  intra prediction** (nor aarch64 NEON). The scalar path there is correct and bit-exact; this is a
-  performance gap only, tracked in `docs/backlog.md`.
+- **No SIMD for the 10/12-bit path, reference-scaled inter prediction, intra prediction, or the
+  ADST / WHT / mixed inverse transforms** (the common 8-bit DCT_DCT transform *is* vectorized;
+  nor aarch64 NEON). The scalar path there is correct and bit-exact; this is a performance gap
+  only, tracked in `docs/backlog.md`. (Intra prediction profiled at ~0.3% on inter content.)
 - **`SEG_LVL_ALT_L` / `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` have no official test vector.** They
   are proven instead by synthetic round-trip vectors (`tests/synthetic_seg_test.rs`)
   cross-decoded byte-identically by ffmpeg's `libvpx-vp9` and native `vp9` decoders.
