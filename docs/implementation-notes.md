@@ -23,13 +23,14 @@ overview. A resolved bug needs no entry.
 - **Cross-frame ownership.** DPB slots, `prev_mi_grid` / `prev_segment_ids`, and the compressed-
   header probability context are shared via `Arc` or borrowed, not deep-cloned per frame
   (performance only — the sweep is byte-identical before/after).
-- **SIMD.** AVX2 covers unscaled inter-prediction for **all bit depths** (widths 8/16/32/64 via
+- **SIMD.** AVX2 covers, for **all bit depths**: unscaled inter-prediction (widths 8/16/32/64 via
   `block_inter_predict_avx2`, width 4 via the 128-bit `block_inter_predict_avx2_w4`; the subpel
   FIR is bit-depth-agnostic and its i32 accumulation holds a 12-bit sample, so only the `clip1`
-  bound differs -- the caller passes `max_val = (1<<bit_depth)-1`). For **8-bit content only**:
-  loop-filter edges on **both** passes -- horizontal (`loop_filter_horiz8_avx2`) and vertical
-  (`loop_filter_vert8_avx2`, which transposes the tap window into the horizontal kernel's layout
-  and reuses it), each covering narrow / wide8 / wide16; and the **DCT_DCT inverse transform +
+  bound differs -- the caller passes `max_val = (1<<bit_depth)-1`); and loop-filter edges on
+  **both** passes -- horizontal (`loop_filter_horiz8_avx2`) and vertical (`loop_filter_vert8_avx2`,
+  which transposes the tap window into the horizontal kernel's layout and reuses it), each
+  covering narrow / wide8 / wide16 (the 8-bit base / clamp / flat-threshold constants scale by
+  `<< (bit_depth-8)` inside the kernel). For **8-bit content only**: the **DCT_DCT inverse transform +
   reconstruction** (all sizes 4/8/16/32, `inverse_transform_dct_dct_reconstruct_avx2` -- the
   scalar recursive idct mirrored on i32 8-lane vectors, fused with the residual-add + 8-bit clip
   so the result is written straight into the plane, skipping the i64 round-trip). Runtime-detected
@@ -59,9 +60,11 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   path -- re-run the `vp90-2-08-tile_1x{2,4,8}` sweep vectors after touching availability or
   prediction near tile edges. The merge copies only the written pixel columns (up to
   `mi_col_end*8`); padding past `mi_cols` is never written by either path, so it stays zero in both.
-- **The loop filter's AVX2 dispatch is gated on `bit_depth == 8`.** The AVX2 kernels
-  (`src/simd.rs`) are u8-only; letting them run on a 10/12-bit path silently corrupts output.
-  The inter-prediction AVX2 path is gated the same way. Any new SIMD kernel must gate likewise.
+- **The AVX2 inter-prediction and loop-filter kernels are all-depth; the transform is 8-bit-only.**
+  Inter-pred takes a `max_val` clip bound and the loop filter scales its 8-bit constants by
+  `<< (bit_depth-8)`, so both run at 10/12-bit. Only the DCT_DCT transform kernel is `bit_depth ==
+  8`-gated (next landmine). Any *new* SIMD kernel with hardcoded 8-bit constants must gate likewise
+  until it is made depth-aware.
 - **The AVX2 DCT_DCT inverse transform uses i32 lane storage, valid only at `bit_depth == 8`.**
   Spec §8.7.1.1 bounds 8-bit transform intermediates to 16 bits, so every `t*cos64` product fits
   i32; at 10/12-bit they would overflow. The dispatch (`tile/residual.rs`) gates on
@@ -104,7 +107,7 @@ skill; change-navigation is the `vp9dec-architecture` skill.
 
 ## Known gaps
 
-- **No SIMD for: the 10/12-bit loop filter and inverse transform** (inter-prediction *is*
+- **No SIMD for: the 10/12-bit inverse transform** (inter-prediction and the loop filter *are*
   vectorized at all depths now), **reference-scaled inter prediction, intra prediction, or the
   ADST / WHT / mixed inverse transforms** (the common 8-bit DCT_DCT transform *is* vectorized;
   nor aarch64 NEON). The scalar path there is correct and bit-exact; this is a performance gap

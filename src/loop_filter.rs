@@ -478,16 +478,16 @@ fn superblock_loop_filter(
 
     let num_edges = 16u32 >> sub;
     for edge in 0..num_edges {
-        // AVX2 fast path (both passes), gated on `bit_depth == 8`: the kernels' constants (128,
-        // +/-128, flat threshold 1) are only valid at that depth -- 10/12-bit frames take the
-        // scalar path below, which scales those constants itself. pass==1 (horizontal) has the
-        // along-edge axis contiguous in memory (SIMD wave 3); pass==0 (vertical) transposes the
-        // tap window into that same layout (SIMD wave 4, see
+        // AVX2 fast path (both passes, all bit depths): the kernels' 8-bit constants (128,
+        // +/-128, flat threshold 1) scale by `<< (bit_depth - 8)` inside the kernel, and the
+        // limit/blimit/thresh strengths are bit-depth-computed by `adaptive_filter_strength`
+        // below. pass==1 (horizontal) has the along-edge axis contiguous in memory (SIMD wave 3);
+        // pass==0 (vertical) transposes the tap window into that same layout (SIMD wave 4, see
         // `superblock_loop_filter_vert_edge_avx2` / `simd::loop_filter_vert8_avx2`). Both decide
         // WHICH positions filter and how strongly via the same `edge_position_params` the scalar
         // loop uses -- only the pixel arithmetic is vectorized.
         #[cfg(target_arch = "x86_64")]
-        if bit_depth == 8 && crate::simd::avx2_enabled() {
+        if crate::simd::avx2_enabled() {
             let edge_avx2 = if pass == 1 {
                 superblock_loop_filter_horiz_edge_avx2
             } else {
@@ -511,6 +511,7 @@ fn superblock_loop_filter(
                 sub,
                 edge_len,
                 edge,
+                bit_depth,
             );
             continue;
         }
@@ -582,6 +583,7 @@ fn superblock_loop_filter_horiz_edge_avx2(
     sub: u32,
     edge_len: u32,
     edge: u32,
+    bit_depth: u8,
 ) {
     let mut i = 0u32;
     while i < edge_len {
@@ -622,12 +624,10 @@ fn superblock_loop_filter_horiz_edge_avx2(
             debug_assert_eq!(px, x0 + lane as usize, "pass==1 edge: x is contiguous");
 
             if apply_filter && lvl > 0 {
-                // bit_depth is hardcoded to 8: the caller (`superblock_loop_filter`) only
-                // reaches this whole function under its own `bit_depth == 8` gate.
                 eligible[lane as usize] = -1;
                 is_tx8[lane as usize] = -((filter_size == TX_8X8) as i32);
                 is_tx16[lane as usize] = -((filter_size == TX_16X16) as i32);
-                let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, 8);
+                let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, bit_depth);
                 limit[lane as usize] = l;
                 blimit[lane as usize] = bl;
                 thresh[lane as usize] = th;
@@ -658,6 +658,7 @@ fn superblock_loop_filter_horiz_edge_avx2(
                     &limit,
                     &blimit,
                     &thresh,
+                    bit_depth,
                 );
             }
         }
@@ -693,6 +694,7 @@ fn superblock_loop_filter_vert_edge_avx2(
     sub: u32,
     edge_len: u32,
     edge: u32,
+    bit_depth: u8,
 ) {
     let mut i = 0u32;
     while i < edge_len {
@@ -738,7 +740,7 @@ fn superblock_loop_filter_vert_edge_avx2(
                 eligible[lane as usize] = -1;
                 is_tx8[lane as usize] = -((filter_size == TX_8X8) as i32);
                 is_tx16[lane as usize] = -((filter_size == TX_16X16) as i32);
-                let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, 8);
+                let (l, bl, th) = adaptive_filter_strength(lvl, sharpness, bit_depth);
                 limit[lane as usize] = l;
                 blimit[lane as usize] = bl;
                 thresh[lane as usize] = th;
@@ -769,6 +771,7 @@ fn superblock_loop_filter_vert_edge_avx2(
                     &limit,
                     &blimit,
                     &thresh,
+                    bit_depth,
                 );
             }
         }

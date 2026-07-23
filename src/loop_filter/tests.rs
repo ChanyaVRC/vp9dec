@@ -233,6 +233,7 @@ fn avx2_horiz8_matches_scalar_sample_filtering() {
                 &limit,
                 &blimit,
                 &thresh,
+                8,
             );
         }
 
@@ -335,6 +336,7 @@ fn avx2_vert8_matches_scalar_sample_filtering() {
                 &limit,
                 &blimit,
                 &thresh,
+                8,
             );
         }
 

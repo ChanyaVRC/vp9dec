@@ -274,6 +274,7 @@ pub unsafe fn loop_filter_horiz8_avx2(
     limit: &[i32; 8],
     blimit: &[i32; 8],
     thresh: &[i32; 8],
+    bit_depth: u8,
 ) {
     let base = plane_data.as_mut_ptr();
 
@@ -330,11 +331,15 @@ pub unsafe fn loop_filter_horiz8_avx2(
 
     // Spec §8.8.5.2 "Narrow filter process" (`filter4`) -- computed unconditionally (cheap,
     // and the common TX_4X4-heavy case selects it; both wide fast paths below reuse it).
-    let c128 = _mm256_set1_epi32(128);
+    // The 8-bit base (128) and clamp range (-128..=127) scale by `<< (bit_depth - 8)`, matching
+    // `loop_filter.rs::narrow_filter`'s `half` / `clamp_hi` / `clamp_lo` (identity at 8-bit).
+    let clamp_hi = (128i32 << (bit_depth - 8)) - 1;
+    let clamp_lo = -(clamp_hi + 1);
+    let c128 = _mm256_set1_epi32(1 << (bit_depth - 1));
     let clamp4 = |v: __m256i| {
         _mm256_min_epi32(
-            _mm256_max_epi32(v, _mm256_set1_epi32(-128)),
-            _mm256_set1_epi32(127),
+            _mm256_max_epi32(v, _mm256_set1_epi32(clamp_lo)),
+            _mm256_set1_epi32(clamp_hi),
         )
     };
 
@@ -396,8 +401,9 @@ pub unsafe fn loop_filter_horiz8_avx2(
     }
 
     // flat_mask, gated on filter_size >= TX_8X8 (is_wide_v) exactly like the scalar
-    // `if filter_size >= TX_8X8 { .. }` (else flat_mask stays false -> narrow selected).
-    let one = _mm256_set1_epi32(1);
+    // `if filter_size >= TX_8X8 { .. }` (else flat_mask stays false -> narrow selected). The
+    // flat threshold is 1 at 8-bit and scales `<< (bit_depth - 8)` (scalar's `threshold`).
+    let one = _mm256_set1_epi32(1 << (bit_depth - 8));
     let mut fm = gt(abs_diff(p1, p0), one);
     fm = _mm256_or_si256(fm, gt(abs_diff(q1, q0), one));
     fm = _mm256_or_si256(fm, gt(abs_diff(p2, p0), one));
@@ -800,6 +806,7 @@ pub unsafe fn loop_filter_vert8_avx2(
     limit: &[i32; 8],
     blimit: &[i32; 8],
     thresh: &[i32; 8],
+    bit_depth: u8,
 ) {
     // Wide window (16 tap columns x0-8..x0+7) iff a lane needs the TX_16X16 wide16 filter, else
     // the narrow window (8 tap columns x0-4..x0+3). Mirrors the horizontal kernel's own is_tx16
@@ -851,6 +858,7 @@ pub unsafe fn loop_filter_vert8_avx2(
         limit,
         blimit,
         thresh,
+        bit_depth,
     );
 
     // Transpose the (now filtered) scratch back to the plane. Rows the kernel left unwritten keep

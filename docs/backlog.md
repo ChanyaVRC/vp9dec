@@ -65,12 +65,19 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   `max_val = (1<<bit_depth)-1`, and the `predict.rs` dispatch no longer gates on `bit_depth == 8`.
   Bit-exact (sweep 315/315 both configs, incl. the `vp9{2,3}-2-20-1{0,2}bit-*` vectors). No large
   high-bit-depth clip exists to bench precisely (the conformance HBD clips are ~160x90x10 frames).
+- 10/12-bit loop-filter SIMD: DONE 2026-07-23. The AVX2 loop-filter kernels
+  (`loop_filter_horiz8_avx2` / `_vert8_avx2`) take `bit_depth` and scale their three 8-bit
+  constants -- narrow base `1<<(bit_depth-1)`, clamp range `+/-(128<<(bit_depth-8))`, flat
+  threshold `1<<(bit_depth-8)` -- matching the scalar `narrow_filter` / `compute_filter_mask`
+  (limit/blimit/thresh were already bit-depth values from `adaptive_filter_strength`). The
+  `superblock_loop_filter` dispatch no longer gates on `bit_depth == 8`. Bit-exact (sweep 315/315
+  both configs, incl. the 10/12-bit vectors).
 - Wave 4 (remaining): intra prediction is the only remaining named hot spot, but profiled at
   ~0.3% on inter content -- not worth SIMD unless targeting intra-heavy / all-intra streams.
-  Still scalar (perf gap only): the **10/12-bit loop filter and inverse transform** (inter-pred is
-  now SIMD at all depths; the loop-filter constants would need `<< (bit_depth-8)` scaling, and the
-  i32 transform overflows past 8-bit so it needs i64), the scaled (SVC/resize) inter path, and the
-  ADST / WHT / mixed inverse transforms (minority of blocks).
+  Still scalar (perf gap only): the **10/12-bit inverse transform** (inter-pred and loop filter
+  are now SIMD at all depths; the i32 transform overflows past 8-bit so it would need i64), the
+  scaled (SVC/resize) inter path, and the ADST / WHT / mixed inverse transforms (minority of
+  blocks -- ~150-200 lines of ADST-specific SIMD for ~0.3% intra ROI, so low priority).
 - Tile-parallel multithreading (a different lever than SIMD, same realtime goal): DONE
   2026-07-23 (`tile::decode_tiles_parallel` / `spawn_column_worker` / `merge_column_worker` +
   `Counts::add_assign`). A frame with >1 tile column and 1 tile row decodes each column on its own
