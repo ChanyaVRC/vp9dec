@@ -27,10 +27,12 @@ overview. A resolved bug needs no entry.
   `block_inter_predict_avx2`, width 4 via the 128-bit `block_inter_predict_avx2_w4`); loop-filter
   edges on **both** passes -- horizontal (`loop_filter_horiz8_avx2`) and vertical
   (`loop_filter_vert8_avx2`, which transposes the tap window into the horizontal kernel's layout
-  and reuses it), each covering narrow / wide8 / wide16; and the **DCT_DCT inverse transform**
-  (all sizes 4/8/16/32, `inverse_transform_dct_dct_avx2` -- the scalar recursive idct mirrored on
-  i32 8-lane vectors). Runtime-detected and cached; `VP9DEC_NO_SIMD=1` forces scalar. Output must
-  equal the scalar path — the sweep passes 315/315 in both configs.
+  and reuses it), each covering narrow / wide8 / wide16; and the **DCT_DCT inverse transform +
+  reconstruction** (all sizes 4/8/16/32, `inverse_transform_dct_dct_reconstruct_avx2` -- the
+  scalar recursive idct mirrored on i32 8-lane vectors, fused with the residual-add + 8-bit clip
+  so the result is written straight into the plane, skipping the i64 round-trip). Runtime-detected
+  and cached; `VP9DEC_NO_SIMD=1` forces scalar. Output must equal the scalar path — the sweep
+  passes 315/315 in both configs.
 
 Architecture and the module map live in `README.md`; the acceptance gate is the `verify-vp9dec`
 skill; change-navigation is the `vp9dec-architecture` skill.

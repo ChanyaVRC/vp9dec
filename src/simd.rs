@@ -1145,30 +1145,81 @@ unsafe fn idct_pass(
     }
 }
 
-/// AVX2 DCT_DCT 2D inverse transform (spec §8.7.2), the 8-bit-only vectorization of the DctDct
-/// arm of `transform::inverse_transform_block`. Transforms `dequant` (an n0 x n0 row-major i64
-/// array, n0 = 1 << n) in place. Bit-exact with the scalar path for conformant 8-bit streams
-/// (see the SIMD-inverse-DCT module comment): the i64 values fit i32 there, so the narrower lane
-/// arithmetic is identical. Caller must gate on `avx2_enabled()`, `bit_depth == 8`,
-/// `tx_type == DctDct`, and `!lossless`.
-///
-/// # Safety
-/// `avx2_enabled()` must hold and `dequant.len()` must be `(1 << n) * (1 << n)` with `2 <= n <= 5`.
+/// The two separable passes of the AVX2 8-bit DCT_DCT 2D inverse transform (spec §8.7.2):
+/// converts `dequant` (n0 x n0 row-major i64) to i32, runs the row pass (-> R^T) then the column
+/// pass (-> O, with `round2(min(n+2,6))`), and writes O row-major into `out`. Bit-exact with the
+/// scalar path for conformant 8-bit streams (see the SIMD-inverse-DCT module comment): the i64
+/// values fit i32 there, so the narrower lane arithmetic is identical. `dequant.len()` must be
+/// `n0*n0` (`2 <= n <= 5`).
 #[target_feature(enable = "avx2")]
-pub unsafe fn inverse_transform_dct_dct_avx2(dequant: &mut [i64], n: u32) {
-    let n0 = 1usize << n;
-    let count = n0 * n0;
+unsafe fn idct_2d_dct(dequant: &[i64], n: u32, out: &mut [i32; 1024]) {
+    let count = (1usize << n) * (1usize << n);
     let mut buf = [0i32; 1024];
     let mut buf2 = [0i32; 1024];
     for (dst, &src) in buf[..count].iter_mut().zip(dequant[..count].iter()) {
         *dst = src as i32;
     }
-    // Row pass (no rounding) -> buf2 == R^T; column pass (round2(min(n+2,6))) -> buf == O.
-    idct_pass(&buf, &mut buf2, n, None);
-    let shift = (n + 2).min(6);
-    idct_pass(&buf2, &mut buf, n, Some(shift));
-    for (dst, &src) in dequant[..count].iter_mut().zip(buf[..count].iter()) {
-        *dst = src as i64;
+    idct_pass(&buf, &mut buf2, n, None); // row pass -> buf2 == R^T
+    idct_pass(&buf2, out, n, Some((n + 2).min(6))); // column pass -> out == O
+}
+
+/// AVX2 8-bit DCT_DCT inverse transform + reconstruction (SIMD wave 4b), fused: transforms
+/// `dequant` and adds the residual straight into the plane with the 8-bit clip
+/// (`clip(pred + residual, 0, 255)`), skipping both the i64 write-back a standalone transform
+/// would do and the scalar per-pixel reconstruction loop. The n0 x n0 block sits at
+/// `(start_x, start_y)` in the row-major u16 `plane_data` (stride `plane_width`). Bit-exact with
+/// the scalar transform-then-reconstruct at `bit_depth == 8`.
+///
+/// # Safety
+/// `avx2_enabled()` must hold; `dequant.len()` must be `n0*n0` (`2 <= n <= 5`); and the block's
+/// rows `start_y..start_y+n0` x columns `start_x..start_x+n0` must be in bounds for `plane_data`.
+#[target_feature(enable = "avx2")]
+pub unsafe fn inverse_transform_dct_dct_reconstruct_avx2(
+    plane_data: &mut [u16],
+    plane_width: usize,
+    start_x: usize,
+    start_y: usize,
+    dequant: &[i64],
+    n: u32,
+) {
+    let n0 = 1usize << n;
+    let mut o = [0i32; 1024];
+    idct_2d_dct(dequant, n, &mut o);
+
+    let base = plane_data.as_mut_ptr();
+    let zero = _mm256_setzero_si256();
+    let max = _mm256_set1_epi32(255);
+
+    if n0 == 4 {
+        for i in 0..4 {
+            let row = base.add((start_y + i) * plane_width + start_x);
+            let pred = _mm_cvtepu16_epi32(_mm_loadl_epi64(row as *const __m128i));
+            let resid = _mm_loadu_si128(o.as_ptr().add(i * 4) as *const __m128i);
+            let sum = _mm_add_epi32(pred, resid);
+            let clipped = _mm_min_epi32(
+                _mm_max_epi32(sum, _mm256_castsi256_si128(zero)),
+                _mm256_castsi256_si128(max),
+            );
+            _mm_storel_epi64(row as *mut __m128i, _mm_packus_epi32(clipped, clipped));
+        }
+        return;
+    }
+
+    for i in 0..n0 {
+        let mut j = 0usize;
+        while j < n0 {
+            let row = base.add((start_y + i) * plane_width + start_x + j);
+            let pred = _mm256_cvtepu16_epi32(_mm_loadu_si128(row as *const __m128i));
+            let resid = _mm256_loadu_si256(o.as_ptr().add(i * n0 + j) as *const __m256i);
+            let sum = _mm256_add_epi32(pred, resid);
+            let clipped = _mm256_min_epi32(_mm256_max_epi32(sum, zero), max);
+            let packed = _mm_packus_epi32(
+                _mm256_castsi256_si128(clipped),
+                _mm256_extracti128_si256(clipped, 1),
+            );
+            _mm_storeu_si128(row as *mut __m128i, packed);
+            j += 8;
+        }
     }
 }
 
@@ -1304,13 +1355,15 @@ mod tests {
         }
     }
 
-    /// The full 2D `inverse_transform_dct_dct_avx2` must exactly reproduce the scalar
-    /// `transform::inverse_transform_block` (DctDct, non-lossless) for every size n = 2..=5.
-    /// Inputs are kept small (±64) so no intermediate exceeds i32 even in the worst case, which
-    /// isolates the transpose/driver/mirror structure; the i32-vs-i64 agreement on realistic
-    /// (spec §8.7.1.1 16-bit-bounded) magnitudes is proven end-to-end by the official sweep.
+    /// The fused `inverse_transform_dct_dct_reconstruct_avx2` (2D transform + per-pixel residual
+    /// add + 8-bit clip) must exactly reproduce the scalar `inverse_transform_block` (DctDct)
+    /// followed by the scalar `clip(pred + residual, 0, 255)` reconstruction, for every size
+    /// n = 2..=5. Inputs are kept small (±64) so no transform intermediate exceeds i32 even in
+    /// the worst case, isolating the transpose/driver/mirror/reconstruction structure; the
+    /// i32-vs-i64 agreement on realistic (spec §8.7.1.1 16-bit-bounded) magnitudes is proven
+    /// end-to-end by the official sweep.
     #[test]
-    fn inverse_transform_dct_dct_simd_matches_scalar() {
+    fn inverse_transform_dct_dct_reconstruct_simd_matches_scalar() {
         if !avx2_enabled() {
             return;
         }
@@ -1323,16 +1376,31 @@ mod tests {
                 for v in dq.iter_mut() {
                     *v = (xorshift32(&mut seed) & 0x7F) as i64 - 64;
                 }
-                let mut scalar = dq.clone();
+                // Random n0 x n0 prediction plane (stride n0), the block placed at (0, 0).
+                let pred: Vec<u16> = (0..count)
+                    .map(|_| (xorshift32(&mut seed) & 0xFF) as u16)
+                    .collect();
+
+                let mut dq_s = dq.clone();
                 crate::transform::inverse_transform_block(
-                    &mut scalar,
+                    &mut dq_s,
                     n,
                     crate::transform::TxType::DctDct,
                     false,
                 );
-                let mut simd = dq.clone();
-                unsafe { inverse_transform_dct_dct_avx2(&mut simd, n) };
-                assert_eq!(scalar, simd, "n={n}: 2D SIMD idct != scalar");
+                let mut plane_scalar = pred.clone();
+                for i in 0..n0 {
+                    for j in 0..n0 {
+                        let old = plane_scalar[i * n0 + j] as i64;
+                        plane_scalar[i * n0 + j] = (old + dq_s[i * n0 + j]).clamp(0, 255) as u16;
+                    }
+                }
+
+                let mut plane_simd = pred.clone();
+                unsafe {
+                    inverse_transform_dct_dct_reconstruct_avx2(&mut plane_simd, n0, 0, 0, &dq, n);
+                }
+                assert_eq!(plane_scalar, plane_simd, "n={n}: fused SIMD != scalar");
             }
         }
     }

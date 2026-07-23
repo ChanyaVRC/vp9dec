@@ -445,22 +445,37 @@ impl TileDecoder {
             dequant[idx] = (t as i64 * ac_quant) / dq_denom;
         }
         dequant[0] = (tokens[0] as i64 * dc_quant) / dq_denom;
+        // The common 8-bit DCT_DCT case runs a fused AVX2 transform+reconstruct (SIMD wave 4b)
+        // that writes clipped pixels straight into the plane, skipping both the i64 write-back and
+        // the scalar reconstruction loop below. Everything else (ADST/WHT/mixed, 10/12-bit)
+        // transforms into `dequant` and takes that loop; the SIMD path is bit-exact against it
+        // (spec §8.7.1.1's 16-bit conformance bound keeps 8-bit DCT intermediates inside i32).
+        #[cfg(target_arch = "x86_64")]
+        let fused = self.bit_depth == 8
+            && !self.lossless
+            && tx_type == TxType::DctDct
+            && crate::simd::avx2_enabled();
+        #[cfg(not(target_arch = "x86_64"))]
+        let fused = false;
+
         {
             let _t = crate::bench_timing::StageTimer::start(
                 crate::bench_timing::Stage::InverseTransform,
             );
-            // AVX2 fast path (SIMD wave 4b) for the common 8-bit DCT_DCT case; ADST/WHT/mixed
-            // and 10/12-bit take the scalar transform, which the SIMD path is bit-exact against
-            // (spec §8.7.1.1's 16-bit conformance bound keeps 8-bit intermediates inside i32).
             #[cfg(target_arch = "x86_64")]
-            if self.bit_depth == 8
-                && !self.lossless
-                && tx_type == TxType::DctDct
-                && crate::simd::avx2_enabled()
-            {
-                // SAFETY: avx2_enabled() checked; dequant[..seg_eob] is exactly n0*n0 (== seg_eob).
+            if fused {
+                let pw = self.planes[plane].width;
+                // SAFETY: avx2_enabled() checked; dequant[..seg_eob] is exactly n0*n0; the block's
+                // rows/cols are in bounds (planes are allocated out to superblock boundaries).
                 unsafe {
-                    crate::simd::inverse_transform_dct_dct_avx2(&mut dequant[..seg_eob], n);
+                    crate::simd::inverse_transform_dct_dct_reconstruct_avx2(
+                        self.planes[plane].as_mut_slice(),
+                        pw,
+                        start_x,
+                        start_y,
+                        &dequant[..seg_eob],
+                        n,
+                    );
                 }
             } else {
                 inverse_transform_block(&mut dequant[..seg_eob], n, tx_type, self.lossless);
@@ -469,12 +484,14 @@ impl TileDecoder {
             inverse_transform_block(&mut dequant[..seg_eob], n, tx_type, self.lossless);
         }
 
-        let max_val = (1i64 << self.bit_depth) - 1;
-        for i in 0..n0 {
-            for j in 0..n0 {
-                let old = self.planes[plane].get(start_x + j, start_y + i) as i64;
-                let new_val = (old + dequant[i * n0 + j]).clamp(0, max_val);
-                self.planes[plane].set(start_x + j, start_y + i, new_val as u16);
+        if !fused {
+            let max_val = (1i64 << self.bit_depth) - 1;
+            for i in 0..n0 {
+                for j in 0..n0 {
+                    let old = self.planes[plane].get(start_x + j, start_y + i) as i64;
+                    let new_val = (old + dequant[i * n0 + j]).clamp(0, max_val);
+                    self.planes[plane].set(start_x + j, start_y + i, new_val as u16);
+                }
             }
         }
 
