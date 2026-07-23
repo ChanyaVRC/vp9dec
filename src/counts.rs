@@ -81,6 +81,28 @@ impl Counts {
             more_coefs: [[[[[[0; 2]; 6]; 6]; 2]; 2]; 4],
         }
     }
+
+    /// Adds every counter in `other` into `self`, element-wise. Used to merge the per-tile-column
+    /// `Counts` that tile-parallel decode accumulates on separate threads back into one frame
+    /// total before backward probability adaptation. Order-independent (integer addition is
+    /// associative/commutative), so the merged total is identical to a single-threaded decode's.
+    ///
+    /// Every field of `Counts` is a `u32` array, so the struct is a contiguous block of `u32`
+    /// with no padding; summing the flat `u32` view is exactly a field-wise sum but avoids
+    /// enumerating all 28 fields. The `debug_assert` and the sibling unit test guard the layout
+    /// assumption against a future non-`u32` field.
+    pub fn add_assign(&mut self, other: &Counts) {
+        debug_assert_eq!(std::mem::size_of::<Counts>() % 4, 0);
+        let n = std::mem::size_of::<Counts>() / 4;
+        // SAFETY: `Counts` is `#[derive(Clone)]` with only `u32`-array fields (all 4-byte
+        // aligned, no padding), so it is soundly viewed as `n` contiguous `u32`s; `self` and
+        // `other` are the same type, so their flat views line up field-for-field.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self as *mut Counts as *mut u32, n) };
+        let src = unsafe { std::slice::from_raw_parts(other as *const Counts as *const u32, n) };
+        for (d, &s) in dst.iter_mut().zip(src.iter()) {
+            *d = d.wrapping_add(s);
+        }
+    }
 }
 
 /// `merge_prob( preProb, ct0, ct1, countSat, maxUpdateFactor )` (spec §8.4.1).
@@ -307,6 +329,28 @@ pub fn adapt_noncoef_probs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_assign_sums_counters_across_all_field_shapes() {
+        // Guards the flat-u32-reinterpret layout assumption in `Counts::add_assign`: set fields of
+        // several different shapes (2D/1D/6D nested arrays, first/middle/last struct fields) and
+        // confirm each sums independently, and that an untouched field stays 0.
+        let mut a = Counts::new();
+        let mut b = Counts::new();
+        a.intra_mode[1][2] = 5; // first field
+        a.mv_joint[3] = 4;
+        a.token[3][1][0][5][4][2] = 7; // second-to-last field
+        b.intra_mode[1][2] = 10;
+        b.mv_joint[3] = 100;
+        b.token[3][1][0][5][4][2] = 1;
+        b.more_coefs[2][1][1][3][2][0] = 9; // last field
+        a.add_assign(&b);
+        assert_eq!(a.intra_mode[1][2], 15);
+        assert_eq!(a.mv_joint[3], 104);
+        assert_eq!(a.token[3][1][0][5][4][2], 8);
+        assert_eq!(a.more_coefs[2][1][1][3][2][0], 9);
+        assert_eq!(a.uv_mode[0][0], 0, "untouched field must stay 0");
+    }
 
     #[test]
     fn merge_prob_with_no_observations_keeps_preprob_untouched_direction() {

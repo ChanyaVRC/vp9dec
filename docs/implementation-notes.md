@@ -33,6 +33,12 @@ overview. A resolved bug needs no entry.
   so the result is written straight into the plane, skipping the i64 round-trip). Runtime-detected
   and cached; `VP9DEC_NO_SIMD=1` forces scalar. Output must equal the scalar path — the sweep
   passes 315/315 in both configs.
+- **Tile-parallel decode.** A frame with >1 tile column and exactly 1 tile row decodes each tile
+  column on its own worker `TileDecoder` (`std::thread::scope`, no external crate), then merges
+  the disjoint column strips (planes + mi_grid) and sums the per-worker adaptation counts back
+  into one. Bit-exact with sequential decode (the sweep's `vp90-2-08-tile_1x{2,4,8}` vectors pass
+  in both SIMD configs). `tile_rows > 1` (above-context crosses tile-row boundaries) and
+  single-column frames stay sequential. ~+22% on a 2-column 854x356 clip; scales with tile count.
 
 Architecture and the module map live in `README.md`; the acceptance gate is the `verify-vp9dec`
 skill; change-navigation is the `vp9dec-architecture` skill.
@@ -43,6 +49,14 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   in `tile/residual.rs` is `(y * num4x4w + x)` and is bit-exact-correct. A plausible,
   spec-grounded "correction" to it (meant to fix 4:2:2) once *regressed* the official 4:2:2
   vector. When a hypothesis and the sweep disagree, the sweep wins — verify first, edit second.
+- **Tile-parallel decode (`tile::decode_tiles_parallel`) assumes tile-column independence.** Each
+  tile column decodes into its own worker `TileDecoder` and is merged by disjoint column strip.
+  This is bit-exact only because VP9 gates the left neighbor at the tile boundary (`tile.rs`'s
+  `avail_l = col > mi_col_start`) and no block reads the not-yet-decoded column to its right. Any
+  change that lets a block read across a tile-column boundary would silently corrupt the parallel
+  path -- re-run the `vp90-2-08-tile_1x{2,4,8}` sweep vectors after touching availability or
+  prediction near tile edges. The merge copies only the written pixel columns (up to
+  `mi_col_end*8`); padding past `mi_cols` is never written by either path, so it stays zero in both.
 - **The loop filter's AVX2 dispatch is gated on `bit_depth == 8`.** The AVX2 kernels
   (`src/simd.rs`) are u8-only; letting them run on a 10/12-bit path silently corrupts output.
   The inter-prediction AVX2 path is gated the same way. Any new SIMD kernel must gate likewise.

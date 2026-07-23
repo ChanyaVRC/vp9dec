@@ -451,11 +451,114 @@ impl TileDecoder {
         self.left_nonzero_context = [[0u8; 16]; 3];
     }
 
+    /// Builds a fresh worker `TileDecoder` that shares this frame's read-only / config state
+    /// (cheap `Arc` / `Copy` clones) but gets its own zeroed mutable buffers (planes, mi_grid,
+    /// contexts, counts). Used by the tile-parallel path in [`Self::decode_tiles`]: each tile
+    /// column decodes on one of these (independent per VP9's tile-column rule), then its column
+    /// region is merged back. The caller sets the worker's `mi_col_start`/`mi_col_end` /
+    /// `mi_row_start` / `mi_row_end` before decoding.
+    fn spawn_column_worker(&self) -> TileDecoder {
+        let grid_cols = self.mi_grid.cols();
+        let grid_rows = self.planes[0].height / 8;
+        let above_nz_len = grid_cols * 2;
+        TileDecoder {
+            tx_mode: self.tx_mode,
+            probs: self.probs.clone(),
+            segmentation: self.segmentation,
+            mi_cols: self.mi_cols,
+            mi_rows: self.mi_rows,
+            tile_cols_log2: self.tile_cols_log2,
+            tile_rows_log2: self.tile_rows_log2,
+            mi_grid: MiGrid::new(grid_cols, grid_rows),
+            above_partition_context: vec![0u8; grid_cols],
+            left_partition_context: [0u8; 8],
+            above_seg_pred_context: vec![0u8; grid_cols],
+            left_seg_pred_context: [0u8; 8],
+            prev_segment_ids: self.prev_segment_ids.clone(),
+            mi_col_start: 0,
+            mi_col_end: 0,
+            mi_row_start: 0,
+            mi_row_end: 0,
+            bit_depth: self.bit_depth,
+            subsampling_x: self.subsampling_x,
+            subsampling_y: self.subsampling_y,
+            lossless: self.lossless,
+            dequant_table: self.dequant_table,
+            planes: [
+                Plane::new(self.planes[0].width, self.planes[0].height),
+                Plane::new(self.planes[1].width, self.planes[1].height),
+                Plane::new(self.planes[2].width, self.planes[2].height),
+            ],
+            above_nonzero_context: [
+                vec![0u8; above_nz_len],
+                vec![0u8; above_nz_len],
+                vec![0u8; above_nz_len],
+            ],
+            left_nonzero_context: [[0u8; 16]; 3],
+            frame_is_intra: self.frame_is_intra,
+            ref_frame_sign_bias: self.ref_frame_sign_bias,
+            allow_high_precision_mv: self.allow_high_precision_mv,
+            interpolation_filter: self.interpolation_filter,
+            reference_mode: self.reference_mode,
+            comp_fixed_ref: self.comp_fixed_ref,
+            comp_var_ref: self.comp_var_ref,
+            use_prev_frame_mvs: self.use_prev_frame_mvs,
+            prev_mi_grid: self.prev_mi_grid.clone(),
+            frame_width: self.frame_width,
+            frame_height: self.frame_height,
+            resolved_refs: self.resolved_refs.clone(),
+            counts: Counts::new(),
+        }
+    }
+
+    /// Merges tile-column worker `w` (which decoded MI columns `[w.mi_col_start, w.mi_col_end)`)
+    /// back into `self`: copies that column strip of every plane and of `mi_grid`, and sums the
+    /// worker's probability-adaptation counts. Column strips are disjoint across workers, so the
+    /// merged result is identical to a single-threaded decode (counts sum is order-independent).
+    fn merge_column_worker(&mut self, w: &TileDecoder) {
+        // Counts (order-independent integer sums).
+        self.counts.add_assign(&w.counts);
+        // mi_grid: MI columns [mi_col_start, mi_col_end) across all rows (row-major, stride cols).
+        let cols = self.mi_grid.cols();
+        let rows = self.planes[0].height / 8;
+        let (c0, c1) = (w.mi_col_start as usize, w.mi_col_end as usize);
+        for row in 0..rows {
+            let base = row * cols;
+            self.mi_grid.data[base + c0..base + c1]
+                .copy_from_slice(&w.mi_grid.data[base + c0..base + c1]);
+        }
+        // Planes: pixel columns [mi_col*8 >> sub_x, ...) across all rows, per plane.
+        for (p, plane) in self.planes.iter_mut().enumerate() {
+            let sub = if p == 0 { 0 } else { self.subsampling_x };
+            let px0 = (c0 * 8) >> sub;
+            let px1 = (c1 * 8) >> sub;
+            let width = plane.width;
+            let dst = plane.as_mut_slice();
+            let src = w.planes[p].as_slice();
+            let height = dst.len() / width;
+            for row in 0..height {
+                let base = row * width;
+                dst[base + px0..base + px1].copy_from_slice(&src[base + px0..base + px1]);
+            }
+        }
+    }
+
     /// `decode_tiles( sz )` (spec §6.4). `data` is the entire tile data following the
     /// uncompressed header, excluding the compressed header (the rest of the frame data).
-    pub fn decode_tiles(&mut self, mut data: &[u8]) -> Result<(), TileError> {
+    pub fn decode_tiles(&mut self, data: &[u8]) -> Result<(), TileError> {
         let tile_cols = 1u32 << self.tile_cols_log2;
         let tile_rows = 1u32 << self.tile_rows_log2;
+
+        // Tile-parallel fast path: >1 tile column and exactly 1 tile row. Tile columns are fully
+        // independent (own bool decoder; left neighbor gated at the tile boundary; the column to
+        // the right is undecoded in raster order), so each decodes on its own worker thread and
+        // its column strip is merged back -- bit-identical to the sequential path. tile_rows > 1
+        // (above-context crosses tile-row boundaries) and the single-column case stay sequential.
+        if tile_cols > 1 && tile_rows == 1 {
+            return self.decode_tiles_parallel(data, tile_cols);
+        }
+
+        let mut data = data;
         self.clear_above_context();
 
         for tile_row in 0..tile_rows {
@@ -502,6 +605,81 @@ impl TileDecoder {
                 }
                 r.exit_bool();
             }
+        }
+        Ok(())
+    }
+
+    /// Splits `data` (the concatenated tiles, each non-final one prefixed by a 4-byte big-endian
+    /// size) into the `num_tiles` per-tile byte slices. Same parsing as the sequential loop, done
+    /// up front so the tiles can be handed to worker threads.
+    fn split_tiles(mut data: &[u8], num_tiles: usize) -> Result<Vec<&[u8]>, TileError> {
+        let mut out = Vec::with_capacity(num_tiles);
+        for i in 0..num_tiles {
+            let last = i == num_tiles - 1;
+            let size = if last {
+                data.len()
+            } else {
+                if data.len() < 4 {
+                    return Err(TileError::InvalidTileSize);
+                }
+                let (size_bytes, rest) = data.split_at(4);
+                data = rest;
+                u32::from_be_bytes(size_bytes.try_into().unwrap()) as usize
+            };
+            if data.len() < size {
+                return Err(TileError::InvalidTileSize);
+            }
+            let (tile_bytes, rest) = data.split_at(size);
+            out.push(tile_bytes);
+            data = rest;
+        }
+        Ok(out)
+    }
+
+    /// Tile-parallel `decode_tiles` for the `tile_cols > 1 && tile_rows == 1` case: decode each
+    /// tile column on its own worker thread (VP9 tile columns are independent), then merge each
+    /// column strip back into `self`. Bit-identical to the sequential path (disjoint column
+    /// writes; order-independent count sums). Uses `std::thread::scope` -- no external crate.
+    fn decode_tiles_parallel(&mut self, data: &[u8], tile_cols: u32) -> Result<(), TileError> {
+        let tiles = Self::split_tiles(data, tile_cols as usize)?;
+        let mut workers: Vec<TileDecoder> = (0..tile_cols)
+            .map(|c| {
+                let mut w = self.spawn_column_worker();
+                w.mi_col_start = get_tile_offset(c, self.mi_cols, self.tile_cols_log2);
+                w.mi_col_end = get_tile_offset(c + 1, self.mi_cols, self.tile_cols_log2);
+                w.mi_row_start = 0;
+                w.mi_row_end = self.mi_rows;
+                w
+            })
+            .collect();
+
+        let results: Vec<Result<(), TileError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = workers
+                .iter_mut()
+                .zip(tiles.iter())
+                .map(|(w, &tile_bytes)| {
+                    scope.spawn(move || -> Result<(), TileError> {
+                        let mut r = BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
+                        w.decode_tile(&mut r)?;
+                        let unused_bits = (tile_bytes.len() * 8).saturating_sub(r.bit_position());
+                        if r.over_read_bits() > TILE_OVER_READ_LIMIT_BITS
+                            || unused_bits > TILE_UNDER_READ_LIMIT_BITS
+                        {
+                            return Err(TileError::CorruptTile);
+                        }
+                        r.exit_bool();
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for res in results {
+            res?;
+        }
+
+        for w in &workers {
+            self.merge_column_worker(w);
         }
         Ok(())
     }
