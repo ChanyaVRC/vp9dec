@@ -103,13 +103,16 @@ fn rec(failures: &mut Vec<String>, label: String, res: Result<(), String>) {
 }
 
 /// Small, diverse seeds: intra-only + superframe, segmentation, 10-bit (profile 2), 4:4:4
-/// (profile 1) -- so mutations reach varied decode paths. The 2 MB subpixel clip is deliberately
+/// (profile 1), and a 4-tile-column clip so mutations also reach the tile-PARALLEL decode path
+/// (`tile::decode_tiles_parallel`, engaged only for >1 tile column) -- corrupting a multi-tile
+/// stream must not panic on any worker thread either. The 2 MB subpixel clip is deliberately
 /// omitted (its size makes the corruption pass' clones dominate the runtime for no extra coverage).
-const SEED_VECTORS: [&str; 4] = [
+const SEED_VECTORS: [&str; 5] = [
     "vp90-2-16-intra-only.ivf",
     "vp90-2-15-segkey.ivf",
     "vp92-2-20-10bit-yuv420.ivf",
     "vp91-2-04-yuv444.ivf",
+    "vp90-2-08-tile_1x4.ivf",
 ];
 
 fn corrupt(rng: &mut Rng, buf: &mut [u8]) {

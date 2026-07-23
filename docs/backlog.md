@@ -84,9 +84,13 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   worker `TileDecoder` via `std::thread::scope` (no external crate), then merges the disjoint
   column strips + sums the per-worker counts. Bit-exact (sweep 315/315 both configs, incl. the
   `vp90-2-08-tile_1x{2,4,8}` vectors). **51.58 -> 62.87 MP/s, 1.22x** on a 2-column 854x356 clip;
-  scales with tile count. `tile_rows > 1` and single-column frames stay sequential. Follow-up
-  ideas (not done): pool/reuse the per-frame worker buffers to cut the N-frame allocation
-  overhead; a shared-buffer (unsafe disjoint-write) variant to avoid the merge copy entirely.
+  scales with tile count. `tile_rows > 1` and single-column frames stay sequential. Columns are
+  decoded in chunks of `available_parallelism()` so peak worker allocation is bounded to that many
+  full-frame buffers (not the attacker-declarable `tile_cols`); the `robustness_test` fuzz corpus
+  includes a 4-tile clip so the parallel path is fuzzed for no-panic. Follow-up ideas (not done):
+  give each worker a column-width buffer (each still allocates a full frame but fills only its
+  column) or a shared-buffer (unsafe disjoint-write) variant, to cut both the per-worker waste and
+  the merge copy.
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 

@@ -642,44 +642,64 @@ impl TileDecoder {
     /// writes; order-independent count sums). Uses `std::thread::scope` -- no external crate.
     fn decode_tiles_parallel(&mut self, data: &[u8], tile_cols: u32) -> Result<(), TileError> {
         let tiles = Self::split_tiles(data, tile_cols as usize)?;
-        let mut workers: Vec<TileDecoder> = (0..tile_cols)
-            .map(|c| {
-                let mut w = self.spawn_column_worker();
-                w.mi_col_start = get_tile_offset(c, self.mi_cols, self.tile_cols_log2);
-                w.mi_col_end = get_tile_offset(c + 1, self.mi_cols, self.tile_cols_log2);
-                w.mi_row_start = 0;
-                w.mi_row_end = self.mi_rows;
-                w
-            })
-            .collect();
 
-        let results: Vec<Result<(), TileError>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = workers
-                .iter_mut()
-                .zip(tiles.iter())
-                .map(|(w, &tile_bytes)| {
-                    scope.spawn(move || -> Result<(), TileError> {
-                        let mut r = BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
-                        w.decode_tile(&mut r)?;
-                        let unused_bits = (tile_bytes.len() * 8).saturating_sub(r.bit_position());
-                        if r.over_read_bits() > TILE_OVER_READ_LIMIT_BITS
-                            || unused_bits > TILE_UNDER_READ_LIMIT_BITS
-                        {
-                            return Err(TileError::CorruptTile);
-                        }
-                        r.exit_bool();
-                        Ok(())
-                    })
+        // Bound peak allocation + concurrency to the machine's parallelism. Each worker holds a
+        // FULL-frame buffer (it only fills its own column -- see `spawn_column_worker`), so
+        // decoding all `tile_cols` at once would allocate `tile_cols` full frames -- an
+        // attacker-controllable multiplier on top of the per-frame `MAX_FRAME_LUMA_SAMPLES` guard
+        // (a wide stream can declare hundreds of tile columns). Processing columns in chunks of
+        // `available_parallelism()` caps peak memory and thread count at that many frames,
+        // regardless of the declared tile count. Columns are independent, so chunk boundaries do
+        // not affect the result, and the first error in column order is still what propagates.
+        let chunk = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1) as u32;
+
+        let mut c0 = 0u32;
+        while c0 < tile_cols {
+            let c1 = (c0 + chunk).min(tile_cols);
+            let mut workers: Vec<TileDecoder> = (c0..c1)
+                .map(|c| {
+                    let mut w = self.spawn_column_worker();
+                    w.mi_col_start = get_tile_offset(c, self.mi_cols, self.tile_cols_log2);
+                    w.mi_col_end = get_tile_offset(c + 1, self.mi_cols, self.tile_cols_log2);
+                    w.mi_row_start = 0;
+                    w.mi_row_end = self.mi_rows;
+                    w
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        for res in results {
-            res?;
-        }
 
-        for w in &workers {
-            self.merge_column_worker(w);
+            let results: Vec<Result<(), TileError>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = workers
+                    .iter_mut()
+                    .zip(tiles[c0 as usize..c1 as usize].iter())
+                    .map(|(w, &tile_bytes)| {
+                        scope.spawn(move || -> Result<(), TileError> {
+                            let mut r =
+                                BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
+                            w.decode_tile(&mut r)?;
+                            let unused_bits =
+                                (tile_bytes.len() * 8).saturating_sub(r.bit_position());
+                            if r.over_read_bits() > TILE_OVER_READ_LIMIT_BITS
+                                || unused_bits > TILE_UNDER_READ_LIMIT_BITS
+                            {
+                                return Err(TileError::CorruptTile);
+                            }
+                            r.exit_bool();
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for res in results {
+                res?;
+            }
+            for w in &workers {
+                self.merge_column_worker(w);
+            }
+            c0 = c1;
         }
         Ok(())
     }
