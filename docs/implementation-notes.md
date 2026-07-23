@@ -23,9 +23,11 @@ overview. A resolved bug needs no entry.
 - **Cross-frame ownership.** DPB slots, `prev_mi_grid` / `prev_segment_ids`, and the compressed-
   header probability context are shared via `Arc` or borrowed, not deep-cloned per frame
   (performance only — the sweep is byte-identical before/after).
-- **SIMD.** AVX2 covers, for 8-bit content: unscaled inter-prediction (widths 8/16/32/64 via
-  `block_inter_predict_avx2`, width 4 via the 128-bit `block_inter_predict_avx2_w4`); loop-filter
-  edges on **both** passes -- horizontal (`loop_filter_horiz8_avx2`) and vertical
+- **SIMD.** AVX2 covers unscaled inter-prediction for **all bit depths** (widths 8/16/32/64 via
+  `block_inter_predict_avx2`, width 4 via the 128-bit `block_inter_predict_avx2_w4`; the subpel
+  FIR is bit-depth-agnostic and its i32 accumulation holds a 12-bit sample, so only the `clip1`
+  bound differs -- the caller passes `max_val = (1<<bit_depth)-1`). For **8-bit content only**:
+  loop-filter edges on **both** passes -- horizontal (`loop_filter_horiz8_avx2`) and vertical
   (`loop_filter_vert8_avx2`, which transposes the tap window into the horizontal kernel's layout
   and reuses it), each covering narrow / wide8 / wide16; and the **DCT_DCT inverse transform +
   reconstruction** (all sizes 4/8/16/32, `inverse_transform_dct_dct_reconstruct_avx2` -- the
@@ -102,7 +104,8 @@ skill; change-navigation is the `vp9dec-architecture` skill.
 
 ## Known gaps
 
-- **No SIMD for the 10/12-bit path, reference-scaled inter prediction, intra prediction, or the
+- **No SIMD for: the 10/12-bit loop filter and inverse transform** (inter-prediction *is*
+  vectorized at all depths now), **reference-scaled inter prediction, intra prediction, or the
   ADST / WHT / mixed inverse transforms** (the common 8-bit DCT_DCT transform *is* vectorized;
   nor aarch64 NEON). The scalar path there is correct and bit-exact; this is a performance gap
   only, tracked in `docs/backlog.md`. (Intra prediction profiled at ~0.3% on inter content.)

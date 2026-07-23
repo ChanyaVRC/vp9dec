@@ -39,12 +39,11 @@ pub fn avx2_enabled() -> bool {
 ///
 /// `w` must be a multiple of 8 (this processes 8 output columns per AVX2 lane group;
 /// width-4 blocks stay on the scalar path). `h <= MAX_BLOCK_DIM`,
-/// `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`, `bit_depth == 8` (the caller only
-/// dispatches here for 8-bit frames -- see `predict.rs`'s call site). `ref_data` is
-/// `Plane::as_slice()`'s `u16` buffer (every plane is `u16`-backed regardless of bit
-/// depth, see `framebuffer.rs`); at `bit_depth == 8` every sample is known to fit in
-/// `0..=255`, so widening `u16 -> i32` here is bit-exact with the scalar path's
-/// `u16 as i32`.
+/// `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`. Works for all bit depths: `ref_data` is
+/// `Plane::as_slice()`'s `u16` buffer (every plane is `u16`-backed, see `framebuffer.rs`), the
+/// subpel FIR is bit-depth-agnostic, and the i32 accumulation holds a 12-bit sample through both
+/// passes -- only the `clip1` bound differs, so the caller passes `max_val = (1<<bit_depth)-1`
+/// and the kernel clips each pass to `0..=max_val`.
 ///
 /// # Safety
 /// The caller must have confirmed `avx2_enabled()` (this fn requires the `avx2` target
@@ -69,6 +68,7 @@ pub unsafe fn block_inter_predict_avx2(
     h: usize,
     intermediate_height: usize,
     interp_filter: u8,
+    max_val: i32,
     pred: &mut [i32],
 ) {
     debug_assert_eq!(w % 8, 0);
@@ -87,7 +87,7 @@ pub unsafe fn block_inter_predict_avx2(
 
     let round_add = _mm256_set1_epi32(64);
     let zero = _mm256_setzero_si256();
-    let max255 = _mm256_set1_epi32(255);
+    let max_clip = _mm256_set1_epi32(max_val);
 
     // Same fixed-size scratch as the scalar path's `intermediate`: the spec's two-pass
     // structure needs the full horizontal-filter output (for rows both above and below
@@ -113,11 +113,10 @@ pub unsafe fn block_inter_predict_avx2(
                 let coeff = _mm256_set1_epi32(tap);
                 acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(widened, coeff));
             }
-            // round2(s, 7) then clip1 (bit_depth == 8, so Clip3(0, 255, .)) -- identical
-            // arithmetic and accumulation order to the scalar `round2`/`clip1`, just 8
-            // lanes at once.
+            // round2(s, 7) then clip1 (Clip3(0, max_val, .)) -- identical arithmetic and
+            // accumulation order to the scalar `round2`/`clip1`, just 8 lanes at once.
             acc = _mm256_srai_epi32(_mm256_add_epi32(acc, round_add), 7);
-            acc = _mm256_min_epi32(_mm256_max_epi32(acc, zero), max255);
+            acc = _mm256_min_epi32(_mm256_max_epi32(acc, zero), max_clip);
             _mm256_storeu_si256(
                 intermediate.as_mut_ptr().add(r * w + c) as *mut __m256i,
                 acc,
@@ -140,7 +139,7 @@ pub unsafe fn block_inter_predict_avx2(
                 acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(vals, coeff));
             }
             acc = _mm256_srai_epi32(_mm256_add_epi32(acc, round_add), 7);
-            acc = _mm256_min_epi32(_mm256_max_epi32(acc, zero), max255);
+            acc = _mm256_min_epi32(_mm256_max_epi32(acc, zero), max_clip);
             _mm256_storeu_si256(pred.as_mut_ptr().add(r * w + c) as *mut __m256i, acc);
             c += 8;
         }
@@ -171,6 +170,7 @@ pub unsafe fn block_inter_predict_avx2_w4(
     h: usize,
     intermediate_height: usize,
     interp_filter: u8,
+    max_val: i32,
     pred: &mut [i32],
 ) {
     debug_assert!(h <= MAX_BLOCK_DIM);
@@ -188,7 +188,7 @@ pub unsafe fn block_inter_predict_avx2_w4(
 
     let round_add = _mm_set1_epi32(64);
     let zero = _mm_setzero_si128();
-    let max255 = _mm_set1_epi32(255);
+    let max_clip = _mm_set1_epi32(max_val);
 
     // Stride-4 scratch (only the first `intermediate_height * 4` entries are used); the same
     // two-pass structure as the main kernel.
@@ -207,7 +207,7 @@ pub unsafe fn block_inter_predict_avx2_w4(
             acc = _mm_add_epi32(acc, _mm_mullo_epi32(vals, _mm_set1_epi32(tap)));
         }
         acc = _mm_srai_epi32(_mm_add_epi32(acc, round_add), 7);
-        acc = _mm_min_epi32(_mm_max_epi32(acc, zero), max255);
+        acc = _mm_min_epi32(_mm_max_epi32(acc, zero), max_clip);
         _mm_storeu_si128(intermediate.as_mut_ptr().add(r * 4) as *mut __m128i, acc);
     }
 
@@ -220,7 +220,7 @@ pub unsafe fn block_inter_predict_avx2_w4(
             acc = _mm_add_epi32(acc, _mm_mullo_epi32(vals, _mm_set1_epi32(tap)));
         }
         acc = _mm_srai_epi32(_mm_add_epi32(acc, round_add), 7);
-        acc = _mm_min_epi32(_mm_max_epi32(acc, zero), max255);
+        acc = _mm_min_epi32(_mm_max_epi32(acc, zero), max_clip);
         _mm_storeu_si128(pred.as_mut_ptr().add(r * 4) as *mut __m128i, acc);
     }
 }
@@ -1280,6 +1280,7 @@ mod tests {
                                 h,
                                 intermediate_height,
                                 interp_filter,
+                                255,
                                 &mut pred8,
                             );
                             block_inter_predict_avx2_w4(
@@ -1292,6 +1293,7 @@ mod tests {
                                 h,
                                 intermediate_height,
                                 interp_filter,
+                                255,
                                 &mut pred4,
                             );
                         }

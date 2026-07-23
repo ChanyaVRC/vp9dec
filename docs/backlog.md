@@ -59,10 +59,18 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   reconstruction loop. Bit-exact both configs (sweep 315/315); +2.2% on 854x356. A re-profile put
   the remaining scalar hot spots at token/entropy decode (~sequential, not SIMD-able) and
   reconstruction (now fused); the big-stage InterPredict and LoopFilter are already AVX2.
+- 10/12-bit inter-prediction SIMD: DONE 2026-07-23. The AVX2 inter-pred kernels
+  (`block_inter_predict_avx2` / `_w4`) already work in i32 (which holds a 12-bit sample through
+  both FIR passes); the only 8-bit-specific value was the `clip1` bound, now passed as
+  `max_val = (1<<bit_depth)-1`, and the `predict.rs` dispatch no longer gates on `bit_depth == 8`.
+  Bit-exact (sweep 315/315 both configs, incl. the `vp9{2,3}-2-20-1{0,2}bit-*` vectors). No large
+  high-bit-depth clip exists to bench precisely (the conformance HBD clips are ~160x90x10 frames).
 - Wave 4 (remaining): intra prediction is the only remaining named hot spot, but profiled at
   ~0.3% on inter content -- not worth SIMD unless targeting intra-heavy / all-intra streams.
-  Still scalar (perf gap only): the 10/12-bit u16 path and the scaled (SVC/resize) inter path,
-  plus the ADST / WHT / mixed inverse transforms (minority of blocks).
+  Still scalar (perf gap only): the **10/12-bit loop filter and inverse transform** (inter-pred is
+  now SIMD at all depths; the loop-filter constants would need `<< (bit_depth-8)` scaling, and the
+  i32 transform overflows past 8-bit so it needs i64), the scaled (SVC/resize) inter path, and the
+  ADST / WHT / mixed inverse transforms (minority of blocks).
 - Tile-parallel multithreading (a different lever than SIMD, same realtime goal): DONE
   2026-07-23 (`tile::decode_tiles_parallel` / `spawn_column_worker` / `merge_column_worker` +
   `Counts::add_assign`). A frame with >1 tile column and 1 tile row decodes each column on its own

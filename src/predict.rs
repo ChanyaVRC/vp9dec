@@ -483,22 +483,22 @@ fn block_inter_predict(
     // of one per column/row; and `p >> 4` reduces to a flat per-call offset (`c` alone
     // for the horizontal pass's column, `r` alone for the vertical pass's row -- see
     // `simd.rs`'s doc comment for the derivation). Falls through to the scalar loop for:
-    // the scaled path (rarer, harder to vectorize -- kept scalar per this wave's scope),
-    // bit_depth != 8 (10/12-bit frames: the AVX2 kernel's arithmetic -- clip1 to 0..=255 --
-    // is only valid at 8-bit; the scalar loop below handles every depth generically), and any
+    // the scaled path (rarer, harder to vectorize -- kept scalar per this wave's scope), and any
     // block whose source window would need the scalar path's per-pixel edge clamp
     // (border replication) -- only near reference-frame edges; replicating that with
-    // AVX2 would need a byte gather, which x86 doesn't have. Width 4 (the `4x4`/`4x8`
-    // partitions) dispatches to the 128-bit-wide `block_inter_predict_avx2_w4`; widths 8/16/
-    // 32/64 to the 256-bit `block_inter_predict_avx2`.
+    // AVX2 would need a byte gather, which x86 doesn't have. All bit depths use the kernel: the
+    // subpel FIR is bit-depth-agnostic and its i32 accumulation holds a 12-bit sample through the
+    // two passes; only the `clip1` bound differs, passed as `max_val = (1<<bit_depth)-1`. Width 4
+    // (the `4x4`/`4x8` partitions) dispatches to the 128-bit-wide `block_inter_predict_avx2_w4`;
+    // widths 8/16/32/64 to the 256-bit `block_inter_predict_avx2`.
     #[cfg(target_arch = "x86_64")]
     {
         if x_step == 16
             && y_step == 16
-            && bit_depth == 8
             && (w == 4 || w.is_multiple_of(8))
             && crate::simd::avx2_enabled()
         {
+            let max_val = (1i32 << bit_depth) - 1;
             let src_row0 = (y >> 4) - 3;
             let src_col0 = (x >> 4) - 3;
             let in_bounds = src_row0 >= 0
@@ -524,6 +524,7 @@ fn block_inter_predict(
                             h,
                             intermediate_height as usize,
                             interp_filter,
+                            max_val,
                             pred,
                         );
                     } else {
@@ -538,6 +539,7 @@ fn block_inter_predict(
                             h,
                             intermediate_height as usize,
                             interp_filter,
+                            max_val,
                             pred,
                         );
                     }
