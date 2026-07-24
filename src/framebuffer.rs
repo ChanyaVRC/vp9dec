@@ -17,40 +17,69 @@
 
 /// A single plane's buffer. Samples are stored as `u16` for every `BitDepth` (8/10/12-bit);
 /// see the module doc for why.
+///
+/// A plane normally covers the whole frame (`x0 == 0`). A tile-parallel worker instead holds a
+/// *column strip* ([`Plane::new_strip`]): a buffer covering only the absolute pixel columns
+/// `[x0, x0 + width)`. All accessors keep taking **absolute** frame x coordinates -- the strip
+/// origin is subtracted internally -- so the decode path is identical either way.
 #[derive(Debug, Clone)]
 pub struct Plane {
     pub width: usize,
     pub height: usize,
+    /// Absolute pixel column of this buffer's first column (0 for a whole-frame plane).
+    pub x0: usize,
     data: Vec<u16>,
 }
 
 impl Plane {
     pub fn new(width: usize, height: usize) -> Self {
+        Self::new_strip(width, height, 0)
+    }
+
+    /// A column strip covering absolute pixel columns `[x0, x0 + width)` of a conceptual
+    /// larger plane (used by the tile-parallel worker decoders, `tile::spawn_column_worker`).
+    /// Accessors take absolute x; `x` must stay within the strip. The whole-frame `crop*`
+    /// outputs are not meaningful on a strip.
+    pub fn new_strip(width: usize, height: usize, x0: usize) -> Self {
         Self {
             width,
             height,
+            x0,
             data: vec![0u16; width * height],
         }
     }
 
     #[inline]
     pub fn get(&self, x: usize, y: usize) -> u16 {
-        debug_assert!(x < self.width && y < self.height, "Plane::get out of range");
-        self.data[y * self.width + x]
+        debug_assert!(
+            x >= self.x0 && x - self.x0 < self.width && y < self.height,
+            "Plane::get out of range"
+        );
+        self.data[y * self.width + (x - self.x0)]
     }
 
     #[inline]
     pub fn set(&mut self, x: usize, y: usize, v: u16) {
-        debug_assert!(x < self.width && y < self.height, "Plane::set out of range");
-        self.data[y * self.width + x] = v;
+        debug_assert!(
+            x >= self.x0 && x - self.x0 < self.width && y < self.height,
+            "Plane::set out of range"
+        );
+        self.data[y * self.width + (x - self.x0)] = v;
     }
 
-    /// Reads after clamping `(x, y)` to `[0, width-1] x [0, height-1]`
+    /// Reads after clamping `(x, y)` to `[x0, x0+width-1] x [0, height-1]`
     /// (used for references like the spec's `CurrFrame[ plane ][ Min(maxY,...) ][ Min(maxX,...) ]`
     /// that replicate the edge value past the frame boundary).
+    ///
+    /// **CAUTION -- strip-relative clamp, currently no production callers.** On a column strip
+    /// (`x0 > 0`) this clamps x into the STRIP's columns `[x0, x0 + width)`, which is NOT the
+    /// spec's frame-edge clamp (that would clamp to the whole frame's `[0, frame_width)`).
+    /// Any future caller running on a tile-parallel worker's plane must reconcile its clamp
+    /// semantics with the sequential (whole-frame) path first, or the two paths will silently
+    /// produce different pixels near tile-column boundaries.
     #[inline]
     pub fn get_clamped(&self, x: i64, y: i64) -> u16 {
-        let cx = x.clamp(0, self.width as i64 - 1) as usize;
+        let cx = x.clamp(self.x0 as i64, (self.x0 + self.width) as i64 - 1) as usize;
         let cy = y.clamp(0, self.height as i64 - 1) as usize;
         self.get(cx, cy)
     }
@@ -72,6 +101,7 @@ impl Plane {
 
     /// Returns a row-major sample sequence cropped to the display size `(crop_width, crop_height)`.
     pub fn crop(&self, crop_width: usize, crop_height: usize) -> Vec<u16> {
+        debug_assert_eq!(self.x0, 0, "crop is only meaningful on a whole-frame plane");
         let mut out = Vec::with_capacity(crop_width * crop_height);
         for y in 0..crop_height {
             let row_start = y * self.width;
@@ -83,6 +113,7 @@ impl Plane {
     /// Same as [`Plane::crop`], narrowed to `u8` (for `PlaneData::U8` output when
     /// `BitDepth == 8`, where every sample is already known to fit in `0..=255`).
     pub fn crop_u8(&self, crop_width: usize, crop_height: usize) -> Vec<u8> {
+        debug_assert_eq!(self.x0, 0, "crop is only meaningful on a whole-frame plane");
         let mut out = Vec::with_capacity(crop_width * crop_height);
         for y in 0..crop_height {
             let row_start = y * self.width;
@@ -101,6 +132,7 @@ impl Plane {
         Plane {
             width: crop_width,
             height: crop_height,
+            x0: 0,
             data: self.crop(crop_width, crop_height),
         }
     }
@@ -116,6 +148,23 @@ mod tests {
         p.set(1, 2, 42);
         assert_eq!(p.get(1, 2), 42);
         assert_eq!(p.get(0, 0), 0);
+    }
+
+    #[test]
+    fn strip_translates_absolute_x_to_its_origin() {
+        // A strip over absolute columns [8, 12) of a conceptual 16-wide plane: accessors take
+        // absolute x, storage is strip-local (stride == strip width).
+        let mut s = Plane::new_strip(4, 2, 8);
+        s.set(8, 0, 1);
+        s.set(11, 1, 2);
+        assert_eq!(s.get(8, 0), 1);
+        assert_eq!(s.get(11, 1), 2);
+        assert_eq!(s.as_slice()[0], 1);
+        // Storage index: row 1 * stride 4 + local col 3.
+        assert_eq!(s.as_slice()[4 + 3], 2);
+        // get_clamped clamps into the strip's absolute column range.
+        assert_eq!(s.get_clamped(0, 0), 1);
+        assert_eq!(s.get_clamped(100, 1), 2);
     }
 
     #[test]

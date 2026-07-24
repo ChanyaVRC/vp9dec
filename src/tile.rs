@@ -64,6 +64,15 @@ pub enum TileError {
     InvalidPartition,
     /// An inter block references a DPB slot that holds no decoded frame (malformed bitstream).
     MissingReference,
+    /// An inter block references a frame more than twice the current frame's width or height.
+    /// Spec §8.5.2.3's conformance bounds (`2 * FrameWidth >= RefFrameWidth[ refIdx ]` and the
+    /// height analog) cap the motion-compensation scaling step at 32 (1/16-pel units), and
+    /// every scaled inter-prediction scratch buffer (scalar and AVX2; see
+    /// `predict::MAX_INTERMEDIATE_HEIGHT`) is sized to exactly that bound -- a malformed
+    /// stream using a larger ratio is rejected here instead of overflowing them. Checked per
+    /// block, not at reference resolution: a conformant stream may *list* an out-of-range
+    /// slot it never predicts from (3-layer SVC does; see `Decoder::decode_one_frame`).
+    RefFrameSizeOutOfRange,
     /// The tile's arithmetic decoder ran far past the end of the tile buffer (see
     /// [`crate::bool_coder::BoolDecoder::over_read_bits`]). A conformant tile holds just enough
     /// coded bits for its blocks; running thousands of bits past the end means the decode
@@ -136,20 +145,33 @@ impl Default for MiInfo {
 /// arrays into a single struct. Its size is `Sb64Cols*8 x Sb64Rows*8`
 /// (allocated to also cover the portion of edge superblocks that extends past the frame).
 ///
+/// A tile-parallel worker instead holds a *column strip* ([`MiGrid::new_strip`]) covering only
+/// the absolute MI columns `[col0, col0 + cols)`; accessors keep taking **absolute** columns
+/// (the origin is subtracted internally), mirroring [`Plane`]'s strip scheme.
+///
 /// Not `Clone`: the previous frame's grid is shared into the next frame's `TileDecoder` via
 /// `Arc<MiGrid>` (see [`crate::Decoder::prev_mi_grid`]) rather than deep-cloned.
 #[derive(Debug)]
 pub struct MiGrid {
     cols: usize,
     rows: usize,
+    /// Absolute MI column of this grid's first column (0 for a whole-frame grid).
+    col0: u32,
     data: Vec<MiInfo>,
 }
 
 impl MiGrid {
     fn new(cols: usize, rows: usize) -> Self {
+        Self::new_strip(cols, rows, 0)
+    }
+
+    /// A column strip covering absolute MI columns `[col0, col0 + cols)` (used by the
+    /// tile-parallel worker decoders, [`TileDecoder::spawn_column_worker`]).
+    fn new_strip(cols: usize, rows: usize, col0: u32) -> Self {
         Self {
             cols,
             rows,
+            col0,
             data: vec![MiInfo::default(); cols * rows],
         }
     }
@@ -163,11 +185,11 @@ impl MiGrid {
     }
 
     pub fn get(&self, row: u32, col: u32) -> &MiInfo {
-        &self.data[row as usize * self.cols + col as usize]
+        &self.data[row as usize * self.cols + (col - self.col0) as usize]
     }
 
     fn get_mut(&mut self, row: u32, col: u32) -> &mut MiInfo {
-        &mut self.data[row as usize * self.cols + col as usize]
+        &mut self.data[row as usize * self.cols + (col - self.col0) as usize]
     }
 }
 
@@ -177,6 +199,14 @@ fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32 {
     let offset = ((tile_num * sbs) >> tile_sz_log2) << 3;
     offset.min(mis)
 }
+
+/// Test-only knob: forces [`TileDecoder::decode_tiles`] down the sequential loop even when the
+/// tile-parallel fast path would engage, so tests can assert that the parallel and sequential
+/// decodes of a multi-tile stream are byte-identical (see `tests/tile_parallel_test.rs`).
+/// Compiled only for test builds (the self-referential `test-support` dev-dependency).
+#[cfg(feature = "test-support")]
+pub static FORCE_SEQUENTIAL_TILES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Decoder that walks tiles and superblocks to decode mode info.
 ///
@@ -452,15 +482,40 @@ impl TileDecoder {
     }
 
     /// Builds a fresh worker `TileDecoder` that shares this frame's read-only / config state
-    /// (cheap `Arc` / `Copy` clones) but gets its own zeroed mutable buffers (planes, mi_grid,
-    /// contexts, counts). Used by the tile-parallel path in [`Self::decode_tiles`]: each tile
-    /// column decodes on one of these (independent per VP9's tile-column rule), then its column
-    /// region is merged back. The caller sets the worker's `mi_col_start`/`mi_col_end` /
-    /// `mi_row_start` / `mi_row_end` before decoding.
-    fn spawn_column_worker(&self) -> TileDecoder {
+    /// (cheap `Arc` / `Copy` clones) but gets its own zeroed mutable buffers, sized to the tile
+    /// column `[mi_col_start, mi_col_end)` it will decode: the planes and `mi_grid` are *column
+    /// strips* (see [`Plane::new_strip`] / [`MiGrid::new_strip`] -- indexed by absolute
+    /// coordinates, so the decode path is unchanged), not full frames. Used by the tile-parallel
+    /// path in [`Self::decode_tiles`]: each tile column decodes on one of these (independent per
+    /// VP9's tile-column rule), then its column strip is merged back.
+    ///
+    /// Strip extents: every access a tile-column decode makes to the current frame stays within
+    /// the tile's own columns -- blocks never cross a tile boundary (tile offsets are
+    /// superblock-aligned), the left neighbor is gated at the tile edge (`avail_l`), intra
+    /// above-right reads are bounded by the prediction block (`not_on_right`), and MV candidate
+    /// reads by `is_inside` (tile-bounded) -- EXCEPT that edge superblocks of the *last* tile
+    /// column write past `mi_cols`/`MiCols*8` into the superblock-rounded padding (see
+    /// `framebuffer.rs`'s module doc). So the last column's strip extends to the full padded
+    /// width; the merge never copies that padding (same drop as before).
+    ///
+    /// The `above_*` context arrays stay full-width (a few bytes per MI column): they are
+    /// indexed absolutely, and slicing them would complicate the code for no measurable gain.
+    fn spawn_column_worker(&self, mi_col_start: u32, mi_col_end: u32) -> TileDecoder {
         let grid_cols = self.mi_grid.cols();
         let grid_rows = self.planes[0].height / 8;
         let above_nz_len = grid_cols * 2;
+        let last = mi_col_end == self.mi_cols;
+        let grid_col_end = if last { grid_cols } else { mi_col_end as usize };
+        let strip_plane = |p: usize| {
+            let sub = if p == 0 { 0 } else { self.subsampling_x };
+            let x0 = (mi_col_start as usize * 8) >> sub;
+            let x_end = if last {
+                self.planes[p].width
+            } else {
+                (mi_col_end as usize * 8) >> sub
+            };
+            Plane::new_strip(x_end - x0, self.planes[p].height, x0)
+        };
         TileDecoder {
             tx_mode: self.tx_mode,
             probs: self.probs.clone(),
@@ -469,26 +524,26 @@ impl TileDecoder {
             mi_rows: self.mi_rows,
             tile_cols_log2: self.tile_cols_log2,
             tile_rows_log2: self.tile_rows_log2,
-            mi_grid: MiGrid::new(grid_cols, grid_rows),
+            mi_grid: MiGrid::new_strip(
+                grid_col_end - mi_col_start as usize,
+                grid_rows,
+                mi_col_start,
+            ),
             above_partition_context: vec![0u8; grid_cols],
             left_partition_context: [0u8; 8],
             above_seg_pred_context: vec![0u8; grid_cols],
             left_seg_pred_context: [0u8; 8],
             prev_segment_ids: self.prev_segment_ids.clone(),
-            mi_col_start: 0,
-            mi_col_end: 0,
+            mi_col_start,
+            mi_col_end,
             mi_row_start: 0,
-            mi_row_end: 0,
+            mi_row_end: self.mi_rows,
             bit_depth: self.bit_depth,
             subsampling_x: self.subsampling_x,
             subsampling_y: self.subsampling_y,
             lossless: self.lossless,
             dequant_table: self.dequant_table,
-            planes: [
-                Plane::new(self.planes[0].width, self.planes[0].height),
-                Plane::new(self.planes[1].width, self.planes[1].height),
-                Plane::new(self.planes[2].width, self.planes[2].height),
-            ],
+            planes: [strip_plane(0), strip_plane(1), strip_plane(2)],
             above_nonzero_context: [
                 vec![0u8; above_nz_len],
                 vec![0u8; above_nz_len],
@@ -511,23 +566,31 @@ impl TileDecoder {
         }
     }
 
-    /// Merges tile-column worker `w` (which decoded MI columns `[w.mi_col_start, w.mi_col_end)`)
-    /// back into `self`: copies that column strip of every plane and of `mi_grid`, and sums the
-    /// worker's probability-adaptation counts. Column strips are disjoint across workers, so the
-    /// merged result is identical to a single-threaded decode (counts sum is order-independent).
+    /// Merges tile-column worker `w` (which decoded MI columns `[w.mi_col_start, w.mi_col_end)`
+    /// into column-strip buffers) back into `self`: copies that column strip of every plane and
+    /// of `mi_grid`, and sums the worker's probability-adaptation counts. Column strips are
+    /// disjoint across workers, so the merged result is identical to a single-threaded decode
+    /// (counts sum is order-independent). As before the strip buffers, only columns up to
+    /// `mi_col_end` are copied -- the last column's superblock-rounded padding (which its strip
+    /// also holds, see [`Self::spawn_column_worker`]) is dropped, staying zero in the merged
+    /// frame exactly as in a sequential decode's output path.
     fn merge_column_worker(&mut self, w: &TileDecoder) {
         // Counts (order-independent integer sums).
         self.counts.add_assign(&w.counts);
-        // mi_grid: MI columns [mi_col_start, mi_col_end) across all rows (row-major, stride cols).
+        // mi_grid: MI columns [mi_col_start, mi_col_end) across all rows. The worker strip's
+        // stride is its own `cols`; its first column is absolute column `mi_col_start`.
         let cols = self.mi_grid.cols();
         let rows = self.planes[0].height / 8;
         let (c0, c1) = (w.mi_col_start as usize, w.mi_col_end as usize);
+        let src_cols = w.mi_grid.cols();
         for row in 0..rows {
             let base = row * cols;
+            let src_base = row * src_cols;
             self.mi_grid.data[base + c0..base + c1]
-                .copy_from_slice(&w.mi_grid.data[base + c0..base + c1]);
+                .copy_from_slice(&w.mi_grid.data[src_base..src_base + (c1 - c0)]);
         }
-        // Planes: pixel columns [mi_col*8 >> sub_x, ...) across all rows, per plane.
+        // Planes: pixel columns [mi_col*8 >> sub_x, ...) across all rows, per plane. The worker
+        // strip's stride is its own `width`; its first column is absolute column `px0`.
         for (p, plane) in self.planes.iter_mut().enumerate() {
             let sub = if p == 0 { 0 } else { self.subsampling_x };
             let px0 = (c0 * 8) >> sub;
@@ -535,10 +598,13 @@ impl TileDecoder {
             let width = plane.width;
             let dst = plane.as_mut_slice();
             let src = w.planes[p].as_slice();
+            let src_width = w.planes[p].width;
+            debug_assert_eq!(w.planes[p].x0, px0);
             let height = dst.len() / width;
             for row in 0..height {
                 let base = row * width;
-                dst[base + px0..base + px1].copy_from_slice(&src[base + px0..base + px1]);
+                let src_base = row * src_width;
+                dst[base + px0..base + px1].copy_from_slice(&src[src_base..src_base + (px1 - px0)]);
             }
         }
     }
@@ -554,7 +620,11 @@ impl TileDecoder {
         // the right is undecoded in raster order), so each decodes on its own worker thread and
         // its column strip is merged back -- bit-identical to the sequential path. tile_rows > 1
         // (above-context crosses tile-row boundaries) and the single-column case stay sequential.
-        if tile_cols > 1 && tile_rows == 1 {
+        let use_parallel = tile_cols > 1 && tile_rows == 1;
+        #[cfg(feature = "test-support")]
+        let use_parallel =
+            use_parallel && !FORCE_SEQUENTIAL_TILES.load(std::sync::atomic::Ordering::Relaxed);
+        if use_parallel {
             return self.decode_tiles_parallel(data, tile_cols);
         }
 
@@ -643,14 +713,15 @@ impl TileDecoder {
     fn decode_tiles_parallel(&mut self, data: &[u8], tile_cols: u32) -> Result<(), TileError> {
         let tiles = Self::split_tiles(data, tile_cols as usize)?;
 
-        // Bound peak allocation + concurrency to the machine's parallelism. Each worker holds a
-        // FULL-frame buffer (it only fills its own column -- see `spawn_column_worker`), so
-        // decoding all `tile_cols` at once would allocate `tile_cols` full frames -- an
-        // attacker-controllable multiplier on top of the per-frame `MAX_FRAME_LUMA_SAMPLES` guard
-        // (a wide stream can declare hundreds of tile columns). Processing columns in chunks of
-        // `available_parallelism()` caps peak memory and thread count at that many frames,
-        // regardless of the declared tile count. Columns are independent, so chunk boundaries do
-        // not affect the result, and the first error in column order is still what propagates.
+        // Bound concurrency (and the per-worker fixed overhead: counts + full-width above-context
+        // arrays) to the machine's parallelism. Each worker's planes/mi_grid are column STRIPS
+        // (see `spawn_column_worker`), so the strip buffers of all `tile_cols` workers sum to
+        // ~one frame regardless of the declared tile count -- but a wide stream can still declare
+        // hundreds of tile columns, and spawning that many threads (each with its own `Counts`)
+        // at once is an attacker-controllable multiplier. Processing columns in chunks of
+        // `available_parallelism()` caps thread count and per-chunk overhead regardless of the
+        // declared tile count. Columns are independent, so chunk boundaries do not affect the
+        // result, and the first error in column order is still what propagates.
         let chunk = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
@@ -661,12 +732,10 @@ impl TileDecoder {
             let c1 = (c0 + chunk).min(tile_cols);
             let mut workers: Vec<TileDecoder> = (c0..c1)
                 .map(|c| {
-                    let mut w = self.spawn_column_worker();
-                    w.mi_col_start = get_tile_offset(c, self.mi_cols, self.tile_cols_log2);
-                    w.mi_col_end = get_tile_offset(c + 1, self.mi_cols, self.tile_cols_log2);
-                    w.mi_row_start = 0;
-                    w.mi_row_end = self.mi_rows;
-                    w
+                    self.spawn_column_worker(
+                        get_tile_offset(c, self.mi_cols, self.tile_cols_log2),
+                        get_tile_offset(c + 1, self.mi_cols, self.tile_cols_log2),
+                    )
                 })
                 .collect();
 
@@ -860,7 +929,9 @@ impl TileDecoder {
         // indexes fixed size/tx tables and unwraps reference views without re-validating, so a
         // corrupted block size or reference would panic there rather than surface as a decode
         // error. A conformant stream never trips these (they reject only values it cannot
-        // produce), so this changes no valid-input output. Both were found by tests/robustness_test.
+        // produce), so this changes no valid-input output. The first two were found by
+        // tests/robustness_test; the reference-size bound by review (pinned red->green in
+        // tests/synthetic_scaled_ref_test.rs).
         let bsize = info.mi_size.max(BLOCK_8X8);
         if SS_SIZE_LOOKUP[bsize as usize][self.subsampling_x as usize][self.subsampling_y as usize]
             == BLOCK_INVALID
@@ -869,8 +940,22 @@ impl TileDecoder {
         }
         if is_inter {
             for &rf in &info.ref_frame {
-                if rf > INTRA_FRAME && self.resolved_refs[(rf - LAST_FRAME) as usize].is_none() {
-                    return Err(TileError::MissingReference);
+                if rf > INTRA_FRAME {
+                    match self.resolved_refs[(rf - LAST_FRAME) as usize].as_deref() {
+                        None => return Err(TileError::MissingReference),
+                        // Spec §8.5.2.3's conformance bound (2x per axis) caps the reference-
+                        // scaling step at 32; the motion-compensation scratch buffers (scalar
+                        // and AVX2, `predict::MAX_INTERMEDIATE_HEIGHT`) are sized to exactly
+                        // that. A larger ratio would overflow the scalar scratch's slice
+                        // bounds (panic), so reject the block's reference before predicting.
+                        Some(r)
+                            if r.width as u64 > 2 * self.frame_width as u64
+                                || r.height as u64 > 2 * self.frame_height as u64 =>
+                        {
+                            return Err(TileError::RefFrameSizeOutOfRange);
+                        }
+                        Some(_) => {}
+                    }
                 }
             }
         }

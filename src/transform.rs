@@ -258,10 +258,10 @@ fn adst_output_permute(t: &mut [i64], n: u32) {
 }
 
 /// Spec §8.7.1.6 constants `SINPI_k_9`.
-const SINPI_1_9: i64 = 5283;
-const SINPI_2_9: i64 = 9929;
-const SINPI_3_9: i64 = 13377;
-const SINPI_4_9: i64 = 15212;
+pub(crate) const SINPI_1_9: i64 = 5283;
+pub(crate) const SINPI_2_9: i64 = 9929;
+pub(crate) const SINPI_3_9: i64 = 13377;
+pub(crate) const SINPI_4_9: i64 = 15212;
 
 /// Spec §8.7.1.6: inverse ADST4 body.
 fn iadst4_impl(t: &mut [i64]) {

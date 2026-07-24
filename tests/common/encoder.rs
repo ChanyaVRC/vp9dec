@@ -110,7 +110,9 @@ impl SegSpec {
 
     /// Writes `segmentation_params()`. `temporal_update` is always signaled `false`: none of
     /// this file's tests need temporal seg-id prediction, so `pred_prob` is never read.
-    fn write(&self, w: &mut BitWriter) {
+    /// `pub` so test files with their own header builders (e.g. the reference-frame-scaling
+    /// tests, whose frame sizes differ from this module's fixed `WIDTH`/`HEIGHT`) can reuse it.
+    pub fn write(&self, w: &mut BitWriter) {
         w.push_flag(self.enabled);
         if !self.enabled {
             return;

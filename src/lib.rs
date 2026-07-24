@@ -529,6 +529,12 @@ impl Decoder {
                 return Err(DecodeError::Header(HeaderError::RefFrameFormatMismatch));
             }
         }
+        // NOTE: reference *sizes* are deliberately NOT validated here. Spec §8.5.2.3's 2x
+        // scaling bound applies per reference a block actually uses, and a conformant stream
+        // may list an out-of-range slot it never predicts from (3-layer spatial SVC: a base-
+        // layer frame's ref_frame_idx can point at a 4x-larger enhancement-layer frame --
+        // `vp90-2-22-svc_1280x720_3` does). The bound is enforced at use time in
+        // `decode_block` (`TileError::RefFrameSizeOutOfRange`).
 
         let tile_data = &frame_data[compressed_end..];
         let prev_grid = if use_prev_frame_mvs {

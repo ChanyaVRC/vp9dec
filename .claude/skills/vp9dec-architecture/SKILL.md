@@ -75,8 +75,13 @@ Pipeline order, hub-first:
 - **High-bit-depth scaling in `loop_filter`.** Its constants are 8-bit and scale by
   `<< (bit_depth - 8)` (identity at 8-bit). Any loop-filter change must be re-checked at
   8 / 10 / 12-bit, not just 8-bit.
-- **SIMD is gated on `bit_depth == 8`.** The AVX2 kernels are u8-only; they must never run on a
-  10/12-bit path.
+- **Only the ADST SIMD kernels are 8-bit-gated.** The AVX2 inter-prediction (unscaled and
+  reference-scaled), loop-filter, and DCT_DCT-transform kernels run at **all** bit depths, each
+  depth-aware by a different mechanism (a `max_val` clip bound / `<< (bit_depth-8)` constant
+  scaling / i64-widened butterfly products). The ADST-containing transform kernels dispatch only
+  at `bit_depth == 8` (their unrounded `S` array exceeds i32 lane storage at 10/12-bit) and MUST
+  stay gated. Any new kernel with hardcoded 8-bit constants or i32-tight arithmetic needs the
+  same gate until made depth-aware — see the landmines in `docs/implementation-notes.md`.
 - **Do not "fix" the sub-8x8 chroma MV block index in `residual.rs`.** `(y * num4x4w + x)` is
   bit-exact-correct; a plausible, spec-grounded "correction" to it once *regressed* the official
   4:2:2 vector. Verify against the sweep before touching it.

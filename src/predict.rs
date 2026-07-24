@@ -448,6 +448,9 @@ pub(crate) const MAX_BLOCK_DIM: usize = 64;
 /// scaling conformance requirement (§8.5.2.3: `RefFrameHeight <= 2 * FrameHeight`), which
 /// caps `y_step <= 32` (1/16-pel units; see [`scale_mv_for_plane`]); the 8-tap subpel filter
 /// needs 8 extra rows of context. `(((MAX_BLOCK_DIM - 1) * 32 + 15) >> 4) + 8 == 134`.
+/// The 2x bound is *enforced*, not assumed: `decode_block` (`src/tile.rs`) rejects any block
+/// referencing a frame beyond it (`TileError::RefFrameSizeOutOfRange`), so decode-path
+/// callers never exceed this scratch size on any input, conformant or not.
 /// `pub(crate)`: shared with `src/simd.rs`'s AVX2 mirror of [`block_inter_predict`].
 pub(crate) const MAX_INTERMEDIATE_HEIGHT: usize = 134;
 
@@ -470,20 +473,15 @@ fn block_inter_predict(
 ) {
     debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
     debug_assert_eq!(pred.len(), w * h);
-    let last_x = ref_plane.width as i64 - 1;
-    let last_y = ref_plane.height as i64 - 1;
-    let intermediate_height = (((h as i64 - 1) * y_step + 15) >> 4) + 8;
-    debug_assert!(intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT);
 
     // SIMD wave 2 (docs/implementation-notes.md): AVX2 fast path for the common unscaled
     // case (spec §8.5.2.3's x_step == y_step == 16, i.e. reference frame same size as the
     // current frame -- the overwhelming majority of content). When x_step/y_step == 16,
-    // `p & 15` in the scalar loops below is step-invariant (adding a multiple of 16 never
+    // `p & 15` in the scalar loops is step-invariant (adding a multiple of 16 never
     // changes the low 4 bits), so there's exactly one filter for the whole call instead
     // of one per column/row; and `p >> 4` reduces to a flat per-call offset (`c` alone
     // for the horizontal pass's column, `r` alone for the vertical pass's row -- see
-    // `simd.rs`'s doc comment for the derivation). Falls through to the scalar loop for:
-    // the scaled path (rarer, harder to vectorize -- kept scalar per this wave's scope), and any
+    // `simd.rs`'s doc comment for the derivation). Falls through to the scalar loop for any
     // block whose source window would need the scalar path's per-pixel edge clamp
     // (border replication) -- only near reference-frame edges; replicating that with
     // AVX2 would need a byte gather, which x86 doesn't have. All bit depths use the kernel: the
@@ -493,6 +491,9 @@ fn block_inter_predict(
     // widths 8/16/32/64 to the 256-bit `block_inter_predict_avx2`.
     #[cfg(target_arch = "x86_64")]
     {
+        let last_x = ref_plane.width as i64 - 1;
+        let last_y = ref_plane.height as i64 - 1;
+        let intermediate_height = (((h as i64 - 1) * y_step + 15) >> 4) + 8;
         if x_step == 16
             && y_step == 16
             && (w == 4 || w.is_multiple_of(8))
@@ -547,7 +548,91 @@ fn block_inter_predict(
                 return;
             }
         }
+
+        // Scaled-reference path (SVC / resize: x_step or y_step != 16). Unlike the unscaled
+        // kernels this one edge-clamps internally (every source read goes through precomputed
+        // clamped indices, reproducing the scalar border replication exactly), so there is no
+        // `in_bounds` fallback. Steps are <= 32 by construction here: `decode_block`
+        // (`src/tile.rs`) rejects any block whose reference exceeds spec §8.5.2.3's 2x bound
+        // (`TileError::RefFrameSizeOutOfRange`) before prediction, which caps both quantities
+        // below at MAX_INTERMEDIATE_HEIGHT (the same `(((MAX_BLOCK_DIM - 1) * 32 + 15) >> 4)
+        // + 8` derivation on each axis). The two bound checks are therefore defensive
+        // redundancy for the kernel's fixed scratch sizes, NOT a malformed-stream handler --
+        // the scalar fallback's own fixed scratch has the identical limit and would panic on
+        // its slice bounds past it.
+        if (x_step != 16 || y_step != 16)
+            && (w == 4 || w.is_multiple_of(8))
+            && crate::simd::avx2_enabled()
+        {
+            let span = (((x & 15) + x_step * (w as i64 - 1)) >> 4) + 8;
+            if intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT
+                && span as usize <= MAX_INTERMEDIATE_HEIGHT
+            {
+                let max_val = (1i32 << bit_depth) - 1;
+                // SAFETY: `avx2_enabled()` proved AVX2 support; `ref_plane.as_slice()` is
+                // exactly `width * height` samples (`Plane::new`), and the kernel clamps
+                // every source read to that rectangle; the two checks above bound its
+                // fixed-size scratch indices.
+                unsafe {
+                    crate::simd::block_inter_predict_scaled_avx2(
+                        ref_plane.as_slice(),
+                        ref_plane.width,
+                        ref_plane.height,
+                        x,
+                        y,
+                        x_step,
+                        y_step,
+                        w,
+                        h,
+                        intermediate_height as usize,
+                        interp_filter,
+                        max_val,
+                        pred,
+                    );
+                }
+                return;
+            }
+        }
     }
+
+    block_inter_predict_scalar(
+        ref_plane,
+        x,
+        y,
+        x_step,
+        y_step,
+        w,
+        h,
+        interp_filter,
+        bit_depth,
+        pred,
+    );
+}
+
+/// Scalar body of [`block_inter_predict`] (the spec §8.5.2.4 two-pass loops, verbatim): the
+/// always-kept fallback for every case the AVX2 kernels don't take (`VP9DEC_NO_SIMD=1`, edge
+/// blocks near reference-frame borders on the unscaled path, non-x86_64), and the
+/// bit-exactness oracle `src/simd.rs`'s unit tests pin the kernels against (hence
+/// `pub(crate)`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_inter_predict_scalar(
+    ref_plane: &Plane,
+    x: i64,
+    y: i64,
+    x_step: i64,
+    y_step: i64,
+    w: usize,
+    h: usize,
+    interp_filter: u8,
+    bit_depth: u8,
+    pred: &mut [i32],
+) {
+    debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
+    debug_assert_eq!(pred.len(), w * h);
+    let last_x = ref_plane.width as i64 - 1;
+    let last_y = ref_plane.height as i64 - 1;
+    let intermediate_height = (((h as i64 - 1) * y_step + 15) >> 4) + 8;
+    debug_assert!(intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT);
 
     let filters = &SUBPEL_FILTERS[interp_filter as usize];
 

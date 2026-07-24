@@ -20,6 +20,11 @@ pub type TokenCounts = [[[[[[u32; 3]; 6]; 6]; 2]; 2]; 4];
 pub type MoreCoefsCounts = [[[[[[u32; 2]; 6]; 6]; 2]; 2]; 4];
 
 /// All counter arrays enumerated by the "Clear counts process" in spec §8.3.
+///
+/// `#[repr(C)]` + the `const` size assertion below make [`Counts::add_assign`]'s flat-`u32`
+/// reinterpretation sound by construction (guaranteed field-order layout, provably no
+/// padding), not by layout luck.
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct Counts {
     pub intra_mode: [[u32; 10]; 4],
@@ -47,6 +52,36 @@ pub struct Counts {
     pub token: TokenCounts,
     pub more_coefs: MoreCoefsCounts,
 }
+
+/// Compile-time no-padding proof for [`Counts::add_assign`]: with `#[repr(C)]` the struct is
+/// laid out field-by-field in declaration order, so its size equals the summed field sizes
+/// exactly when there is no padding anywhere. Adding/reshaping a field breaks this assertion
+/// until the sum (and `add_assign`'s flat view) is re-audited.
+const _: () = assert!(
+    std::mem::size_of::<Counts>()
+        == std::mem::size_of::<[[u32; 10]; 4]>()      // intra_mode
+            + std::mem::size_of::<[[u32; 10]; 10]>()  // uv_mode
+            + std::mem::size_of::<[[u32; 4]; 16]>()   // partition
+            + std::mem::size_of::<[[u32; 3]; 4]>()    // interp_filter
+            + std::mem::size_of::<[[u32; 4]; 7]>()    // inter_mode
+            + std::mem::size_of::<[[[u32; 4]; 2]; 4]>() // tx_size
+            + std::mem::size_of::<[[u32; 2]; 4]>()    // is_inter
+            + std::mem::size_of::<[[u32; 2]; 5]>()    // comp_mode
+            + std::mem::size_of::<[[[u32; 2]; 2]; 5]>() // single_ref
+            + std::mem::size_of::<[[u32; 2]; 5]>()    // comp_ref
+            + std::mem::size_of::<[[u32; 2]; 3]>()    // skip
+            + std::mem::size_of::<[u32; 4]>()         // mv_joint
+            + std::mem::size_of::<[[u32; 2]; 2]>()    // mv_sign
+            + std::mem::size_of::<[[u32; 11]; 2]>()   // mv_class
+            + std::mem::size_of::<[[u32; 2]; 2]>()    // mv_class0_bit
+            + std::mem::size_of::<[[[u32; 4]; 2]; 2]>() // mv_class0_fr
+            + std::mem::size_of::<[[u32; 2]; 2]>()    // mv_class0_hp
+            + std::mem::size_of::<[[[u32; 2]; 10]; 2]>() // mv_bits
+            + std::mem::size_of::<[[u32; 4]; 2]>()    // mv_fr
+            + std::mem::size_of::<[[u32; 2]; 2]>()    // mv_hp
+            + std::mem::size_of::<TokenCounts>()      // token
+            + std::mem::size_of::<MoreCoefsCounts>() // more_coefs
+);
 
 impl Default for Counts {
     fn default() -> Self {
@@ -89,14 +124,16 @@ impl Counts {
     ///
     /// Every field of `Counts` is a `u32` array, so the struct is a contiguous block of `u32`
     /// with no padding; summing the flat `u32` view is exactly a field-wise sum but avoids
-    /// enumerating all 28 fields. The `debug_assert` and the sibling unit test guard the layout
-    /// assumption against a future non-`u32` field.
+    /// enumerating all 28 fields. `#[repr(C)]` + the `const` size assertion at the struct
+    /// prove the no-padding layout at compile time; the sibling unit test additionally checks
+    /// the summing behavior across field shapes.
     pub fn add_assign(&mut self, other: &Counts) {
         debug_assert_eq!(std::mem::size_of::<Counts>() % 4, 0);
         let n = std::mem::size_of::<Counts>() / 4;
-        // SAFETY: `Counts` is `#[derive(Clone)]` with only `u32`-array fields (all 4-byte
-        // aligned, no padding), so it is soundly viewed as `n` contiguous `u32`s; `self` and
-        // `other` are the same type, so their flat views line up field-for-field.
+        // SAFETY: `Counts` is `#[repr(C)]` with only `u32`-array fields and provably no
+        // padding (the `const` assertion above), so it is soundly viewed as `n` contiguous
+        // `u32`s; `self` and `other` are the same type, so their flat views line up
+        // field-for-field.
         let dst = unsafe { std::slice::from_raw_parts_mut(self as *mut Counts as *mut u32, n) };
         let src = unsafe { std::slice::from_raw_parts(other as *const Counts as *const u32, n) };
         for (d, &s) in dst.iter_mut().zip(src.iter()) {

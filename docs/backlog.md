@@ -72,12 +72,73 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   (limit/blimit/thresh were already bit-depth values from `adaptive_filter_strength`). The
   `superblock_loop_filter` dispatch no longer gates on `bit_depth == 8`. Bit-exact (sweep 315/315
   both configs, incl. the 10/12-bit vectors).
+- 10/12-bit DCT_DCT inverse-transform SIMD: DONE 2026-07-24. The idct network keeps its i32
+  lane storage at every depth (spec §8.7.1.1 bounds all stored intermediates to signed
+  `8 + BitDepth <= 20` bits), so only the butterfly's `t*cos64` products (~2^33 at 12-bit)
+  needed widening: `simd.rs::b_op_simd_hbd` computes them with 32x32->64-bit `_mm256_mul_epi32`
+  multiplies and rounds in i64; the rest of the network is shared verbatim via
+  `idct_simd::<const HBD>` (monomorphized, so the 8-bit path's codegen is unchanged). The new
+  fused entry `inverse_transform_dct_dct_reconstruct_hbd_avx2` clips at `(1<<bit_depth)-1`;
+  the `tile/residual.rs` dispatch routes 10/12-bit DCT_DCT (non-lossless) there, 8-bit to the
+  existing kernel; ADST / WHT / mixed and lossless stay scalar. Bit-exact (sweep 315/315 both
+  SIMD configs, incl. the `vp92-2-20-10bit-*` / `vp93-2-20-12bit-*` vectors); unit tests pin
+  the 1D HBD idct (at full ±2^19 12-bit magnitudes, with a self-check that those magnitudes
+  overflow the i32-product network) and the fused 2D at 10-bit and 12-bit, every size, against
+  the scalar. Perf: no large high-bit-depth clip exists (the conformance HBD clips are
+  ~160x90x10 frames, ~8 ms/decode), so whole-clip MP/s vs master is within noise; the
+  `InverseTransform` sub-timer on the 12-bit clip went 1.0 ms -> 0.7 ms (9.8% -> 7.2% of
+  decode) -- directional only. The 8-bit path is untouched (separate monomorphization;
+  854x356 clip re-benched at par).
+- 8-bit ADST inverse-transform SIMD (ADST_DCT / DCT_ADST / ADST_ADST, sizes 4/8/16 -- 32x32 is
+  DCT-only): DONE 2026-07-24 (`simd.rs::inverse_transform_adst_reconstruct_avx2` +
+  `iadst4/8/16_simd` / `sb_op_simd` / `sh_op_simd`; the separable pass is now
+  `xform_pass::<HBD, ADST>` and the fused add+clip reconstruction is shared via
+  `reconstruct_add_clip`). The scalar `transform::iadst*` networks are mirrored verbatim on i32
+  8-lane vectors. 8-bit ONLY: the spec §8.7.1.1/§8.7.2 bounds (|T| <= 2^15, |cos64| <= 2^14)
+  keep every SB product (<= 2^29), unrounded S value (< 2^30), SH sum (< 2^31) and iadst4 chain
+  (43801 * 2^15 < 2^31) inside i32, but at 10/12-bit the S array needs `24 + BitDepth` (up to
+  36) bits of LANE STORAGE, so the DCT's products-only i64 widening does not carry over --
+  10/12-bit ADST stays scalar, as does lossless WHT (tiny 4x4-only lossless path whose
+  shift/no-round structure shares nothing with the butterfly infra). Bit-exact (sweep 315/315
+  both SIMD configs) + ffmpeg cross-decode 10/10; unit tests pin the 1D iadst (4x4 at the FULL
+  ±2^15 spec input bound), the SB/SH ops at the exact spec T bound over every network angle and
+  both flips, and the fused 2D vs scalar for all three tx types x 4/8/16. Perf (A/B, same
+  session): 854x356 inter movie 51.52 -> 51.83 MP/s (+0.6%, within noise, as the ~0.3% estimate
+  predicted); on `vp90-2-16-intra-only` the `InverseTransform` sub-timer went 3.7 ms -> 2.6 ms
+  (10.7% -> 7.7% of decode) -- directional only (7-frame clip).
+- Scaled-reference (SVC / resize) inter-prediction SIMD: DONE 2026-07-24
+  (`simd.rs::block_inter_predict_scaled_avx2`; the scalar loops moved to
+  `predict::block_inter_predict_scalar`, the always-kept fallback + unit-test oracle). Both FIR
+  passes are AVX2, all bit depths (same i32-FIR + `max_val` argument as the unscaled kernels):
+  the horizontal pass's per-column subpel phase and source column (`p = x + x_step*c`) are
+  row-invariant, so they are precomputed once per call (per-column gather indices + tap-major
+  coefficient vectors) and each tap's 8 samples fetched with `_mm256_i32gather_epi32` from a
+  per-row i32 scratch of the edge-clamped source span; the vertical pass's phase/base row are
+  uniform per output row (no gathers -- the unscaled vertical pass with a per-row filter).
+  Edge clamping happens inside the kernel via the precomputed clamped indices (bit-identical to
+  the scalar border replication), so unlike the unscaled kernels there is no `in_bounds` scalar
+  fallback; the dispatch's two `MAX_INTERMEDIATE_HEIGHT` bound checks are safety guards against
+  non-conformant scaling ratios (see the landmine in `implementation-notes.md`). Bit-exact
+  (sweep 315/315 both SIMD configs -- incl. the 29 MD5-gated resize/SVC vectors:
+  `vp90-2-05-resize`, `vp90-2-13-largescaling`, `vp90-2-18-resize`, the 24
+  `vp90-2-21-resize_inter_*`, `vp90-2-22-svc_1280x720_{1,3}`) + ffmpeg cross-decode; a
+  temporary probe confirmed the kernel is actually exercised by the 05/13/18/21-resize and
+  3-layer-SVC vectors (the `resize-fp-tiles` family resizes only at keyframes, so it decodes
+  without scaled inter refs); a unit test pins the kernel against the scalar across widths
+  (4-pad + 8-wide groups), steps 1..=32 on both axes, subpel phases, all edge clamps, and
+  8/10/12-bit. Perf (A/B via a temporary kernel-only gate, same binary): on the most
+  scaled-heavy official clip, `vp90-2-22-svc_1280x720_3` (3-layer SVC, scaled inter-layer refs
+  every frame), **42.4 -> 47.2 MP/s (min), ~+11%**; `InterPredict` sub-timer 172 -> 134 ms
+  (37.6% -> 32.4% of decode). `vp90-2-21-resize_inter_1280x720_5_1-2` (resizes only every few
+  frames, mostly unscaled) is within noise, as expected. No large scaled-content clip exists in
+  the corpus (the SVC clip is 60 frames), so the numbers are directional.
 - Wave 4 (remaining): intra prediction is the only remaining named hot spot, but profiled at
   ~0.3% on inter content -- not worth SIMD unless targeting intra-heavy / all-intra streams.
-  Still scalar (perf gap only): the **10/12-bit inverse transform** (inter-pred and loop filter
-  are now SIMD at all depths; the i32 transform overflows past 8-bit so it would need i64), the
-  scaled (SVC/resize) inter path, and the ADST / WHT / mixed inverse transforms (minority of
-  blocks -- ~150-200 lines of ADST-specific SIMD for ~0.3% intra ROI, so low priority).
+  Still scalar (perf gap only): the WHT (lossless 4x4) inverse transform, 10/12-bit ADST, and
+  the unscaled inter path's near-reference-edge blocks (the `in_bounds` scalar fallback; the
+  scaled kernel's gather-through-clamped-scratch approach could close it if ever profiled as
+  hot). Inter-pred (unscaled + scaled), the loop filter, and the DCT_DCT transform are SIMD at
+  all bit depths; the ADST-containing transforms at 8-bit.
 - Tile-parallel multithreading (a different lever than SIMD, same realtime goal): DONE
   2026-07-23 (`tile::decode_tiles_parallel` / `spawn_column_worker` / `merge_column_worker` +
   `Counts::add_assign`). A frame with >1 tile column and 1 tile row decodes each column on its own
@@ -85,12 +146,25 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   column strips + sums the per-worker counts. Bit-exact (sweep 315/315 both configs, incl. the
   `vp90-2-08-tile_1x{2,4,8}` vectors). **51.58 -> 62.87 MP/s, 1.22x** on a 2-column 854x356 clip;
   scales with tile count. `tile_rows > 1` and single-column frames stay sequential. Columns are
-  decoded in chunks of `available_parallelism()` so peak worker allocation is bounded to that many
-  full-frame buffers (not the attacker-declarable `tile_cols`); the `robustness_test` fuzz corpus
-  includes a 4-tile clip so the parallel path is fuzzed for no-panic. Follow-up ideas (not done):
-  give each worker a column-width buffer (each still allocates a full frame but fills only its
-  column) or a shared-buffer (unsafe disjoint-write) variant, to cut both the per-worker waste and
-  the merge copy.
+  decoded in chunks of `available_parallelism()` so thread count and per-worker fixed overhead are
+  bounded (not the attacker-declarable `tile_cols`); the `robustness_test` fuzz corpus
+  includes a 4-tile clip so the parallel path is fuzzed for no-panic. Follow-up (cut the
+  per-worker buffer waste): DONE 2026-07-24 -- chose the column-width-buffer design (safe code):
+  each worker's planes/`mi_grid` are column STRIPS with an origin (`Plane::new_strip` /
+  `MiGrid::new_strip`; accessors keep taking absolute coordinates, so the decode path is
+  untouched -- only the fused SIMD reconstruction's raw-slice offset translates explicitly, and
+  the last column's strip extends into the superblock-rounded padding its edge blocks write).
+  Per-worker allocation drops from a full frame to ~`frame/tile_cols` (1920x800 4-tile: 6.9 MiB
+  -> 1.7 MiB per worker; all workers sum to ~1 frame regardless of tile count); the merge copy
+  remains (unchanged bytes, now read from compact strips). The shared-buffer (unsafe
+  disjoint-write) variant was REJECTED: strips are row-interleaved, so disjoint `&mut` handout is
+  impossible and soundness would need raw-pointer/UnsafeCell plumbing through the hottest write
+  paths -- for a merge memcpy worth ~1% of decode. Bit-exact (sweep 315/315 both SIMD configs;
+  new `tests/tile_parallel_test.rs` pins parallel == forced-sequential byte-for-byte on
+  `vp90-2-08-tile_1x{2,4,8}` via the test-only `tile::FORCE_SEQUENTIAL_TILES` knob). Perf
+  (interleaved A/B vs HEAD, same session): 1920x800 4-tile **~78 -> ~91 MP/s (min), ~+17%** (the
+  per-frame alloc+zero of 4 full frame+grid buffers, ~27 MiB/frame, dominated); 854x356 2-tile
+  ~parity (+~1%, within this machine's noise).
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 
@@ -153,6 +227,17 @@ decision is now that they MAY be done. What "doing" each means, honestly:
 - **examples/-as-tools & single-crate layout** (no action recommended): re-affirmed — still the
   right call at this size; revisit only if the tool count grows (then: `tools/` crate or
   workspace).
+- **Adversarial 4-lens review of the four 2026-07 pending changes** (HBD DCT / 8-bit ADST /
+  scaled inter-pred AVX2; tile-parallel strip buffers): DONE 2026-07-24. No confirmed bug in
+  the changes themselves. Fixed alongside: a PRE-EXISTING scaled-path panic on malformed
+  ratios (now rejected per block, `TileError::RefFrameSizeOutOfRange` + red→green
+  `tests/synthetic_scaled_ref_test.rs`), a resize seed for the robustness fuzz, stale
+  SIMD/tile-parallel docs, and test hardening (fused reconstruction at nonzero origins;
+  `b_op` at spec bounds). Recorded-but-not-done ideas: (1) a differential fuzz mode (SIMD vs
+  `VP9DEC_NO_SIMD` on a malformed corpus — needs the caveat that i32-wrap divergence on
+  garbage input is legitimate, see implementation-notes); (2) a synthetic wide (≥449px)
+  HBD/profile-2 multi-tile stream to exercise the corpus-unreachable {HBD, non-4:2:0} ×
+  column-strip cells (currently sound-by-construction + offset unit tests only).
 
 ## Non-goals (decided, not deferred)
 

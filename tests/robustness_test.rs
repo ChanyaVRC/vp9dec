@@ -103,16 +103,21 @@ fn rec(failures: &mut Vec<String>, label: String, res: Result<(), String>) {
 }
 
 /// Small, diverse seeds: intra-only + superframe, segmentation, 10-bit (profile 2), 4:4:4
-/// (profile 1), and a 4-tile-column clip so mutations also reach the tile-PARALLEL decode path
+/// (profile 1), a 4-tile-column clip so mutations also reach the tile-PARALLEL decode path
 /// (`tile::decode_tiles_parallel`, engaged only for >1 tile column) -- corrupting a multi-tile
-/// stream must not panic on any worker thread either. The 2 MB subpixel clip is deliberately
-/// omitted (its size makes the corruption pass' clones dominate the runtime for no extra coverage).
-const SEED_VECTORS: [&str; 5] = [
+/// stream must not panic on any worker thread either -- and an inter-frame-resize clip so
+/// mutations also reach the reference-SCALED prediction path (steps != 16: the scaled AVX2
+/// kernel, its scalar fallback, and the per-block reference-size bound
+/// `TileError::RefFrameSizeOutOfRange`, none of which a fixed-resolution seed can exercise).
+/// The 2 MB subpixel clip is deliberately omitted (its size makes the corruption pass' clones
+/// dominate the runtime for no extra coverage).
+const SEED_VECTORS: [&str; 6] = [
     "vp90-2-16-intra-only.ivf",
     "vp90-2-15-segkey.ivf",
     "vp92-2-20-10bit-yuv420.ivf",
     "vp91-2-04-yuv444.ivf",
     "vp90-2-08-tile_1x4.ivf",
+    "vp90-2-21-resize_inter_320x180_5_1-2.ivf",
 ];
 
 fn corrupt(rng: &mut Rng, buf: &mut [u8]) {

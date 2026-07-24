@@ -445,15 +445,19 @@ impl TileDecoder {
             dequant[idx] = (t as i64 * ac_quant) / dq_denom;
         }
         dequant[0] = (tokens[0] as i64 * dc_quant) / dq_denom;
-        // The common 8-bit DCT_DCT case runs a fused AVX2 transform+reconstruct (SIMD wave 4b)
-        // that writes clipped pixels straight into the plane, skipping both the i64 write-back and
-        // the scalar reconstruction loop below. Everything else (ADST/WHT/mixed, 10/12-bit)
-        // transforms into `dequant` and takes that loop; the SIMD path is bit-exact against it
-        // (spec §8.7.1.1's 16-bit conformance bound keeps 8-bit DCT intermediates inside i32).
+        // The non-lossless transforms run a fused AVX2 transform+reconstruct (SIMD wave 4b and
+        // follow-ups) that writes clipped pixels straight into the plane, skipping both the i64
+        // write-back and the scalar reconstruction loop below: DCT_DCT at every bit depth (the
+        // 10/12-bit variant widens the butterfly products to i64), the ADST-containing types
+        // (ADST_DCT / DCT_ADST / ADST_ADST; sizes 4/8/16 only -- 32x32 is DCT-only) at 8-bit
+        // only (the ADST's unrounded `S` array fits i32 lanes only at 8-bit -- see the
+        // inverse-ADST section in `simd.rs`). WHT (lossless) and 10/12-bit ADST transform into
+        // `dequant` and take the scalar loop. The SIMD paths are bit-exact against it (spec
+        // §8.7.1.1's `8 + BitDepth`-bit conformance bound keeps all stored intermediates inside
+        // i32).
         #[cfg(target_arch = "x86_64")]
-        let fused = self.bit_depth == 8
-            && !self.lossless
-            && tx_type == TxType::DctDct
+        let fused = !self.lossless
+            && (tx_type == TxType::DctDct || self.bit_depth == 8)
             && crate::simd::avx2_enabled();
         #[cfg(not(target_arch = "x86_64"))]
         let fused = false;
@@ -465,17 +469,56 @@ impl TileDecoder {
             #[cfg(target_arch = "x86_64")]
             if fused {
                 let pw = self.planes[plane].width;
+                // The kernels index the raw buffer directly, so translate the absolute column
+                // into the plane's storage (`x0` > 0 only for a tile-parallel worker's column
+                // strip, whose blocks all satisfy start_x >= x0 -- see `spawn_column_worker`).
+                // A violated strip invariant fails loudly on `Plane::get`'s slice bounds in
+                // the scalar path, but here it would be an unsafe out-of-bounds WRITE inside
+                // the fused kernels -- pin it uniformly in debug.
+                debug_assert!(
+                    start_x >= self.planes[plane].x0 && start_x - self.planes[plane].x0 + n0 <= pw,
+                    "fused-reconstruction block outside its plane strip's columns"
+                );
+                debug_assert!(
+                    start_y + n0 <= self.planes[plane].height,
+                    "fused-reconstruction block outside its plane's rows"
+                );
+                let local_x = start_x - self.planes[plane].x0;
                 // SAFETY: avx2_enabled() checked; dequant[..seg_eob] is exactly n0*n0; the block's
-                // rows/cols are in bounds (planes are allocated out to superblock boundaries).
+                // rows/cols are in bounds (planes -- whole-frame or column strip -- are allocated
+                // out to superblock boundaries); the ADST entry only runs at bit_depth == 8 (the
+                // `fused` gate above) with n <= 4 (`compute_tx_type` returns DctDct for TX_32X32).
                 unsafe {
-                    crate::simd::inverse_transform_dct_dct_reconstruct_avx2(
-                        self.planes[plane].as_mut_slice(),
-                        pw,
-                        start_x,
-                        start_y,
-                        &dequant[..seg_eob],
-                        n,
-                    );
+                    if tx_type != TxType::DctDct {
+                        crate::simd::inverse_transform_adst_reconstruct_avx2(
+                            self.planes[plane].as_mut_slice(),
+                            pw,
+                            local_x,
+                            start_y,
+                            &dequant[..seg_eob],
+                            n,
+                            tx_type,
+                        );
+                    } else if self.bit_depth == 8 {
+                        crate::simd::inverse_transform_dct_dct_reconstruct_avx2(
+                            self.planes[plane].as_mut_slice(),
+                            pw,
+                            local_x,
+                            start_y,
+                            &dequant[..seg_eob],
+                            n,
+                        );
+                    } else {
+                        crate::simd::inverse_transform_dct_dct_reconstruct_hbd_avx2(
+                            self.planes[plane].as_mut_slice(),
+                            pw,
+                            local_x,
+                            start_y,
+                            &dequant[..seg_eob],
+                            n,
+                            self.bit_depth,
+                        );
+                    }
                 }
             } else {
                 inverse_transform_block(&mut dequant[..seg_eob], n, tx_type, self.lossless);

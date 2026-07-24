@@ -182,6 +182,44 @@ fn non_skip_block_with_all_zero_tokens_decodes_successfully() {
 }
 
 #[test]
+fn column_worker_strips_are_sized_and_merged_by_absolute_position() {
+    // 200x80 (4:2:0): MiCols=25, Sb64Cols=4 -> padded planes 256 (luma) / 128 (chroma) wide,
+    // padded grid 32 columns. Two tile columns as get_tile_offset would split them: [0,16)
+    // and [16,25) (the last tile ends at MiCols).
+    let header = minimal_header(200, 80);
+    let compressed = default_compressed_header();
+    let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
+
+    let mut w0 = decoder.spawn_column_worker(0, 16);
+    let mut w1 = decoder.spawn_column_worker(16, 25);
+
+    // Strip sizing: a middle column gets exactly its tile's span; the LAST column's strip
+    // extends into the superblock-rounded padding (its edge blocks write past MiCols*8).
+    assert_eq!((w0.planes[0].x0, w0.planes[0].width), (0, 128));
+    assert_eq!((w1.planes[0].x0, w1.planes[0].width), (128, 256 - 128));
+    assert_eq!((w0.planes[1].x0, w0.planes[1].width), (0, 64));
+    assert_eq!((w1.planes[1].x0, w1.planes[1].width), (64, 128 - 64));
+    assert_eq!(w0.mi_grid.cols(), 16);
+    assert_eq!(w1.mi_grid.cols(), 32 - 16);
+
+    // Workers address planes/mi_grid by ABSOLUTE coordinates; the merge must land each
+    // strip back at its absolute position and sum the counts.
+    w0.planes[0].set(5, 3, 111);
+    w1.planes[0].set(130, 7, 222);
+    w0.mi_grid.get_mut(2, 3).y_mode = 5;
+    w1.mi_grid.get_mut(2, 20).y_mode = 6;
+    w0.counts.partition[0][0] = 1;
+    w1.counts.partition[0][0] = 2;
+    decoder.merge_column_worker(&w0);
+    decoder.merge_column_worker(&w1);
+    assert_eq!(decoder.planes[0].get(5, 3), 111);
+    assert_eq!(decoder.planes[0].get(130, 7), 222);
+    assert_eq!(decoder.mi_grid.get(2, 3).y_mode, 5);
+    assert_eq!(decoder.mi_grid.get(2, 20).y_mode, 6);
+    assert_eq!(decoder.counts.partition[0][0], 3);
+}
+
+#[test]
 fn invalid_tile_size_is_rejected() {
     let header = minimal_header(64, 64);
     // 64x64 -> MiCols=8, Sb64Cols=1, so there is still only 1 tile, but force
