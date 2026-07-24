@@ -103,87 +103,9 @@ impl TileDecoder {
             let pred_max_y = ((self.mi_rows * 8) >> sub_y).saturating_sub(1) as usize;
 
             if is_inter {
-                // SIMD wave 1 measurement (docs/implementation-notes.md): times the whole
-                // per-plane inter-predict section below (all sub-4x4 predict_inter calls when
-                // MiSize < BLOCK_8X8 included), not per-call -- see bench_timing module docs.
-                let _t = crate::bench_timing::StageTimer::start(
-                    crate::bench_timing::Stage::InterPredict,
+                self.predict_inter_for_plane(
+                    plane, row, col, info, base_x, base_y, num4x4w, num4x4h,
                 );
-                // `predict_inter()` (spec §8.5.2): motion compensation / sub-pixel interpolation.
-                let refs: [Option<&RefFrameData>; 2] = [
-                    if info.ref_frame[0] > INTRA_FRAME {
-                        self.resolved_refs[(info.ref_frame[0] - LAST_FRAME) as usize].as_deref()
-                    } else {
-                        None
-                    },
-                    if info.ref_frame[1] > INTRA_FRAME {
-                        self.resolved_refs[(info.ref_frame[1] - LAST_FRAME) as usize].as_deref()
-                    } else {
-                        None
-                    },
-                ];
-                let ref_views: [Option<RefPlaneView>; 2] = std::array::from_fn(|i| {
-                    refs[i].map(|r| RefPlaneView {
-                        plane: match plane {
-                            0 => &r.y,
-                            1 => &r.u,
-                            _ => &r.v,
-                        },
-                        width: r.width,
-                        height: r.height,
-                    })
-                });
-                let ref_view_refs: [Option<&RefPlaneView>; 2] =
-                    [ref_views[0].as_ref(), ref_views[1].as_ref()];
-                let inter_params = InterPredictParams {
-                    ref_frame: info.ref_frame,
-                    block_mvs: &info.sub_mvs,
-                    interp_filter: info.interp_filter,
-                    mi_row: row,
-                    mi_col: col,
-                    mi_size: info.mi_size,
-                    mi_rows: self.mi_rows,
-                    mi_cols: self.mi_cols,
-                    subsampling_x: self.subsampling_x,
-                    subsampling_y: self.subsampling_y,
-                    frame_width: self.frame_width,
-                    frame_height: self.frame_height,
-                    bit_depth: self.bit_depth,
-                    refs: ref_view_refs,
-                };
-
-                if info.mi_size < BLOCK_8X8 {
-                    let mut y = 0u32;
-                    while y < num4x4h {
-                        let mut x = 0u32;
-                        while x < num4x4w {
-                            let block_idx = (y * num4x4w + x) as usize;
-                            predict_inter(
-                                &mut self.planes[plane],
-                                plane,
-                                (base_x + 4 * x) as usize,
-                                (base_y + 4 * y) as usize,
-                                4,
-                                4,
-                                block_idx,
-                                &inter_params,
-                            );
-                            x += 1;
-                        }
-                        y += 1;
-                    }
-                } else {
-                    predict_inter(
-                        &mut self.planes[plane],
-                        plane,
-                        base_x as usize,
-                        base_y as usize,
-                        (num4x4w * 4) as usize,
-                        (num4x4h * 4) as usize,
-                        0,
-                        &inter_params,
-                    );
-                }
             }
 
             let mut block_idx = 0u32;
@@ -265,6 +187,105 @@ impl TileDecoder {
             }
         }
         eob_total
+    }
+
+    /// The inter-prediction step of `residual( )` for one plane: `predict_inter()`
+    /// (spec §8.5.2, motion compensation / sub-pixel interpolation), including the per-4x4
+    /// sub-block loop when `MiSize < BLOCK_8X8`. LANDMINE: the sub-8x8 chroma MV block index
+    /// `(y * num4x4w + x)` is bit-exact-correct as written -- a plausible, spec-grounded
+    /// "correction" to it once regressed the official 4:2:2 vector (see
+    /// docs/implementation-notes.md); verify against the sweep before touching it.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_inter_for_plane(
+        &mut self,
+        plane: usize,
+        row: u32,
+        col: u32,
+        info: &MiInfo,
+        base_x: u32,
+        base_y: u32,
+        num4x4w: u32,
+        num4x4h: u32,
+    ) {
+        // SIMD wave 1 measurement (docs/implementation-notes.md): times the whole
+        // per-plane inter-predict section below (all sub-4x4 predict_inter calls when
+        // MiSize < BLOCK_8X8 included), not per-call -- see bench_timing module docs.
+        let _t = crate::bench_timing::StageTimer::start(crate::bench_timing::Stage::InterPredict);
+        // `predict_inter()` (spec §8.5.2): motion compensation / sub-pixel interpolation.
+        let refs: [Option<&RefFrameData>; 2] = [
+            if info.ref_frame[0] > INTRA_FRAME {
+                self.resolved_refs[(info.ref_frame[0] - LAST_FRAME) as usize].as_deref()
+            } else {
+                None
+            },
+            if info.ref_frame[1] > INTRA_FRAME {
+                self.resolved_refs[(info.ref_frame[1] - LAST_FRAME) as usize].as_deref()
+            } else {
+                None
+            },
+        ];
+        let ref_views: [Option<RefPlaneView>; 2] = std::array::from_fn(|i| {
+            refs[i].map(|r| RefPlaneView {
+                plane: match plane {
+                    0 => &r.y,
+                    1 => &r.u,
+                    _ => &r.v,
+                },
+                width: r.width,
+                height: r.height,
+            })
+        });
+        let ref_view_refs: [Option<&RefPlaneView>; 2] =
+            [ref_views[0].as_ref(), ref_views[1].as_ref()];
+        let inter_params = InterPredictParams {
+            ref_frame: info.ref_frame,
+            block_mvs: &info.sub_mvs,
+            interp_filter: info.interp_filter,
+            mi_row: row,
+            mi_col: col,
+            mi_size: info.mi_size,
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            subsampling_x: self.subsampling_x,
+            subsampling_y: self.subsampling_y,
+            frame_width: self.frame_width,
+            frame_height: self.frame_height,
+            bit_depth: self.bit_depth,
+            refs: ref_view_refs,
+        };
+
+        if info.mi_size < BLOCK_8X8 {
+            let mut y = 0u32;
+            while y < num4x4h {
+                let mut x = 0u32;
+                while x < num4x4w {
+                    let block_idx = (y * num4x4w + x) as usize;
+                    predict_inter(
+                        &mut self.planes[plane],
+                        plane,
+                        (base_x + 4 * x) as usize,
+                        (base_y + 4 * y) as usize,
+                        4,
+                        4,
+                        block_idx,
+                        &inter_params,
+                    );
+                    x += 1;
+                }
+                y += 1;
+            }
+        } else {
+            predict_inter(
+                &mut self.planes[plane],
+                plane,
+                base_x as usize,
+                base_y as usize,
+                (num4x4w * 4) as usize,
+                (num4x4h * 4) as usize,
+                0,
+                &inter_params,
+            );
+        }
     }
 
     /// The part of `get_scan( )` (spec §6.4.25) that determines `TxType`.
@@ -433,7 +454,32 @@ impl TileDecoder {
 
         let nonzero = c > 0;
 
-        // Inverse quantization + inverse transform + reconstruction (spec §8.6.2).
+        self.dequant_transform_reconstruct(
+            plane, start_x, start_y, tx_sz, tx_type, segment_id, &tokens,
+        );
+
+        nonzero
+    }
+
+    /// Inverse quantization + inverse transform + reconstruction (spec §8.6.2) of one transform
+    /// block's decoded `tokens` -- the tail of [`Self::tokens_and_reconstruct`], including the
+    /// fused AVX2 transform+reconstruct dispatch and the scalar reconstruction loop.
+    #[allow(clippy::too_many_arguments)]
+    fn dequant_transform_reconstruct(
+        &mut self,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: u8,
+        tx_type: TxType,
+        segment_id: u8,
+        tokens: &[i32; 1024],
+    ) {
+        let n = (tx_sz as u32) + 2;
+        let n0 = 1usize << n;
+        let seg_eob = n0 * n0;
+        let plane_type = if plane > 0 { 1usize } else { 0usize };
+
         let dq_denom: i64 = if tx_sz == TX_32X32 { 2 } else { 1 };
         // Per-frame dequant table (spec §8.6.1 get_qindex/get_dc_quant/get_ac_quant), built
         // once by `build_dequant_table` -- a per-block table lookup instead of re-deriving.
@@ -451,7 +497,7 @@ impl TileDecoder {
         // 10/12-bit variant widens the butterfly products to i64), the ADST-containing types
         // (ADST_DCT / DCT_ADST / ADST_ADST; sizes 4/8/16 only -- 32x32 is DCT-only) at 8-bit
         // only (the ADST's unrounded `S` array fits i32 lanes only at 8-bit -- see the
-        // inverse-ADST section in `simd.rs`). WHT (lossless) and 10/12-bit ADST transform into
+        // inverse-ADST section in `simd/transform.rs`). WHT (lossless) and 10/12-bit ADST transform into
         // `dequant` and take the scalar loop. The SIMD paths are bit-exact against it (spec
         // §8.7.1.1's `8 + BitDepth`-bit conformance bound keeps all stored intermediates inside
         // i32).
@@ -537,8 +583,6 @@ impl TileDecoder {
                 }
             }
         }
-
-        nonzero
     }
 
     /// `read_coef( token )` (spec §6.4.26).
@@ -549,8 +593,9 @@ impl TileDecoder {
         let mut coef = row[2] as i32;
 
         if token == DCT_VAL_CATEGORY6 {
-            // When BitDepth == 8, this loop runs 0 times
-            // (`for e in 0..(BitDepth-8)`). 10bit/12bit are out of scope for M2.
+            // The cat6 high-bit loop (`for e in 0..(BitDepth-8)`): 0 iterations at 8-bit,
+            // 2/4 at 10/12-bit (profiles 2/3), reading the extra magnitude bits above the
+            // 14 base cat6 extra bits. Sweep-verified at all three bit depths.
             for e in 0..(self.bit_depth.saturating_sub(8) as u32) {
                 let high_bit = r.read_bool(255) as i32;
                 coef += high_bit << (5 + self.bit_depth as u32 - e);

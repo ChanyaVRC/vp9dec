@@ -1,20 +1,22 @@
-//! Intra prediction process (spec §8.5.1 "Intra prediction process").
+//! Prediction processes: intra prediction (spec §8.5.1) and inter prediction
+//! (spec §8.5.2). Both are called per plane by [`crate::tile::TileDecoder`]'s
+//! residual path (`src/tile/residual.rs`).
 //!
-//! VP9 intra prediction has 10 modes (`DC_PRED` through `TM_PRED`). Unlike
-//! VP8 and earlier, or AV1, there are no smooth-style filters, so only these
-//! 10 modes are implemented here.
+//! [`predict_intra`] implements the 10 intra modes (`DC_PRED` through
+//! `TM_PRED`; VP9 has no smooth-style filters, unlike VP8 or AV1). Per
+//! transform block the caller passes the [`crate::framebuffer::Plane`] to
+//! predict into, the block's top-left `(x, y)`,
+//! `have_left`/`have_above`/`not_on_right` (availability at frame/block
+//! edges), `tx_size`, the mode, and the clip bounds `max_x`/`max_y` (= the
+//! spec's `maxX`/`maxY`, which differ per plane).
 //!
-//! The caller ([`crate::tile::TileDecoder`]) passes the following per
-//! transform block:
-//! - The [`crate::framebuffer::Plane`] containing the relevant region of
-//!   `plane` (the prediction result is written here)
-//! - The top-left coordinates `(x, y)` of the block to predict
-//! - `have_left`/`have_above`/`not_on_right` (availability at frame/block
-//!   edges)
-//! - `tx_size` (`TX_4X4`=0 through `TX_32X32`=3)
-//! - The intra prediction mode (`DC_PRED` through `TM_PRED`)
-//! - The clip bounds `max_x`/`max_y` (= the spec's `maxX`/`maxY`, which
-//!   differ per plane)
+//! [`predict_inter`] implements motion compensation: MV selection, edge
+//! clamping, and reference-frame scaling (§8.5.2.1-8.5.2.3) feeding the
+//! per-block subpel interpolation (§8.5.2.4, `block_inter_predict`), plus
+//! compound (two-reference) averaging. `block_inter_predict` dispatches to
+//! the AVX2 kernels in `src/simd/inter.rs` (unscaled and reference-scaled) when
+//! available; [`block_inter_predict_scalar`] is the always-kept fallback and
+//! the bit-exactness oracle the SIMD unit tests pin against.
 
 use crate::framebuffer::Plane;
 use crate::prob_tables::{
@@ -440,7 +442,7 @@ fn scale_mv_for_plane(
 
 /// Max output block dimension for a single `predict_inter` call (spec: 64x64 is the
 /// largest coding block, and chroma calls are always <= that due to subsampling).
-/// `pub(crate)`: shared with `src/simd.rs`'s AVX2 mirror of [`block_inter_predict`].
+/// `pub(crate)`: shared with `src/simd/inter.rs`'s AVX2 mirror of [`block_inter_predict`].
 pub(crate) const MAX_BLOCK_DIM: usize = 64;
 
 /// Max rows needed in [`block_inter_predict`]'s intermediate (horizontal-filter) buffer.
@@ -451,7 +453,7 @@ pub(crate) const MAX_BLOCK_DIM: usize = 64;
 /// The 2x bound is *enforced*, not assumed: `decode_block` (`src/tile.rs`) rejects any block
 /// referencing a frame beyond it (`TileError::RefFrameSizeOutOfRange`), so decode-path
 /// callers never exceed this scratch size on any input, conformant or not.
-/// `pub(crate)`: shared with `src/simd.rs`'s AVX2 mirror of [`block_inter_predict`].
+/// `pub(crate)`: shared with `src/simd/inter.rs`'s AVX2 mirror of [`block_inter_predict`].
 pub(crate) const MAX_INTERMEDIATE_HEIGHT: usize = 134;
 
 /// Per-block inter prediction process (spec §8.5.2.4 "Block inter prediction process").
@@ -481,7 +483,7 @@ fn block_inter_predict(
     // changes the low 4 bits), so there's exactly one filter for the whole call instead
     // of one per column/row; and `p >> 4` reduces to a flat per-call offset (`c` alone
     // for the horizontal pass's column, `r` alone for the vertical pass's row -- see
-    // `simd.rs`'s doc comment for the derivation). Falls through to the scalar loop for any
+    // `simd/inter.rs`'s doc comment for the derivation). Falls through to the scalar loop for any
     // block whose source window would need the scalar path's per-pixel edge clamp
     // (border replication) -- only near reference-frame edges; replicating that with
     // AVX2 would need a byte gather, which x86 doesn't have. All bit depths use the kernel: the
@@ -612,7 +614,7 @@ fn block_inter_predict(
 /// Scalar body of [`block_inter_predict`] (the spec §8.5.2.4 two-pass loops, verbatim): the
 /// always-kept fallback for every case the AVX2 kernels don't take (`VP9DEC_NO_SIMD=1`, edge
 /// blocks near reference-frame borders on the unscaled path, non-x86_64), and the
-/// bit-exactness oracle `src/simd.rs`'s unit tests pin the kernels against (hence
+/// bit-exactness oracle `src/simd/tests.rs`'s unit tests pin the kernels against (hence
 /// `pub(crate)`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn block_inter_predict_scalar(

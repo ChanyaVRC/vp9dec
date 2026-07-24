@@ -56,8 +56,9 @@ Pipeline order, hub-first:
   (`tx_mode` + probability forward updates). The 4 `frame_context_idx` slots live in
   `FrameContextStore`.
 - **Tile decode hub** — `tile.rs` (`decode_partition` / `decode_block`) dispatching to
-  `tile/{mode_info, ref_ctx, mv_pred, residual}`. `residual.rs` runs per-plane intra/inter
-  prediction + token decode + reconstruction, and holds the per-frame dequant table.
+  `tile/{mode_info, ref_ctx, mv_pred, residual, parallel}`. `residual.rs` runs per-plane
+  intra/inter prediction + token decode + reconstruction, and holds the per-frame dequant
+  table; `parallel.rs` holds the tile-column worker/merge machinery.
 - **Prediction / transform / quant** — `predict::{predict_intra, predict_inter}` (motion comp:
   MV selection, edge clamp, reference-frame scaling, subpel interpolation, compound); `transform`
   (inverse DCT/ADST/WHT); `quant` (dequant); `scan` (scan-order tables).
@@ -65,7 +66,8 @@ Pipeline order, hub-first:
 - **DPB / superframe** — `dpb::Dpb` (8 reference slots; also serves `show_existing_frame`);
   `superframe::split_superframe`.
 - **Pure tables** (no decode logic) — `common`, `subpel`, `mv_ref_tables`, `prob_tables`.
-- **SIMD** — `simd.rs` (x86_64 AVX2, runtime-detected). Output **must equal** the scalar path;
+- **SIMD** — `simd.rs` hub + `simd/{inter, loop_filter, transform}.rs` (x86_64 AVX2,
+  runtime-detected). Output **must equal** the scalar path;
   `VP9DEC_NO_SIMD=1` forces scalar and the sweep must pass identically in both configs.
 - **Encoder mirrors** (test-only, `feature = "test-support"`) — `test_support` hand-builds
   synthetic bitstreams for round-trip tests; never in a normal build.

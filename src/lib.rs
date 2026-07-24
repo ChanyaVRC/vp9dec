@@ -3,15 +3,10 @@
 //! Reference spec: VP9 Bitstream & Decoding Process Specification v0.7
 //! (Google, dated 2017-02-22, <https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf>)
 //!
-//! # Milestones
-//! - M1: IVF container parser, bool decoder, uncompressed frame header parsing
-//! - M2: keyframe decoding via intra prediction
-//! - M2b: loop filter (deblocking filter) + official conformance verification
-//! - M3 first half: inter frame bitstream decoding (up to but not including motion compensation)
-//! - M3 second half: motion compensation, probability adaptation, reference frame management + full-frame MD5 conformance
-//! - M4: full conformance test pass
-//!
-//! (Modules are added incrementally in subsequent commits.)
+//! Decodes all four VP9 profiles (8/10/12-bit; 4:2:0/4:2:2/4:4:0/4:4:4), verified bit-exact
+//! against the full official conformance corpus. Runtime-detected AVX2 fast paths and
+//! tile-parallel decoding accelerate the scalar reference path without altering its output.
+//! See README.md "Current architecture" for the module map.
 
 pub mod ivf;
 
@@ -47,7 +42,8 @@ pub mod prob_tables;
 pub mod quant;
 #[doc(hidden)]
 pub mod scan;
-/// AVX2 inter-prediction convolution (SIMD wave 2); x86_64-only, see `src/simd.rs`.
+/// AVX2 SIMD kernels (inter prediction, loop filter, inverse transforms); x86_64-only, see
+/// the hub `src/simd.rs` and its submodules.
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub mod simd;
@@ -78,7 +74,10 @@ use tile::{MiGrid, TileDecoder, TileError};
 /// Error type covering everything that can cause [`Decoder::decode_frame`] to fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// Failed to parse the uncompressed header (`uncompressed_header`).
+    /// Failed to parse the uncompressed header (`uncompressed_header`). Two variants are
+    /// raised by the [`Decoder`] itself rather than the parser: `FrameSizeTooLarge` (a
+    /// signaled size the decoder refuses to allocate) and `RefFrameFormatMismatch` (an
+    /// inter frame whose reference doesn't share its bit depth / subsampling).
     Header(HeaderError),
     /// Failed to parse the compressed header (`compressed_header`).
     CompressedHeader(CompressedHeaderError),
@@ -111,7 +110,7 @@ impl From<TileError> for DecodeError {
 
 /// One decoded plane's pixel data. 8-bit streams (`BitDepth == 8`) decode into `U8` (no
 /// memory bloat from widening the overwhelmingly common case); 10/12-bit streams (VP9
-/// profile 2) decode into `U16` (each sample 0..=1023 or 0..=4095).
+/// profiles 2/3) decode into `U16` (each sample 0..=1023 or 0..=4095).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaneData {
     U8(Vec<u8>),
@@ -143,7 +142,9 @@ impl PlaneData {
 }
 
 /// One decoded frame. Cropped to the display size (`FrameWidth`/`FrameHeight`), holding the
-/// 3 YUV420 planes as [`PlaneData`] (row-major).
+/// 3 Y/U/V planes as [`PlaneData`] (row-major). Chroma sizing follows
+/// `subsampling_x`/`subsampling_y`: 4:2:0 for profiles 0/2; profiles 1/3 also output
+/// 4:2:2, 4:4:0, or 4:4:4.
 ///
 /// The `u`/`v` sizes follow the output process of spec §8.9, computed as
 /// `((width + subsampling_x) >> subsampling_x) x ((height + subsampling_y) >> subsampling_y)`
@@ -360,6 +361,28 @@ impl Decoder {
         }
     }
 
+    /// Spec §8.1 step 3: `PrevSegmentIds` is refreshed from this frame's `SegmentIds` (read
+    /// out of `grid`) only when segmentation_enabled && segmentation_update_map (not gated by
+    /// show_frame). Otherwise it is left as-is (already reset to zero by
+    /// [`Self::clear_prev_segment_ids_if_needed`] if the size changed).
+    fn refresh_prev_segment_ids(
+        &mut self,
+        header: &header::NewFrameHeader,
+        image_size: &header::ImageSize,
+        grid: &MiGrid,
+    ) {
+        if header.segmentation.enabled && header.segmentation.update_map {
+            let mut new_map = vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize];
+            for row in 0..image_size.mi_rows {
+                for col in 0..image_size.mi_cols {
+                    new_map[(row * image_size.mi_cols + col) as usize] =
+                        grid.get(row, col).segment_id;
+                }
+            }
+            self.prev_segment_ids = Arc::new(new_map);
+        }
+    }
+
     /// Decodes one container chunk (one IVF frame, one WebM block, etc.). Callers must pass
     /// chunks extracted from an IVF or similar container in bitstream order (decode order),
     /// not display order.
@@ -569,62 +592,16 @@ impl Decoder {
         // timer lives to the end of the function (no more fallible `?` calls follow).
         let _dpb_t = bench_timing::StageTimer::start(bench_timing::Stage::DpbOutput);
 
-        // spec §8.1 step 3: PrevSegmentIds is refreshed from this frame's SegmentIds only
-        // when segmentation_enabled && segmentation_update_map (not gated by show_frame).
-        // Otherwise it is left as-is (already reset to zero above if the size changed).
-        if header.segmentation.enabled && header.segmentation.update_map {
-            let grid = tile_decoder.mi_grid();
-            let mut new_map = vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize];
-            for row in 0..image_size.mi_rows {
-                for col in 0..image_size.mi_cols {
-                    new_map[(row * image_size.mi_cols + col) as usize] =
-                        grid.get(row, col).segment_id;
-                }
-            }
-            self.prev_segment_ids = Arc::new(new_map);
-        }
+        self.refresh_prev_segment_ids(&header, &image_size, tile_decoder.mi_grid());
 
         // refresh_probs() (spec §6.1.2).
-        let final_probs = if !header.error_resilient_mode && !header.frame_parallel_decoding_mode {
-            // load_probs( frame_context_idx ): restore all tables except tx_probs/skip_prob
-            // to their pre-forward-update value (starting_probs). tx_probs/skip_prob are
-            // left at their post-forward-update value from compressed_header(). The two
-            // fields are copied aside (24B + 3B) before moving starting_probs into working,
-            // rather than cloning the whole multi-KB struct just to overwrite most of it.
-            let pre_update_tx_probs = starting_probs.tx_probs;
-            let pre_update_skip_prob = starting_probs.skip_prob;
-            let mut working = starting_probs;
-            working.tx_probs = compressed.probs.tx_probs;
-            working.skip_prob = compressed.probs.skip_prob;
-
-            let counts = tile_decoder.counts();
-            // Spec §8.4.3: determining updateFactor.
-            let update_factor = if header.frame_is_intra {
-                112
-            } else if self.last_frame_type == Some(FrameType::KeyFrame) {
-                128
-            } else {
-                112
-            };
-            adapt_coef_probs(&mut working.coef_probs, counts, update_factor);
-
-            if !header.frame_is_intra {
-                // load_probs2( frame_context_idx ): also restore tx_probs/skip_prob to
-                // their pre-forward-update value before applying adapt_noncoef_probs.
-                working.tx_probs = pre_update_tx_probs;
-                working.skip_prob = pre_update_skip_prob;
-                adapt_noncoef_probs(
-                    &mut working,
-                    counts,
-                    header.interpolation_filter,
-                    compressed.tx_mode,
-                    header.allow_high_precision_mv,
-                );
-            }
-            working
-        } else {
-            (*compressed.probs).clone()
-        };
+        let final_probs = refresh_probs(
+            &header,
+            starting_probs,
+            &compressed,
+            tile_decoder.counts(),
+            self.last_frame_type,
+        );
         if header.refresh_frame_context {
             self.frame_contexts
                 .save(header.effective_frame_context_idx(), final_probs);
@@ -724,6 +701,60 @@ fn frame_context_reset(
         FrameContextReset::Slot(frame_context_idx)
     } else {
         FrameContextReset::None
+    }
+}
+
+/// `refresh_probs()` (spec §6.1.2): the frame context to save back after a frame's decode --
+/// a pure function of the frame's header, the pre-forward-update starting probabilities
+/// (`load_probs`' value), the parsed compressed header, the tile decode's adaptation counts,
+/// and the previous frame's type (spec §8.4.3's updateFactor). Backward adaptation runs only
+/// when neither error_resilient_mode nor frame_parallel_decoding_mode is set; otherwise the
+/// post-forward-update probabilities are saved as-is.
+fn refresh_probs(
+    header: &header::NewFrameHeader,
+    starting_probs: FrameContext,
+    compressed: &compressed_header::CompressedHeader,
+    counts: &counts::Counts,
+    last_frame_type: Option<FrameType>,
+) -> FrameContext {
+    if !header.error_resilient_mode && !header.frame_parallel_decoding_mode {
+        // load_probs( frame_context_idx ): restore all tables except tx_probs/skip_prob
+        // to their pre-forward-update value (starting_probs). tx_probs/skip_prob are
+        // left at their post-forward-update value from compressed_header(). The two
+        // fields are copied aside (24B + 3B) before moving starting_probs into working,
+        // rather than cloning the whole multi-KB struct just to overwrite most of it.
+        let pre_update_tx_probs = starting_probs.tx_probs;
+        let pre_update_skip_prob = starting_probs.skip_prob;
+        let mut working = starting_probs;
+        working.tx_probs = compressed.probs.tx_probs;
+        working.skip_prob = compressed.probs.skip_prob;
+
+        // Spec §8.4.3: determining updateFactor.
+        let update_factor = if header.frame_is_intra {
+            112
+        } else if last_frame_type == Some(FrameType::KeyFrame) {
+            128
+        } else {
+            112
+        };
+        adapt_coef_probs(&mut working.coef_probs, counts, update_factor);
+
+        if !header.frame_is_intra {
+            // load_probs2( frame_context_idx ): also restore tx_probs/skip_prob to
+            // their pre-forward-update value before applying adapt_noncoef_probs.
+            working.tx_probs = pre_update_tx_probs;
+            working.skip_prob = pre_update_skip_prob;
+            adapt_noncoef_probs(
+                &mut working,
+                counts,
+                header.interpolation_filter,
+                compressed.tx_mode,
+                header.allow_high_precision_mv,
+            );
+        }
+        working
+    } else {
+        (*compressed.probs).clone()
     }
 }
 

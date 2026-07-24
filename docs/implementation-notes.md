@@ -68,8 +68,8 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   in `tile/residual.rs` is `(y * num4x4w + x)` and is bit-exact-correct. A plausible,
   spec-grounded "correction" to it (meant to fix 4:2:2) once *regressed* the official 4:2:2
   vector. When a hypothesis and the sweep disagree, the sweep wins — verify first, edit second.
-- **Tile-parallel decode (`tile::decode_tiles_parallel`) assumes tile-column independence -- and
-  the worker buffers are now sized to that assumption.** Each tile column decodes into its own
+- **Tile-parallel decode (`decode_tiles_parallel` in `src/tile/parallel.rs`) assumes tile-column
+  independence -- and the worker buffers are now sized to that assumption.** Each tile column decodes into its own
   worker `TileDecoder` whose planes/`mi_grid` are column STRIPS covering only its tile's columns
   (absolute-coordinate accessors with an internal origin), merged back by disjoint column strip.
   This works only because every current-frame access a tile decode makes stays within its own
@@ -159,10 +159,10 @@ skill; change-navigation is the `vp9dec-architecture` skill.
 - **`cargo fmt` is safe tree-wide.** `rustfmt <one file>` on the crate root used to reformat the
   whole crate; the tree was normalized once, so a plain `cargo fmt` now touches only your change.
 - **Large unit-test modules live out-of-line** in a sibling `<module>/tests.rs` (declared with
-  `#[cfg(test)] mod tests;`): `transform`, `header`, `loop_filter`, `tile`, `tile::mode_info`,
-  and the crate root (`src/tests.rs`). Smaller modules keep their tests inline. Split a module's
-  tests out when the test body grows large (a few hundred lines) rather than inlining a block
-  that rivals the source in size.
+  `#[cfg(test)] mod tests;`): `transform`, `header`, `loop_filter`, `simd`, `tile`,
+  `tile::mode_info`, and the crate root (`src/tests.rs`). Smaller modules keep their tests
+  inline. Split a module's tests out when the test body grows large (a few hundred lines)
+  rather than inlining a block that rivals the source in size.
 
 ## Known gaps
 

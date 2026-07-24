@@ -67,25 +67,8 @@ impl Plane {
         self.data[y * self.width + (x - self.x0)] = v;
     }
 
-    /// Reads after clamping `(x, y)` to `[x0, x0+width-1] x [0, height-1]`
-    /// (used for references like the spec's `CurrFrame[ plane ][ Min(maxY,...) ][ Min(maxX,...) ]`
-    /// that replicate the edge value past the frame boundary).
-    ///
-    /// **CAUTION -- strip-relative clamp, currently no production callers.** On a column strip
-    /// (`x0 > 0`) this clamps x into the STRIP's columns `[x0, x0 + width)`, which is NOT the
-    /// spec's frame-edge clamp (that would clamp to the whole frame's `[0, frame_width)`).
-    /// Any future caller running on a tile-parallel worker's plane must reconcile its clamp
-    /// semantics with the sequential (whole-frame) path first, or the two paths will silently
-    /// produce different pixels near tile-column boundaries.
-    #[inline]
-    pub fn get_clamped(&self, x: i64, y: i64) -> u16 {
-        let cx = x.clamp(self.x0 as i64, (self.x0 + self.width) as i64 - 1) as usize;
-        let cy = y.clamp(0, self.height as i64 - 1) as usize;
-        self.get(cx, cy)
-    }
-
     /// Raw row-major buffer (stride == `width`), for the AVX2 SIMD convolution
-    /// (`src/simd.rs`), which proves its own bounds instead of paying `get`'s per-access
+    /// (`src/simd/inter.rs`), which proves its own bounds instead of paying `get`'s per-access
     /// check.
     #[inline]
     pub fn as_slice(&self) -> &[u16] {
@@ -93,7 +76,8 @@ impl Plane {
     }
 
     /// Mutable counterpart of [`Plane::as_slice`], for the AVX2 loop-filter kernel
-    /// (`src/simd.rs`), which writes its filtered samples directly into the raw buffer.
+    /// (`src/simd/loop_filter.rs`), which writes its filtered samples directly into the raw
+    /// buffer.
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u16] {
         &mut self.data
@@ -162,19 +146,6 @@ mod tests {
         assert_eq!(s.as_slice()[0], 1);
         // Storage index: row 1 * stride 4 + local col 3.
         assert_eq!(s.as_slice()[4 + 3], 2);
-        // get_clamped clamps into the strip's absolute column range.
-        assert_eq!(s.get_clamped(0, 0), 1);
-        assert_eq!(s.get_clamped(100, 1), 2);
-    }
-
-    #[test]
-    fn get_clamped_clips_to_bounds() {
-        let mut p = Plane::new(4, 3);
-        p.set(0, 0, 7);
-        p.set(3, 2, 9);
-        assert_eq!(p.get_clamped(-5, -5), 7);
-        assert_eq!(p.get_clamped(100, 100), 9);
-        assert_eq!(p.get_clamped(0, 0), 7);
     }
 
     #[test]

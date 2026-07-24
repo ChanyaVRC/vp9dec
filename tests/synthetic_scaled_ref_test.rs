@@ -12,9 +12,9 @@
 //! predicts from (`vp90-2-22-svc_1280x720_3`'s base layer lists a 4x-larger enhancement
 //! frame), so eager rejection would break the official sweep.
 //!
-//! Two synthetic streams, hand-built with `tests/common/encoder.rs`'s bool coder (the same
-//! machinery as `synthetic_seg_test.rs`, with local header builders because the frame sizes
-//! differ from that module's fixed 16x16):
+//! Two synthetic streams, hand-built with `tests/common/encoder.rs`'s builders (the same
+//! machinery as `synthetic_seg_test.rs`, passing explicit frame sizes instead of that
+//! module's default 16x16):
 //!
 //! 1. ratio 4.0 (64x256 keyframe -> 64x64 inter): must return `Err`, never panic -- before the
 //!    upstream rejection existed, this stream panicked on the scalar scratch's slice bounds
@@ -33,105 +33,22 @@
 mod common;
 
 use common::encoder::{
-    assemble_frame, build_inter_compressed_header, build_keyframe_compressed_header, encode_tree,
-    header_size, SegSpec,
+    assemble_frame, build_inter_compressed_header, build_inter_header,
+    build_keyframe_compressed_header, build_keyframe_header, encode_tree, header_size, SegSpec,
 };
 use vp9dec::header::{SEG_LVL_REF_FRAME, SEG_LVL_SKIP};
 use vp9dec::prob_tables::{
     DC_PRED, DEFAULT_PARTITION_PROBS, DEFAULT_SKIP_PROB, INTRA_MODE_TREE, KF_PARTITION_PROBS,
     KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, LAST_FRAME, PARTITION_NONE, PARTITION_TREE,
 };
-use vp9dec::test_support::{BitWriter, BoolEncoder};
+use vp9dec::test_support::BoolEncoder;
 use vp9dec::tile::TileError;
 use vp9dec::{DecodeError, Decoder, PlaneData};
 
 /// All frames here are one superblock (64) wide, so `Sb64Cols == 1`: `tile_info()`'s
-/// tile-cols loop reads no bits and `tile_rows_log2` is a single 0 bit -- same tiling tail
-/// as `tests/common/encoder.rs`'s fixed-size builders.
+/// tile-cols loop reads no bits and `tile_rows_log2` is a single 0 bit -- the tiling tail
+/// `tests/common/encoder.rs`'s builders write.
 const WIDTH: u32 = 64;
-
-/// Mirrors `common::encoder::build_keyframe_header` (profile 0, lossless, no loop filter, no
-/// segmentation), parameterized by frame size instead of that module's fixed 16x16.
-fn build_sized_keyframe_header(width: u32, height: u32, header_size_in_bytes: u16) -> Vec<u8> {
-    let mut w = BitWriter::new();
-    w.push_bits(2, 2); // frame_marker
-    w.push_bits(0, 1); // profile_low_bit
-    w.push_bits(0, 1); // profile_high_bit -> profile 0
-    w.push_flag(false); // show_existing_frame
-    w.push_bits(0, 1); // frame_type = KEY_FRAME
-    w.push_flag(true); // show_frame
-    w.push_flag(false); // error_resilient_mode
-    w.push_bits(0x49, 8); // frame_sync_code
-    w.push_bits(0x83, 8);
-    w.push_bits(0x42, 8);
-    w.push_bits(0, 3); // color_space = CS_UNKNOWN
-    w.push_flag(false); // color_range
-    w.push_bits(width - 1, 16);
-    w.push_bits(height - 1, 16);
-    w.push_flag(false); // render_size same as frame size
-    w.push_flag(false); // refresh_frame_context
-    w.push_flag(true); // frame_parallel_decoding_mode
-    w.push_bits(0, 2); // frame_context_idx
-    w.push_bits(0, 6); // loop_filter_level
-    w.push_bits(0, 3); // sharpness
-    w.push_flag(false); // loop_filter_delta_enabled
-    w.push_bits(0, 8); // base_q_idx = 0 -> lossless
-    w.push_flag(false); // delta_q_y_dc coded?
-    w.push_flag(false); // delta_q_uv_dc coded?
-    w.push_flag(false); // delta_q_uv_ac coded?
-    SegSpec::disabled().write(&mut w);
-    w.push_bits(0, 1); // tile_rows_log2 (tile-cols loop reads no bits: Sb64Cols == 1)
-    w.push_bits(header_size_in_bytes as u32, 16);
-    w.finish()
-}
-
-/// Mirrors `common::encoder::build_inter_header`, except the frame size is explicit
-/// (`found_ref = 0` for all three slots, then `frame_size()`) instead of inherited from the
-/// reference -- the whole point is an inter frame SMALLER than its reference.
-fn build_sized_inter_header(
-    width: u32,
-    height: u32,
-    segmentation: &SegSpec,
-    header_size_in_bytes: u16,
-) -> Vec<u8> {
-    let mut w = BitWriter::new();
-    w.push_bits(2, 2); // frame_marker
-    w.push_bits(0, 1); // profile_low_bit
-    w.push_bits(0, 1); // profile_high_bit -> profile 0
-    w.push_flag(false); // show_existing_frame
-    w.push_bits(1, 1); // frame_type = NON_KEY_FRAME
-    w.push_flag(true); // show_frame = 1 -> intra_only not read
-    w.push_flag(false); // error_resilient_mode
-    w.push_bits(0, 2); // reset_frame_context
-    w.push_bits(0, 8); // refresh_frame_flags = 0
-    for _ in 0..3 {
-        w.push_bits(0, 3); // ref_frame_idx[i] = 0 (the keyframe refreshed every slot)
-        w.push_flag(false); // ref_frame_sign_bias: all equal -> SINGLE_REFERENCE, zero bits
-    }
-    for _ in 0..3 {
-        w.push_flag(false); // found_ref = 0: do NOT inherit the reference's size
-    }
-    w.push_bits(width - 1, 16);
-    w.push_bits(height - 1, 16);
-    w.push_flag(false); // render_size same as frame size
-    w.push_flag(false); // allow_high_precision_mv
-    w.push_flag(false); // interpolation_filter: not switchable
-    w.push_bits(0, 2); // -> EIGHTTAP_SMOOTH; never read per-block
-    w.push_flag(false); // refresh_frame_context
-    w.push_flag(true); // frame_parallel_decoding_mode
-    w.push_bits(0, 2); // frame_context_idx
-    w.push_bits(0, 6); // loop_filter_level
-    w.push_bits(0, 3); // sharpness
-    w.push_flag(false); // loop_filter_delta_enabled
-    w.push_bits(0, 8); // base_q_idx = 0 -> lossless
-    w.push_flag(false); // delta_q_y_dc coded?
-    w.push_flag(false); // delta_q_uv_dc coded?
-    w.push_flag(false); // delta_q_uv_ac coded?
-    segmentation.write(&mut w);
-    w.push_bits(0, 1); // tile_rows_log2
-    w.push_bits(header_size_in_bytes as u32, 16);
-    w.finish()
-}
 
 /// Tile data for a 64-wide keyframe of `sb_rows` stacked 64x64 superblocks, each a single
 /// `PARTITION_NONE` DC_PRED block with `skip = 1` (lossless -> `read_tx_size` reads no bits).
@@ -188,13 +105,28 @@ fn encode_forced_zeromv_inter_tile() -> Vec<u8> {
 /// ZEROMV inter frame referencing it (vertical scaling ratio `ref_height / 64`).
 fn build_scaled_ref_frames(ref_height: u32) -> (Vec<u8>, Vec<u8>) {
     let kf_compressed = build_keyframe_compressed_header();
-    let kf_header = build_sized_keyframe_header(WIDTH, ref_height, header_size(&kf_compressed));
+    let kf_header = build_keyframe_header(
+        WIDTH,
+        ref_height,
+        0,
+        false,
+        &SegSpec::disabled(),
+        header_size(&kf_compressed),
+    );
     let kf_tile = encode_dc_keyframe_tile(ref_height as usize / 64);
     let keyframe = assemble_frame(kf_header, kf_compressed, kf_tile);
 
     let seg = forced_skip_last_seg();
     let inter_compressed = build_inter_compressed_header();
-    let inter_header = build_sized_inter_header(64, 64, &seg, header_size(&inter_compressed));
+    // ref_frame_idx all 0 (the keyframe refreshed every slot); the explicit 64x64 size is the
+    // whole point -- an inter frame SMALLER than its reference.
+    let inter_header = build_inter_header(
+        [0, 0, 0],
+        Some((64, 64)),
+        0,
+        &seg,
+        header_size(&inter_compressed),
+    );
     let inter_tile = encode_forced_zeromv_inter_tile();
     let inter = assemble_frame(inter_header, inter_compressed, inter_tile);
 

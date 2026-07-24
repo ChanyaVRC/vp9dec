@@ -15,6 +15,8 @@ use vp9dec::prob_tables::{
 };
 use vp9dec::test_support::{BitWriter, BoolEncoder};
 
+/// Default frame size for this module's fixed-size pieces (`build_intra_only_header`, the
+/// tile builders' 2x2 8x8-block layout) and the seg/superframe tests built on them.
 pub const WIDTH: u32 = 16;
 pub const HEIGHT: u32 = 16;
 
@@ -57,7 +59,8 @@ pub fn write_no_update(enc: &mut BoolEncoder, count: usize) {
     // CAUTION: a wrong `count` at a call site is invisible to every test in this file -- too few
     // writes are absorbed (the bool decoder reads the zero padding as more `false` bits), too
     // many are discarded by `exit_bool` -- so verify counts against
-    // `parse_compressed_header_ex`'s read order when editing; green tests do not prove them.
+    // `parse_compressed_header`'s read order (`src/compressed_header.rs`) when editing; green
+    // tests do not prove them.
     for _ in 0..count {
         enc.write_bool(false, 252);
     }
@@ -110,8 +113,6 @@ impl SegSpec {
 
     /// Writes `segmentation_params()`. `temporal_update` is always signaled `false`: none of
     /// this file's tests need temporal seg-id prediction, so `pred_prob` is never read.
-    /// `pub` so test files with their own header builders (e.g. the reference-frame-scaling
-    /// tests, whose frame sizes differ from this module's fixed `WIDTH`/`HEIGHT`) can reuse it.
     pub fn write(&self, w: &mut BitWriter) {
         w.push_flag(self.enabled);
         if !self.enabled {
@@ -151,7 +152,7 @@ impl SegSpec {
 // ===========================================================================================
 // Uncompressed header builders. Both mirror `src/header.rs`'s
 // `#[cfg(test)] fn build_minimal_keyframe_header`/`build_minimal_inter_frame_header`, extended
-// with segmentation/loop-filter-level parameters. `refresh_frame_context = false` +
+// with frame-size/segmentation/loop-filter-level parameters. `refresh_frame_context = false` +
 // `frame_parallel_decoding_mode = true` on every frame here sidesteps backward probability
 // adaptation entirely (`Decoder::decode_one_frame`'s `refresh_probs`, src/lib.rs) -- with only
 // two frames ever decoded and the first always a key frame (which resets every frame context
@@ -160,6 +161,8 @@ impl SegSpec {
 // ===========================================================================================
 
 pub fn build_keyframe_header(
+    width: u32,
+    height: u32,
     loop_filter_level: u8,
     loop_filter_delta_enabled: bool,
     segmentation: &SegSpec,
@@ -178,8 +181,8 @@ pub fn build_keyframe_header(
     w.push_bits(0x42, 8);
     w.push_bits(0, 3); // color_space = CS_UNKNOWN
     w.push_flag(false); // color_range
-    w.push_bits(WIDTH - 1, 16);
-    w.push_bits(HEIGHT - 1, 16);
+    w.push_bits(width - 1, 16);
+    w.push_bits(height - 1, 16);
     w.push_flag(false); // render_size same as frame size
     w.push_flag(false); // refresh_frame_context
     w.push_flag(true); // frame_parallel_decoding_mode
@@ -195,13 +198,17 @@ pub fn build_keyframe_header(
     w.push_flag(false); // delta_q_uv_dc coded?
     w.push_flag(false); // delta_q_uv_ac coded?
     segmentation.write(&mut w);
-    w.push_bits(0, 1); // tile_rows_log2 (Sb64Cols=1 for a 16x16 frame -> tile_cols loop never runs)
+    w.push_bits(0, 1); // tile_rows_log2 (callers keep width <= 64, so Sb64Cols == 1 and the tile-cols loop never runs)
     w.push_bits(header_size_in_bytes as u32, 16);
     w.finish()
 }
 
+/// `explicit_size`: `None` inherits ref_frame_idx[0]'s slot size (`found_ref = 1`); `Some`
+/// declines all three references (`found_ref = 0`) and codes the frame size explicitly --
+/// for inter frames whose size must differ from their reference (the scaled-ref tests).
 pub fn build_inter_header(
     ref_frame_idx: [u8; 3],
+    explicit_size: Option<(u32, u32)>,
     loop_filter_level: u8,
     segmentation: &SegSpec,
     header_size_in_bytes: u16,
@@ -223,7 +230,17 @@ pub fn build_inter_header(
         // (SINGLE_REFERENCE, zero bits) -- see build_inter_compressed_header.
         w.push_flag(false);
     }
-    w.push_flag(true); // frame_size_with_refs: inherit ref_frame_idx[0]'s slot size
+    match explicit_size {
+        // frame_size_with_refs: inherit ref_frame_idx[0]'s slot size.
+        None => w.push_flag(true),
+        Some((width, height)) => {
+            for _ in 0..3 {
+                w.push_flag(false); // found_ref = 0: do NOT inherit the reference's size
+            }
+            w.push_bits(width - 1, 16);
+            w.push_bits(height - 1, 16);
+        }
+    }
     w.push_flag(false); // render_size same as frame size
     w.push_flag(false); // allow_high_precision_mv
     w.push_flag(false); // interpolation_filter: not switchable
@@ -246,10 +263,11 @@ pub fn build_inter_header(
 
 /// Builds an `intra_only` (spec 6.2) non-key, hidden (`show_frame = 0`) frame's uncompressed
 /// header, used only to plant distinct content in a single DPB slot (`refresh_frame_flags`)
-/// without disturbing the others. Front half mirrors `src/header.rs::parse_uncompressed_header`'s
-/// `intra_only` branch (verified at lines 618-650); the tail from `refresh_frame_context` onward
+/// without disturbing the others. Front half mirrors the `intra_only` branch of
+/// `src/header.rs::parse_uncompressed_header`; the tail from `refresh_frame_context` onward
 /// is byte-for-bit identical to `build_keyframe_header`'s (both key frames and intra_only frames
-/// have `frame_is_intra = true` and share the same post-frame-size parsing code, lines 680-705).
+/// have `frame_is_intra = true` and share the same shared-tail parsing code after the frame
+/// size).
 pub fn build_intra_only_header(
     refresh_frame_flags: u8,
     segmentation: &SegSpec,
@@ -268,7 +286,8 @@ pub fn build_intra_only_header(
     w.push_bits(0x49, 8);
     w.push_bits(0x83, 8);
     w.push_bits(0x42, 8);
-    // profile == 0 -> color_config is not read (defaults used); see header.rs:633-643.
+    // profile == 0 -> color_config is not read (defaults used); see the `intra_only`
+    // branch of `parse_uncompressed_header`.
     w.push_bits(refresh_frame_flags as u32, 8);
     w.push_bits(WIDTH - 1, 16);
     w.push_bits(HEIGHT - 1, 16);
@@ -302,7 +321,7 @@ pub fn build_keyframe_compressed_header() -> Vec<u8> {
     enc.finish()
 }
 
-/// Mirrors `parse_compressed_header_ex`'s read order (`src/compressed_header.rs:533-573`)
+/// Mirrors `parse_compressed_header`'s read order (`src/compressed_header.rs`)
 /// exactly. Every table update is declined (`write_no_update`), so this frame's
 /// `CompressedHeaderProbs` stay at `CompressedHeaderProbs::default()` -- which is also what
 /// `encode_inter_tile_forced` assumes when it needs a probability value at all (partition).

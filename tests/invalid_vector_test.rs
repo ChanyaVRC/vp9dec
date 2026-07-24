@@ -111,7 +111,7 @@ fn official_invalid_vector_gate() {
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.starts_with("invalid-") && n.ends_with(".ivf"))
             })
-            .filter(|p| res_sidecar(p).exists())
+            .filter(|p| common::sidecar_path(p, "res").exists())
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -136,7 +136,7 @@ fn official_invalid_vector_gate() {
     for ivf in &vectors {
         let name = ivf.file_name().unwrap().to_string_lossy().into_owned();
         let bytes = std::fs::read(ivf).unwrap_or_else(|e| panic!("read {name}: {e}"));
-        let res = parse_res(&res_sidecar(ivf));
+        let res = parse_res(&common::sidecar_path(ivf, "res"));
         match gate_one(&bytes, &res) {
             Ok(()) => {
                 pass += 1;
@@ -161,11 +161,4 @@ fn official_invalid_vector_gate() {
         failures.len(),
         failures.join("\n")
     );
-}
-
-/// `<ivf-path>.res` (the sidecar naming `fetch-vectors` writes: the full ivf filename + `.res`).
-fn res_sidecar(ivf_path: &Path) -> PathBuf {
-    let mut name = ivf_path.as_os_str().to_owned();
-    name.push(".res");
-    PathBuf::from(name)
 }

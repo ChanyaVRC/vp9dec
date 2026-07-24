@@ -41,10 +41,30 @@ pub fn read_vector(relative_path: &str) -> Option<Vec<u8>> {
     Some(std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display())))
 }
 
+/// One lowercased MD5 hex digest per non-blank line of an `.ivf.md5` file's text (each
+/// line's first whitespace-separated column; a filename column, if present, is discarded),
+/// in the file's order -- one line per displayed output frame.
+pub fn parse_md5_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Appends `.<ext>` to a path's full file name -- the sidecar naming `fetch-vectors` uses
+/// (`foo.ivf` -> `foo.ivf.md5`/`foo.ivf.res`). Not [`Path::with_extension`], which replaces
+/// after the last dot -- appending is correct regardless of how many dots are in the
+/// vector's own name (e.g. `...b6-.v2.ivf`).
+pub fn sidecar_path(path: &Path, ext: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".");
+    name.push(ext);
+    PathBuf::from(name)
+}
+
 /// Reads `tests/vectors/<ivf_name>` together with its accompanying `<ivf_name>.md5`. Returns
-/// `None` (after an `eprintln!`) if either file is missing. The returned `Vec<String>` is one
-/// lowercased MD5 hex digest per line of `.ivf.md5` (its filename column, if present, is
-/// discarded), in the file's order -- one line per displayed output frame.
+/// `None` (after an `eprintln!`) if either file is missing. The returned `Vec<String>` is
+/// [`parse_md5_lines`] of the `.ivf.md5` file.
 pub fn read_vector_with_md5(ivf_name: &str) -> Option<(Vec<u8>, Vec<String>)> {
     let ivf_path = vectors_dir().join(ivf_name);
     let md5_path = vectors_dir().join(format!("{ivf_name}.md5"));
@@ -63,17 +83,8 @@ pub fn read_vector_with_md5(ivf_name: &str) -> Option<(Vec<u8>, Vec<String>)> {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", ivf_path.display()));
     let md5_text = std::fs::read_to_string(&md5_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", md5_path.display()));
-    let expected_lines = md5_text
-        .lines()
-        .map(|line| {
-            line.split_whitespace()
-                .next()
-                .unwrap_or_else(|| panic!("{}: contains a blank line", md5_path.display()))
-                .to_ascii_lowercase()
-        })
-        .collect();
 
-    Some((ivf_bytes, expected_lines))
+    Some((ivf_bytes, parse_md5_lines(&md5_text)))
 }
 
 /// Parses `bytes` as an IVF file and returns its container header plus the first frame's raw

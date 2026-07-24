@@ -76,6 +76,8 @@ fn decode_single(decoder: &mut Decoder, chunk: &[u8], what: &str) -> DecodedFram
 fn build_skip_ref_frames() -> Vec<Vec<u8>> {
     let keyframe_compressed = build_keyframe_compressed_header();
     let keyframe_header = build_keyframe_header(
+        WIDTH,
+        HEIGHT,
         0,
         false,
         &SegSpec::disabled(),
@@ -98,7 +100,7 @@ fn build_skip_ref_frames() -> Vec<Vec<u8>> {
     seg.feature_data[0][SEG_LVL_REF_FRAME] = LAST_FRAME as i32;
 
     let inter_compressed = build_inter_compressed_header();
-    let inter_header = build_inter_header([0, 0, 0], 0, &seg, header_size(&inter_compressed));
+    let inter_header = build_inter_header([0, 0, 0], None, 0, &seg, header_size(&inter_compressed));
     let inter_tile = encode_inter_tile_forced([0, 0, 0, 0], seg.tree_probs);
     let inter_bytes = assemble_frame(inter_header, inter_compressed, inter_tile);
 
@@ -182,6 +184,8 @@ fn seg_lvl_ref_frame_selects_the_forced_reference_without_reading_bits() {
 fn build_steering_frames() -> Vec<Vec<u8>> {
     let keyframe_compressed = build_keyframe_compressed_header();
     let keyframe_header = build_keyframe_header(
+        WIDTH,
+        HEIGHT,
         0,
         false,
         &SegSpec::disabled(),
@@ -225,7 +229,7 @@ fn build_steering_frames() -> Vec<Vec<u8>> {
 
     let inter_compressed = build_inter_compressed_header();
     // LAST->slot0 (A), GOLDEN->slot1 (B), ALTREF->slot2 (unused, still A from the key frame).
-    let inter_header = build_inter_header([0, 1, 2], 0, &seg, header_size(&inter_compressed));
+    let inter_header = build_inter_header([0, 1, 2], None, 0, &seg, header_size(&inter_compressed));
     let inter_tile = encode_inter_tile_forced([0, 0, 0, 0], seg.tree_probs);
     let inter_bytes = assemble_frame(inter_header, inter_compressed, inter_tile);
 
@@ -280,7 +284,7 @@ fn seg_lvl_ref_frame_steers_to_the_specific_slot_not_just_last() {
     seg.feature_enabled[0][SEG_LVL_REF_FRAME] = true;
     seg.feature_data[0][SEG_LVL_REF_FRAME] = LAST_FRAME as i32;
     let compressed = build_inter_compressed_header();
-    let header = build_inter_header([0, 1, 2], 0, &seg, header_size(&compressed));
+    let header = build_inter_header([0, 1, 2], None, 0, &seg, header_size(&compressed));
     let tile = encode_inter_tile_forced([0, 0, 0, 0], seg.tree_probs);
     let last_steered = decode_single(
         &mut decoder,
@@ -319,6 +323,8 @@ fn seg_lvl_ref_frame_steers_to_the_specific_slot_not_just_last() {
 fn build_altref_steering_frames() -> Vec<Vec<u8>> {
     let keyframe_compressed = build_keyframe_compressed_header();
     let keyframe_header = build_keyframe_header(
+        WIDTH,
+        HEIGHT,
         0,
         false,
         &SegSpec::disabled(),
@@ -361,7 +367,7 @@ fn build_altref_steering_frames() -> Vec<Vec<u8>> {
 
     let inter_compressed = build_inter_compressed_header();
     // LAST->slot0 (A), GOLDEN->slot1 (A), ALTREF->slot2 (B); refresh_frame_flags = 0.
-    let inter_header = build_inter_header([0, 1, 2], 0, &seg, header_size(&inter_compressed));
+    let inter_header = build_inter_header([0, 1, 2], None, 0, &seg, header_size(&inter_compressed));
     let inter_tile = encode_inter_tile_forced([0, 0, 0, 0], seg.tree_probs);
     let inter_bytes = assemble_frame(inter_header, inter_compressed, inter_tile);
 
@@ -410,7 +416,7 @@ fn seg_lvl_ref_frame_steers_to_the_altref_slot() {
         seg.feature_enabled[0][SEG_LVL_REF_FRAME] = true;
         seg.feature_data[0][SEG_LVL_REF_FRAME] = steer as i32;
         let compressed = build_inter_compressed_header();
-        let header = build_inter_header([0, 1, 2], 0, &seg, header_size(&compressed));
+        let header = build_inter_header([0, 1, 2], None, 0, &seg, header_size(&compressed));
         let tile = encode_inter_tile_forced([0, 0, 0, 0], seg.tree_probs);
         let steered = decode_single(
             &mut decoder,
@@ -456,7 +462,7 @@ fn build_alt_l_frames(alt_l_level: i32) -> Vec<Vec<u8>> {
     // Base level 30 (nonzero, as the task asks) only ever applies to segment 0's own edges
     // (none of which this test examines): segment 1's `abs_or_delta_update = true` override
     // replaces the base level outright wherever segment 1 is looked up.
-    let header = build_keyframe_header(30, false, &seg, header_size(&compressed));
+    let header = build_keyframe_header(WIDTH, HEIGHT, 30, false, &seg, header_size(&compressed));
     let tile = encode_keyframe_tile(
         [
             kb(Some(0), V_PRED),
@@ -575,7 +581,14 @@ fn seg_lvl_alt_l_loop_filter_level_change_is_observable() {
 /// (`setup_past_independence`), so `loop_filter_ref_deltas[INTRA_FRAME] == 1` here.
 fn build_delta_enabled_zero_level_frame() -> Vec<u8> {
     let compressed = build_keyframe_compressed_header();
-    let header = build_keyframe_header(0, true, &SegSpec::disabled(), header_size(&compressed));
+    let header = build_keyframe_header(
+        WIDTH,
+        HEIGHT,
+        0,
+        true,
+        &SegSpec::disabled(),
+        header_size(&compressed),
+    );
     let tile = encode_keyframe_tile(
         [
             kb(None, V_PRED),

@@ -37,8 +37,9 @@ pub enum Stage {
     InverseTransform,
 }
 
-/// Number of [`Stage`] variants (= array size for [`snapshot`]).
-pub const STAGE_COUNT: usize = 10;
+/// Number of [`Stage`] variants (= array size for [`snapshot`]), derived from the last
+/// variant so it can't drift from the enum.
+pub const STAGE_COUNT: usize = Stage::InverseTransform as usize + 1;
 
 #[cfg(feature = "bench-timing")]
 mod imp {

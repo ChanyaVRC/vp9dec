@@ -137,8 +137,7 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   Still scalar (perf gap only): the WHT (lossless 4x4) inverse transform, 10/12-bit ADST, and
   the unscaled inter path's near-reference-edge blocks (the `in_bounds` scalar fallback; the
   scaled kernel's gather-through-clamped-scratch approach could close it if ever profiled as
-  hot). Inter-pred (unscaled + scaled), the loop filter, and the DCT_DCT transform are SIMD at
-  all bit depths; the ADST-containing transforms at 8-bit.
+  hot). See implementation-notes.md for current SIMD coverage.
 - Tile-parallel multithreading (a different lever than SIMD, same realtime goal): DONE
   2026-07-23 (`tile::decode_tiles_parallel` / `spawn_column_worker` / `merge_column_worker` +
   `Counts::add_assign`). A frame with >1 tile column and 1 tile row decodes each column on its own
@@ -181,7 +180,17 @@ Remaining (moved to P1's SIMD scope, not blocking): a u16 SIMD path for 10/12-bi
 
 ## P3 — small recorded items
 
-- **fetch script exit-code bug**: DONE 2026-07-22. `fetch-vectors.sh` captured `rc=$?` after
+- **Structural refactor pass (audit follow-up)**: DONE 2026-07-24. Pure structural moves on the
+  decode path, no output change (full acceptance gate re-verified, both SIMD configs): tile-
+  parallel machinery extracted to `src/tile/parallel.rs` (R1); the duplicated 4-byte tile-size
+  parse and corrupt-tile check unified into `split_tiles`/`check_tile_read_bounds` (R2, the one
+  approved behavior-adjacent change -- on some malformed multi-tile streams the error VARIANT
+  may differ, still `Err` from the same packet; invalid gate stays 21/21); `residual()`'s
+  per-plane inter-predict block and `tokens_and_reconstruct`'s dequant/transform tail split out
+  at spec-process seams (R3); `src/simd.rs` (2,595 lines) split into a hub +
+  `simd/{inter, loop_filter, transform, tests}.rs` (S1/S2); the twin loop-filter AVX2 edge
+  dispatchers merged into one pass-parameterized `superblock_loop_filter_edge_avx2` (S3);
+  `refresh_probs` and the PrevSegmentIds refresh extracted from `decode_one_frame` (A5). `fetch-vectors.sh` captured `rc=$?` after
   the `fi`, reading the if-statement's status (always 0 when curl failed) instead of curl's, so
   the FAIL line always printed "curl exit 0"; moved the failure handling into an `else` branch
   where `$?` still holds curl's real status. (The PowerShell script reports via the exception

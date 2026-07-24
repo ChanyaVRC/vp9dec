@@ -23,7 +23,14 @@ use vp9dec::Decoder;
 /// (`kb`'s) intra mode. Segmentation and loop filtering are both off.
 fn build_keyframe_frame(y_modes: [u8; 4]) -> Vec<u8> {
     let compressed = build_keyframe_compressed_header();
-    let header = build_keyframe_header(0, false, &SegSpec::disabled(), header_size(&compressed));
+    let header = build_keyframe_header(
+        WIDTH,
+        HEIGHT,
+        0,
+        false,
+        &SegSpec::disabled(),
+        header_size(&compressed),
+    );
     let tile = encode_keyframe_tile(
         [
             kb(None, y_modes[0]),

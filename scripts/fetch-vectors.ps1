@@ -51,6 +51,26 @@ function Get-Vector {
     }
 }
 
+# Remuxes tests/vectors/$Src (a .webm) to tests/vectors/$Dst (an .ivf) via the pre-built
+# webm_to_ivf example, recording the outcome in $RemuxOk/$RemuxFail.
+function Invoke-Remux {
+    param([string]$Src, [string]$Dst)
+    Write-Host "[remux] $Src -> $Dst"
+    Push-Location $RepoRoot
+    try {
+        $remuxErr = cargo run --quiet --example webm_to_ivf -- "tests/vectors/$Src" "tests/vectors/$Dst" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "[FAIL] remux failed: $Src"
+            $remuxErr | ForEach-Object { Write-Warning $_ }
+            $RemuxFail.Add("$Src`: $($remuxErr | Select-Object -Last 1)")
+        } else {
+            $RemuxOk.Add($Src)
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
 # Pre-build once so the ~300 subsequent `cargo run --example webm_to_ivf` invocations below
 # each skip straight to executing the (already up to date) binary.
 cargo build --quiet --example webm_to_ivf
@@ -80,20 +100,7 @@ Get-Content (Join-Path $ScriptDir "vectors.txt") | ForEach-Object {
             } elseif (-not $webmOk -and -not (Test-Path $webmPath)) {
                 Write-Host "[skip] $name.webm not available, cannot remux"
             } else {
-                Write-Host "[remux] $name.webm -> $name.ivf"
-                Push-Location $RepoRoot
-                try {
-                    $remuxErr = cargo run --quiet --example webm_to_ivf -- "tests/vectors/$name.webm" "tests/vectors/$name.ivf" 2>&1
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Warning "[FAIL] remux failed: $name"
-                        $remuxErr | ForEach-Object { Write-Warning $_ }
-                        $RemuxFail.Add("$name`: $($remuxErr | Select-Object -Last 1)")
-                    } else {
-                        $RemuxOk.Add($name)
-                    }
-                } finally {
-                    Pop-Location
-                }
+                Invoke-Remux "$name.webm" "$name.ivf"
             }
 
             $ivfMd5Path = Join-Path $VectorsDir "$name.ivf.md5"
@@ -119,20 +126,7 @@ Get-Content (Join-Path $ScriptDir "vectors.txt") | ForEach-Object {
                 } elseif (-not $ok -and -not (Test-Path $webmPath)) {
                     Write-Host "[skip] $name not available, cannot remux"
                 } else {
-                    Write-Host "[remux] $name -> $name.ivf"
-                    Push-Location $RepoRoot
-                    try {
-                        $remuxErr = cargo run --quiet --example webm_to_ivf -- "tests/vectors/$name" "tests/vectors/$name.ivf" 2>&1
-                        if ($LASTEXITCODE -ne 0) {
-                            Write-Warning "[FAIL] remux failed: $name"
-                            $remuxErr | ForEach-Object { Write-Warning $_ }
-                            $RemuxFail.Add("$name`: $($remuxErr | Select-Object -Last 1)")
-                        } else {
-                            $RemuxOk.Add($name)
-                        }
-                    } finally {
-                        Pop-Location
-                    }
+                    Invoke-Remux $name "$name.ivf"
                 }
 
                 $ivfResPath = Join-Path $VectorsDir "$name.ivf.res"

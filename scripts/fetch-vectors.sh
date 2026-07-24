@@ -48,6 +48,24 @@ fetch() {
     fi
 }
 
+# Remuxes tests/vectors/$1 (a .webm) to tests/vectors/$2 (an .ivf) via the pre-built
+# webm_to_ivf example, recording the outcome in remux_ok/remux_fail.
+remux_one() {
+    local src="$1" dst="$2"
+    echo "[remux] $src -> $dst"
+    local remux_err
+    remux_err="$(mktemp)"
+    if (cd "$repo_root" && cargo run --quiet --example webm_to_ivf -- \
+        "tests/vectors/$src" "tests/vectors/$dst") 2>"$remux_err"; then
+        remux_ok+=("$src")
+    else
+        echo "[FAIL] remux failed: $src" >&2
+        cat "$remux_err" >&2
+        remux_fail+=("$src: $(tail -n 1 "$remux_err")")
+    fi
+    rm -f "$remux_err"
+}
+
 # Pre-build once so the ~300 subsequent `cargo run --example webm_to_ivf` invocations below
 # each skip straight to executing the (already up to date) binary.
 cargo build --quiet --example webm_to_ivf
@@ -72,17 +90,7 @@ while read -r name kind; do
             elif [ "$webm_ready" -eq 0 ] && [ ! -f "$vectors_dir/$name.webm" ]; then
                 echo "[skip] $name.webm not available, cannot remux"
             else
-                echo "[remux] $name.webm -> $name.ivf"
-                remux_err="$(mktemp)"
-                if (cd "$repo_root" && cargo run --quiet --example webm_to_ivf -- \
-                    "tests/vectors/$name.webm" "tests/vectors/$name.ivf") 2>"$remux_err"; then
-                    remux_ok+=("$name")
-                else
-                    echo "[FAIL] remux failed: $name" >&2
-                    cat "$remux_err" >&2
-                    remux_fail+=("$name: $(tail -n 1 "$remux_err")")
-                fi
-                rm -f "$remux_err"
+                remux_one "$name.webm" "$name.ivf"
             fi
 
             if [ -f "$vectors_dir/$name.ivf.md5" ]; then
@@ -105,17 +113,7 @@ while read -r name kind; do
                     elif [ ! -f "$vectors_dir/$name" ]; then
                         echo "[skip] $name not available, cannot remux"
                     else
-                        echo "[remux] $name -> $name.ivf"
-                        remux_err="$(mktemp)"
-                        if (cd "$repo_root" && cargo run --quiet --example webm_to_ivf -- \
-                            "tests/vectors/$name" "tests/vectors/$name.ivf") 2>"$remux_err"; then
-                            remux_ok+=("$name")
-                        else
-                            echo "[FAIL] remux failed: $name" >&2
-                            cat "$remux_err" >&2
-                            remux_fail+=("$name: $(tail -n 1 "$remux_err")")
-                        fi
-                        rm -f "$remux_err"
+                        remux_one "$name" "$name.ivf"
                     fi
 
                     if [ -f "$vectors_dir/$name.ivf.res" ]; then
