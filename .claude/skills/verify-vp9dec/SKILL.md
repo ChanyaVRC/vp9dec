@@ -46,8 +46,9 @@ kernel, or module move must not alter a single output byte of any 8-bit decode.
 ## 3. Independent ffmpeg cross-decode
 
 - `cargo test --test synthetic_seg_test synthetic_streams_cross_decode_against_ffmpeg -- --nocapture`
-  → **8** `[xdecode] ... OK` lines (4 synthetic scenarios × the `libvpx-vp9` and native `vp9`
-  decoders).
+  → one `[xdecode] ... OK` line per synthetic scenario × decoder (`libvpx-vp9` and native
+  `vp9` — so 2 lines per scenario, every one `OK`). Don't assert a fixed total (the scenario
+  count grows); every emitted line must be `OK` and there must be at least one.
 - Needs `ffmpeg` on `PATH`, or an explicit `VP9DEC_FFMPEG=<path-to-ffmpeg>`; it skips cleanly
   if neither is present. **0 lines means it didn't run**, not that it passed.
 
@@ -71,5 +72,5 @@ disagree, the sweep wins.
 
 Send back / fix if any gate is unmet or a report disagrees with a re-run — in particular:
 the 8-bit sweep is not 315/315 in **both** SIMD configurations; a new-profile vector
-mismatches; the ffmpeg cross-decode isn't 8/8; or a "pass" was really a silent `[skip]` that
-never ran.
+mismatches; any ffmpeg cross-decode line is missing or not `OK`; or a "pass" was really a
+silent `[skip]` that never ran.

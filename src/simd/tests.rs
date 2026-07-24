@@ -1,5 +1,6 @@
 use super::transform::{
-    b_op_simd, b_op_simd_hbd, iadst_simd, idct_permute_simd, idct_simd, sb_op_simd, sh_op_simd,
+    b_op_simd, b_op_simd_hbd, iadst_i64, iadst_simd, idct_i64, idct_permute_simd, idct_simd,
+    sb_op_simd, sh_op_simd,
 };
 use super::*;
 use crate::predict::MAX_INTERMEDIATE_HEIGHT;
@@ -659,6 +660,251 @@ fn b_op_matches_scalar_at_spec_bounds() {
                                  t[{k}] lane {lane}"
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The i64-lane 1D inverse ADST (`iadst_i64`, 4 rows per vector) must exactly reproduce the
+/// scalar `transform::iadst4/8/16` on each lane, for every size n = 2..=4, at the FULL spec
+/// §8.7.1.1 input bound for BOTH high bit depths (±2^(7+BitDepth): ±2^17 at 10-bit, ±2^19 at
+/// 12-bit). Unlike the 8-bit i32-lane kernels, full-range testing of ALL sizes is sound here:
+/// the kernel is the scalar's i64 arithmetic op for op (exact-mod-2^64 multiply, emulated
+/// arithmetic-shift round2), so it matches wherever the scalar i64 does not overflow -- and
+/// even adversarial full-range inputs compound to < ~2^46 (see the i64 section comment in
+/// `simd/transform.rs`). Signed-bound corner vectors are planted deterministically alongside
+/// the random draws (the random draw alone almost never lands on the corners). Self-check
+/// that these magnitudes discriminate: the same inputs through the 8-bit i32-LANE network
+/// (`iadst_simd`) must diverge from the scalar in EVERY (bit depth, size) cell (the `S`
+/// array needs `24 + BitDepth` bits -- beyond i32 lane storage), the `mullo_diverged`
+/// precedent from the HBD DCT test.
+#[test]
+fn iadst_i64_1d_matches_scalar_at_full_range() {
+    if !avx2_enabled() {
+        return;
+    }
+    let mut seed = 0x1D64_AD57u32;
+    for &bit_depth in &[10u32, 12] {
+        let mask = (1u32 << (bit_depth + 8)) - 1;
+        let half = 1i64 << (bit_depth + 7);
+        for n in 2..=4u32 {
+            let n0 = 1usize << n;
+            // Per-(bit_depth, n) so every cell individually proves the i64 lanes are needed.
+            let mut i32_lanes_diverged = false;
+            // Trials 0/1 plant the signed-bound corners (all -half; alternating -half and
+            // half-1); the random draw reaches -half with probability 2^-(bit_depth+8) per
+            // element, so corners are otherwise effectively untested.
+            for trial in 0..202 {
+                let mut rows = [[0i64; 16]; 4];
+                for row in rows.iter_mut() {
+                    for (i, v) in row[..n0].iter_mut().enumerate() {
+                        *v = match trial {
+                            0 => -half,
+                            1 => {
+                                if i % 2 == 0 {
+                                    -half
+                                } else {
+                                    half - 1
+                                }
+                            }
+                            _ => (xorshift32(&mut seed) & mask) as i64 - half,
+                        };
+                    }
+                }
+                let mut scalar = rows;
+                for row in scalar.iter_mut() {
+                    match n {
+                        2 => crate::transform::iadst4((&mut row[..4]).try_into().unwrap()),
+                        3 => crate::transform::iadst8((&mut row[..8]).try_into().unwrap()),
+                        _ => crate::transform::iadst16((&mut row[..16]).try_into().unwrap()),
+                    }
+                }
+                let mut t = [unsafe { _mm256_setzero_si256() }; 16];
+                let mut t32 = [unsafe { _mm256_setzero_si256() }; 16];
+                for (k, (tk, tk32)) in t[..n0].iter_mut().zip(t32[..n0].iter_mut()).enumerate() {
+                    let lanes: [i64; 4] = std::array::from_fn(|r| rows[r][k]);
+                    *tk = unsafe { _mm256_loadu_si256(lanes.as_ptr() as *const __m256i) };
+                    let lanes32: [i32; 8] =
+                        std::array::from_fn(|r| if r < 4 { rows[r][k] as i32 } else { 0 });
+                    *tk32 = unsafe { _mm256_loadu_si256(lanes32.as_ptr() as *const __m256i) };
+                }
+                unsafe {
+                    iadst_i64(&mut t, n);
+                    iadst_simd(&mut t32, n);
+                }
+                for (k, (&tk, &tk32)) in t[..n0].iter().zip(t32[..n0].iter()).enumerate() {
+                    let mut lanes = [0i64; 4];
+                    let mut lanes32 = [0i32; 8];
+                    unsafe {
+                        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, tk);
+                        _mm256_storeu_si256(lanes32.as_mut_ptr() as *mut __m256i, tk32);
+                    }
+                    for (r, &lane) in lanes.iter().enumerate() {
+                        assert_eq!(
+                            lane, scalar[r][k],
+                            "bd={bit_depth} n={n}: row {r}, elem {k}"
+                        );
+                        i32_lanes_diverged |= lanes32[r] as i64 != scalar[r][k];
+                    }
+                }
+            }
+            assert!(
+                i32_lanes_diverged,
+                "bd={bit_depth} n={n}: test inputs never overflowed the i32-lane ADST \
+                 network -- magnitudes too small to prove the i64 lanes are needed"
+            );
+        }
+    }
+}
+
+/// The i64-lane 1D inverse DCT (`idct_i64` -- the mixed types' DCT axis) must exactly
+/// reproduce the scalar `transform::idct_permute` + `transform::idct` on each lane, at the
+/// full ±2^(7+BitDepth) input bound for 10-bit AND 12-bit. Covers n = 2..=5 (the network
+/// mirrors `idct_simd` verbatim, though the i64 driver only dispatches n <= 4). No
+/// i32-divergence self-check here: the i32-LANE HBD DCT is exact at these magnitudes by
+/// design (that is the established `b_op_simd_hbd` kernel); the i64 DCT exists for the
+/// driver's uniform lane layout, not because i32 lanes fail on the DCT axis.
+#[test]
+fn idct_i64_1d_matches_scalar_at_full_range() {
+    if !avx2_enabled() {
+        return;
+    }
+    let mut seed = 0x1D64_DC70u32;
+    for &bit_depth in &[10u32, 12] {
+        let mask = (1u32 << (bit_depth + 8)) - 1;
+        let half = 1i64 << (bit_depth + 7);
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            // Trials 0/1 plant the signed-bound corners, as in the ADST 1D test above.
+            for trial in 0..202 {
+                let mut rows = [[0i64; 32]; 4];
+                for row in rows.iter_mut() {
+                    for (i, v) in row[..n0].iter_mut().enumerate() {
+                        *v = match trial {
+                            0 => -half,
+                            1 => {
+                                if i % 2 == 0 {
+                                    -half
+                                } else {
+                                    half - 1
+                                }
+                            }
+                            _ => (xorshift32(&mut seed) & mask) as i64 - half,
+                        };
+                    }
+                }
+                let mut scalar = rows;
+                for row in scalar.iter_mut() {
+                    crate::transform::idct_permute(&mut row[..n0], n);
+                    crate::transform::idct(&mut row[..n0], n);
+                }
+                let mut t = [unsafe { _mm256_setzero_si256() }; 32];
+                for (k, tk) in t[..n0].iter_mut().enumerate() {
+                    let lanes: [i64; 4] = std::array::from_fn(|r| rows[r][k]);
+                    *tk = unsafe { _mm256_loadu_si256(lanes.as_ptr() as *const __m256i) };
+                }
+                unsafe {
+                    idct_permute_simd(&mut t, n);
+                    idct_i64(&mut t, n);
+                }
+                for (k, &tk) in t[..n0].iter().enumerate() {
+                    let mut lanes = [0i64; 4];
+                    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, tk) };
+                    for (r, &lane) in lanes.iter().enumerate() {
+                        assert_eq!(
+                            lane, scalar[r][k],
+                            "bd={bit_depth} n={n}: row {r}, elem {k}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The fused HBD `inverse_transform_adst_reconstruct_hbd_avx2` (i64-lane 2D transform +
+/// residual add + `(1 << bit_depth) - 1` clip) must exactly reproduce the scalar
+/// `inverse_transform_block` + `clamp(pred + residual, 0, max_val)` reconstruction, for every
+/// ADST-containing tx type x every ADST size (4/8/16) x 10-bit AND 12-bit, with dequant
+/// inputs at the FULL spec §8.7.1.1 stored-value bound ±2^(7+BitDepth) (the scalar i64 path
+/// is the oracle; the i64 lanes make full-range 2D testing sound -- see the i64 section
+/// comment -- including the final i32 narrowing, whose inputs stay far inside i32 even at
+/// these magnitudes) and predictions across the full sample range. Two placements per the
+/// repo convention: (0, 0) in a tight stride-n0 plane, and a nonzero origin inside a wider
+/// plane (the offset/stride seam of `reconstruct_add_clip` -- what the tile-parallel column
+/// strips feed it). Whole-plane equality also proves no out-of-block writes.
+#[test]
+fn inverse_transform_adst_reconstruct_hbd_simd_matches_scalar() {
+    if !avx2_enabled() {
+        return;
+    }
+    let mut seed = 0xAD57_2BD1u32;
+    for &bit_depth in &[10u8, 12] {
+        let max_val = (1i64 << bit_depth) - 1;
+        let mask = (1u32 << (bit_depth as u32 + 8)) - 1;
+        let half = 1i64 << (bit_depth as u32 + 7);
+        for &tx_type in &[
+            crate::transform::TxType::AdstDct,
+            crate::transform::TxType::DctAdst,
+            crate::transform::TxType::AdstAdst,
+        ] {
+            for n in 2..=4u32 {
+                let n0 = 1usize << n;
+                let count = n0 * n0;
+                // Trials 0/1 plant the signed-bound corners, as in the 1D tests above.
+                for trial in 0..102 {
+                    let mut dq = vec![0i64; count];
+                    for (i, v) in dq.iter_mut().enumerate() {
+                        *v = match trial {
+                            0 => -half,
+                            1 => {
+                                if i % 2 == 0 {
+                                    -half
+                                } else {
+                                    half - 1
+                                }
+                            }
+                            _ => (xorshift32(&mut seed) & mask) as i64 - half,
+                        };
+                    }
+                    let mut dq_s = dq.clone();
+                    crate::transform::inverse_transform_block(&mut dq_s, n, tx_type, false);
+                    for &(start_x, start_y, plane_width) in &[(0usize, 0usize, n0), (4, 2, n0 + 8)]
+                    {
+                        let pred: Vec<u16> = (0..plane_width * (start_y + n0))
+                            .map(|_| (xorshift32(&mut seed) & (max_val as u32)) as u16)
+                            .collect();
+                        let mut plane_scalar = pred.clone();
+                        for i in 0..n0 {
+                            for j in 0..n0 {
+                                let idx = (start_y + i) * plane_width + start_x + j;
+                                let old = plane_scalar[idx] as i64;
+                                plane_scalar[idx] =
+                                    (old + dq_s[i * n0 + j]).clamp(0, max_val) as u16;
+                            }
+                        }
+
+                        let mut plane_simd = pred.clone();
+                        unsafe {
+                            inverse_transform_adst_reconstruct_hbd_avx2(
+                                &mut plane_simd,
+                                plane_width,
+                                start_x,
+                                start_y,
+                                &dq,
+                                n,
+                                tx_type,
+                                bit_depth,
+                            );
+                        }
+                        assert_eq!(
+                            plane_scalar, plane_simd,
+                            "bit_depth={bit_depth} tx_type={tx_type:?} n={n} at \
+                             ({start_x},{start_y}) stride {plane_width}: fused HBD ADST SIMD \
+                             != scalar"
+                        );
                     }
                 }
             }

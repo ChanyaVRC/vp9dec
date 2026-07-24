@@ -106,6 +106,35 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   session): 854x356 inter movie 51.52 -> 51.83 MP/s (+0.6%, within noise, as the ~0.3% estimate
   predicted); on `vp90-2-16-intra-only` the `InverseTransform` sub-timer went 3.7 ms -> 2.6 ms
   (10.7% -> 7.7% of decode) -- directional only (7-frame clip).
+- 10/12-bit ADST inverse-transform SIMD (ADST_DCT / DCT_ADST / ADST_ADST, sizes 4/8/16):
+  DONE 2026-07-24 (`simd/transform.rs::inverse_transform_adst_reconstruct_hbd_avx2` +
+  `iadst4/8/16_i64` / `idct_i64` / `sb_op_i64` / `sh_op_i64` / `b_op_i64` / `mul_i64` /
+  `round2_i64`; driver `xform_pass_i64`). The last non-lossless transform gap. Design: i64
+  LANES (4 per `__m256i`, 4 rows per pass chunk) -- the spec §8.7.1.1 bound on the ADST's
+  unrounded `S` array is `24 + BitDepth` (up to 36) bits, beyond i32 lane STORAGE, so the HBD
+  DCT's products-only widening could not carry over. Both axes of a mixed block run in i64
+  (the i64 1D DCT is trivially bit-exact -- scalar `idct` IS i64 -- and keeps the driver
+  self-contained, no i32/i64 layout mixing across the transpose). Every op mirrors the scalar
+  i64 arithmetic exactly: multiply-by-constant via an exact-mod-2^64 low/cross-product
+  decomposition (AVX2 has no 64-bit multiply), `round2` via an emulated 64-bit arithmetic
+  shift; the final post-round2 outputs (re-bounded by §8.7.1.1) narrow to i32 into the shared
+  `reconstruct_add_clip` with the `(1<<bit_depth)-1` clip. Dispatch (`tile/residual.rs`) is
+  now simply `!lossless && avx2_enabled()`; WHT/lossless stays scalar and `VP9DEC_NO_SIMD=1`
+  still forces scalar everywhere. Bit-exact (sweep 315/315 both SIMD configs, all eight
+  `vp92/vp93-2-20-*` 10/12-bit vectors PASS in both) + ffmpeg cross-decode 10/10 + robustness
+  fuzz 6/6 seeds 0 panics (10-bit seed exercises the path under corruption) + invalid gate
+  21/21. A temporary probe confirmed the official corpus exercises ALL 18 cells (2 depths x 3
+  tx types x 3 sizes) -- e.g. AdstAdst 16x16 at 12-bit via `vp93-2-20-12bit-yuv440`. Unit
+  tests pin the 1D iadst AND the mixed-axis 1D idct at the FULL ±2^(7+BitDepth) spec input
+  bound for 10-bit and 12-bit (possible only because the lanes are i64 -- the scalar i64 path
+  is the oracle), with a self-check that those magnitudes DIVERGE on the i32-lane network
+  (proving the i64 lanes are load-bearing), and the fused 2D vs scalar for all type/size/depth
+  cells including a nonzero-origin/wider-stride placement. Perf: completeness item, as
+  expected -- the only HBD corpus clips are 160x90x10-frame (~8 ms/decode); whole-clip MP/s is
+  within noise and the `InverseTransform` sub-timer reads 0.6 ms before AND after on the
+  12-bit clip (below the 0.1 ms display resolution -- no measurable delta; the HBD DCT change
+  had already taken the DCT_DCT share). The 8-bit and HBD-DCT kernels are untouched (separate
+  fns; 854x356 8-bit clip re-benched at par).
 - Scaled-reference (SVC / resize) inter-prediction SIMD: DONE 2026-07-24
   (`simd.rs::block_inter_predict_scaled_avx2`; the scalar loops moved to
   `predict::block_inter_predict_scalar`, the always-kept fallback + unit-test oracle). Both FIR
@@ -134,7 +163,7 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   the corpus (the SVC clip is 60 frames), so the numbers are directional.
 - Wave 4 (remaining): intra prediction is the only remaining named hot spot, but profiled at
   ~0.3% on inter content -- not worth SIMD unless targeting intra-heavy / all-intra streams.
-  Still scalar (perf gap only): the WHT (lossless 4x4) inverse transform, 10/12-bit ADST, and
+  Still scalar (perf gap only): the WHT (lossless 4x4) inverse transform and
   the unscaled inter path's near-reference-edge blocks (the `in_bounds` scalar fallback; the
   scaled kernel's gather-through-clamped-scratch approach could close it if ever profiled as
   hot). See implementation-notes.md for current SIMD coverage.

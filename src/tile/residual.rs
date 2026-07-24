@@ -491,20 +491,18 @@ impl TileDecoder {
             dequant[idx] = (t as i64 * ac_quant) / dq_denom;
         }
         dequant[0] = (tokens[0] as i64 * dc_quant) / dq_denom;
-        // The non-lossless transforms run a fused AVX2 transform+reconstruct (SIMD wave 4b and
-        // follow-ups) that writes clipped pixels straight into the plane, skipping both the i64
-        // write-back and the scalar reconstruction loop below: DCT_DCT at every bit depth (the
-        // 10/12-bit variant widens the butterfly products to i64), the ADST-containing types
-        // (ADST_DCT / DCT_ADST / ADST_ADST; sizes 4/8/16 only -- 32x32 is DCT-only) at 8-bit
-        // only (the ADST's unrounded `S` array fits i32 lanes only at 8-bit -- see the
-        // inverse-ADST section in `simd/transform.rs`). WHT (lossless) and 10/12-bit ADST transform into
-        // `dequant` and take the scalar loop. The SIMD paths are bit-exact against it (spec
-        // §8.7.1.1's `8 + BitDepth`-bit conformance bound keeps all stored intermediates inside
-        // i32).
+        // Every non-lossless transform runs a fused AVX2 transform+reconstruct (SIMD wave 4b
+        // and follow-ups) that writes clipped pixels straight into the plane, skipping both the
+        // i64 write-back and the scalar reconstruction loop below: DCT_DCT at every bit depth
+        // (the 10/12-bit variant widens the butterfly products to i64), and the ADST-containing
+        // types (ADST_DCT / DCT_ADST / ADST_ADST; sizes 4/8/16 only -- 32x32 is DCT-only) on
+        // i32 lanes at 8-bit and on i64 lanes at 10/12-bit (the ADST's unrounded `S` array
+        // needs `24 + BitDepth` bits of lane storage -- see the i64 section in
+        // `simd/transform.rs`). Only WHT (lossless) transforms into `dequant` and takes the
+        // scalar loop. The SIMD paths are bit-exact against it for conformant streams (spec
+        // §8.7.1.1's stored-value bounds).
         #[cfg(target_arch = "x86_64")]
-        let fused = !self.lossless
-            && (tx_type == TxType::DctDct || self.bit_depth == 8)
-            && crate::simd::avx2_enabled();
+        let fused = !self.lossless && crate::simd::avx2_enabled();
         #[cfg(not(target_arch = "x86_64"))]
         let fused = false;
 
@@ -532,19 +530,32 @@ impl TileDecoder {
                 let local_x = start_x - self.planes[plane].x0;
                 // SAFETY: avx2_enabled() checked; dequant[..seg_eob] is exactly n0*n0; the block's
                 // rows/cols are in bounds (planes -- whole-frame or column strip -- are allocated
-                // out to superblock boundaries); the ADST entry only runs at bit_depth == 8 (the
-                // `fused` gate above) with n <= 4 (`compute_tx_type` returns DctDct for TX_32X32).
+                // out to superblock boundaries); the ADST entries only run with n <= 4
+                // (`compute_tx_type` returns DctDct for TX_32X32), each at its bit depth.
                 unsafe {
                     if tx_type != TxType::DctDct {
-                        crate::simd::inverse_transform_adst_reconstruct_avx2(
-                            self.planes[plane].as_mut_slice(),
-                            pw,
-                            local_x,
-                            start_y,
-                            &dequant[..seg_eob],
-                            n,
-                            tx_type,
-                        );
+                        if self.bit_depth == 8 {
+                            crate::simd::inverse_transform_adst_reconstruct_avx2(
+                                self.planes[plane].as_mut_slice(),
+                                pw,
+                                local_x,
+                                start_y,
+                                &dequant[..seg_eob],
+                                n,
+                                tx_type,
+                            );
+                        } else {
+                            crate::simd::inverse_transform_adst_reconstruct_hbd_avx2(
+                                self.planes[plane].as_mut_slice(),
+                                pw,
+                                local_x,
+                                start_y,
+                                &dequant[..seg_eob],
+                                n,
+                                tx_type,
+                                self.bit_depth,
+                            );
+                        }
                     } else if self.bit_depth == 8 {
                         crate::simd::inverse_transform_dct_dct_reconstruct_avx2(
                             self.planes[plane].as_mut_slice(),

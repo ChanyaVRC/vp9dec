@@ -18,8 +18,8 @@ use std::arch::x86_64::*;
 // and would wrap, so the HBD network (`HBD = true`) computes them with 32x32 -> 64-bit
 // widening multiplies and rounds in i64 (`b_op_simd_hbd`). DCT_DCT (both axes DCT) is
 // vectorized at every depth; the ADST-containing types (ADST_DCT / DCT_ADST / ADST_ADST, sizes
-// 4/8/16 -- 32x32 is DCT-only) at 8-bit only (see the inverse-ADST section below). WHT
-// (lossless) and 10/12-bit ADST stay scalar.
+// 4/8/16 -- 32x32 is DCT-only) take these i32-lane networks at 8-bit and the i64-lane networks
+// (see the i64 section below) at 10/12-bit. Only WHT (lossless) stays scalar.
 // ===========================================================================================
 
 /// `round2(x, 14)` (`transform.rs::round2`) lane-wise; the b_op products fit i32 (see the module
@@ -257,8 +257,8 @@ pub(super) unsafe fn idct_simd<const HBD: bool>(t: &mut [__m256i], n: u32) {
 //   - the networks' `B`/`H` ops are bounded as in the DCT case (`b_op_simd`'s own claim).
 // At 10/12-bit the spec's bound on the `S` array is `24 + BitDepth` (up to 36) bits -- beyond
 // i32 LANE STORAGE, not merely the products -- so the DCT's products-only i64 widening does not
-// carry over; 10/12-bit ADST stays scalar and the dispatch (`tile/residual.rs`) gates these
-// kernels on bit_depth == 8.
+// carry over; the dispatch (`tile/residual.rs`) gates these kernels on bit_depth == 8 and
+// routes 10/12-bit ADST to the i64-lane networks in the next section.
 // -------------------------------------------------------------------------------------------
 
 /// Vector `SB(a, b, angle, flip)` (`transform.rs::sb_op`, spec §8.7.1.1) on 8 rows: the
@@ -488,6 +488,409 @@ pub(super) unsafe fn iadst_simd(t: &mut [__m256i], n: u32) {
     }
 }
 
+// -------------------------------------------------------------------------------------------
+// SIMD inverse ADST + mixed-axis DCT at 10/12-bit: i64 LANES (4 per `__m256i`). The spec
+// §8.7.1.1 bound on the ADST's unrounded `S` array is signed `24 + BitDepth` bits -- up to 36
+// at 12-bit, beyond i32 LANE STORAGE (not merely the products), so the HBD DCT's
+// i32-lanes-with-widened-products trick cannot carry over; these kernels instead mirror the
+// scalar networks on i64 element vectors, 4 rows per vector. For a mixed block (AdstDct /
+// DctAdst) the DCT axis ALSO runs in i64 (`idct_i64`) so the whole 2D driver is
+// self-contained -- no i32/i64 intermediate-layout mixing across the transpose -- and the DCT
+// axis is trivially bit-exact (the scalar `idct` is i64 arithmetic verbatim).
+//
+// Exactness argument: every op below is the scalar's i64 arithmetic, element for element --
+//   - `mul_i64` computes each lane * constant exactly mod 2^64 (AVX2 has no 64-bit multiply;
+//     the low/cross-product decomposition below is exact mod 2^64, hence exact whenever the
+//     true product fits i64);
+//   - `round2_i64` is `(x + 2^(n-1)) >> n` with a sign-propagating emulated 64-bit ARITHMETIC
+//     shift (AVX2 has only logical 64-bit shifts) -- exact for every i64;
+//   - adds/subs are exact mod 2^64, matching two's-complement scalar i64.
+// So the kernels equal the scalar wherever the scalar itself does not overflow i64 -- and it
+// never does: conformant streams bound stored T values to signed `8 + BitDepth` <= 20 bits and
+// unrounded S values to `24 + BitDepth` <= 36 bits, so products |T * cos64| < 2^19 * 2^14 =
+// 2^33 and every sum < 2^37; even the unit tests' adversarial full-range inputs (+/-2^19 at
+// every array position, unreachable from a conformant stream) compound to < ~2^46 (per-stage
+// L-inf gain <= ~2.83 for SB+SH / B, x2 for H). WHT (lossless) stays scalar; TX_32X32 is
+// DCT-only (spec §8.7.2) and takes the HBD DCT kernel above, so this path only sees n <= 4.
+// -------------------------------------------------------------------------------------------
+
+/// Exact `lane * c` on 4 i64 lanes (low 64 bits). AVX2 has no 64-bit multiply, so decompose:
+/// `a*c mod 2^64 = a_lo*c_lo + ((a_hi*c_lo + a_lo*c_hi) << 32)`, with `_lo` the unsigned low
+/// dwords and `_hi` the high dwords (signedness is irrelevant mod 2^32). Exact whenever the
+/// true product fits i64 -- always here (see the section comment).
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn mul_i64(a: __m256i, c: i64) -> __m256i {
+    let b = _mm256_set1_epi64x(c);
+    let a_hi = _mm256_srli_epi64(a, 32);
+    let b_hi = _mm256_srli_epi64(b, 32);
+    // Even dwords: a_hi*c_lo resp. a_lo*c_hi (their odd dwords are 0 * something == 0).
+    let cross = _mm256_add_epi32(_mm256_mullo_epi32(a_hi, b), _mm256_mullo_epi32(a, b_hi));
+    _mm256_add_epi64(_mm256_mul_epu32(a, b), _mm256_slli_epi64(cross, 32))
+}
+
+/// `round2(x, n)` (`transform.rs::round2`) on 4 i64 lanes: add `2^(n-1)`, then an emulated
+/// 64-bit ARITHMETIC right shift (logical shift + the sign bits OR-ed back into the vacated
+/// top `n` bits). Exact for every i64 lane value -- no magnitude precondition.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn round2_i64(x: __m256i, n: u32) -> __m256i {
+    let biased = _mm256_add_epi64(x, _mm256_set1_epi64x(1i64 << (n - 1)));
+    let sign = _mm256_cmpgt_epi64(_mm256_setzero_si256(), biased);
+    _mm256_or_si256(
+        _mm256_srl_epi64(biased, _mm_cvtsi32_si128(n as i32)),
+        _mm256_sll_epi64(sign, _mm_cvtsi32_si128(64 - n as i32)),
+    )
+}
+
+/// `B(a, b, angle, flip)` (`transform.rs::b_op`) on 4 i64 lanes.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn b_op_i64(t: &mut [__m256i], a: usize, b: usize, angle: i32, flip: bool) {
+    let cos = crate::transform::cos64(angle);
+    let sin = crate::transform::sin64(angle);
+    let ta = t[a];
+    let tb = t[b];
+    let x = _mm256_sub_epi64(mul_i64(ta, cos), mul_i64(tb, sin));
+    let y = _mm256_add_epi64(mul_i64(ta, sin), mul_i64(tb, cos));
+    let na = round2_i64(x, 14);
+    let nb = round2_i64(y, 14);
+    if flip {
+        t[a] = nb;
+        t[b] = na;
+    } else {
+        t[a] = na;
+        t[b] = nb;
+    }
+}
+
+/// `H(a, b, flip)` (`transform.rs::h_op`) on 4 i64 lanes.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn h_op_i64(t: &mut [__m256i], a: usize, b: usize, flip: bool) {
+    let (a, b) = if flip { (b, a) } else { (a, b) };
+    let x = t[a];
+    let y = t[b];
+    t[a] = _mm256_add_epi64(x, y);
+    t[b] = _mm256_sub_epi64(x, y);
+}
+
+/// `SB(a, b, angle, flip)` (`transform.rs::sb_op`) on 4 i64 lanes: the unrounded rotation into
+/// the high-precision `S` array -- the values whose `24 + BitDepth`-bit bound forces the i64
+/// lanes in the first place.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn sb_op_i64(s: &mut [__m256i], t: &[__m256i], a: usize, b: usize, angle: i32, flip: bool) {
+    let cos = crate::transform::cos64(angle);
+    let sin = crate::transform::sin64(angle);
+    let ta = t[a];
+    let tb = t[b];
+    let sa = _mm256_sub_epi64(mul_i64(ta, cos), mul_i64(tb, sin));
+    let sb = _mm256_add_epi64(mul_i64(ta, sin), mul_i64(tb, cos));
+    if flip {
+        s[a] = sb;
+        s[b] = sa;
+    } else {
+        s[a] = sa;
+        s[b] = sb;
+    }
+}
+
+/// `SH(a, b)` (`transform.rs::sh_op`) on 4 i64 lanes.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn sh_op_i64(t: &mut [__m256i], s: &[__m256i], a: usize, b: usize) {
+    t[a] = round2_i64(_mm256_add_epi64(s[a], s[b]), 14);
+    t[b] = round2_i64(_mm256_sub_epi64(s[a], s[b]), 14);
+}
+
+/// Inverse ADST4 (`transform.rs::iadst4_impl`, spec §8.7.1.6) on 4 i64 lanes -- same statement
+/// and evaluation order as the scalar (`v` is `(T0 - T2) + T3`, `o3` is `(x0 + x1) - x3`).
+#[target_feature(enable = "avx2")]
+unsafe fn iadst4_i64(t: &mut [__m256i]) {
+    use crate::transform::{SINPI_1_9, SINPI_2_9, SINPI_3_9, SINPI_4_9};
+    let s0 = mul_i64(t[0], SINPI_1_9);
+    let s1 = mul_i64(t[0], SINPI_2_9);
+    let s2 = mul_i64(t[1], SINPI_3_9);
+    let s3 = mul_i64(t[2], SINPI_4_9);
+    let s4 = mul_i64(t[2], SINPI_1_9);
+    let s5 = mul_i64(t[3], SINPI_2_9);
+    let s6 = mul_i64(t[3], SINPI_4_9);
+    let v = _mm256_add_epi64(_mm256_sub_epi64(t[0], t[2]), t[3]);
+    let s7 = mul_i64(v, SINPI_3_9);
+    let x0 = _mm256_add_epi64(_mm256_add_epi64(s0, s3), s5);
+    let x1 = _mm256_sub_epi64(_mm256_sub_epi64(s1, s4), s6);
+    let x2 = s7;
+    let x3 = s2;
+    let o0 = _mm256_add_epi64(x0, x3);
+    let o1 = _mm256_add_epi64(x1, x3);
+    let o2 = x2;
+    let o3 = _mm256_sub_epi64(_mm256_add_epi64(x0, x1), x3);
+    t[0] = round2_i64(o0, 14);
+    t[1] = round2_i64(o1, 14);
+    t[2] = round2_i64(o2, 14);
+    t[3] = round2_i64(o3, 14);
+}
+
+/// Inverse ADST8 (`transform.rs::iadst8_impl`, spec §8.7.1.7) on 4 i64 lanes -- a verbatim
+/// mirror of the scalar op sequence (the permutes reorder whole element vectors, so the
+/// existing lane-agnostic `adst_input/output_permute_simd` are shared).
+#[target_feature(enable = "avx2")]
+unsafe fn iadst8_i64(t: &mut [__m256i]) {
+    adst_input_permute_simd(t, 3);
+    let mut s = [_mm256_setzero_si256(); 8];
+
+    for i in 0..4usize {
+        sb_op_i64(&mut s, t, 2 * i, 1 + 2 * i, 30 - 8 * i as i32, true);
+    }
+    for i in 0..4usize {
+        sh_op_i64(t, &s, i, 4 + i);
+    }
+    for i in 0..2usize {
+        sb_op_i64(&mut s, t, 4 + 3 * i, 5 + i, 24 - 16 * i as i32, true);
+    }
+    for i in 0..2usize {
+        sh_op_i64(t, &s, 4 + i, 6 + i);
+    }
+    for i in 0..2usize {
+        h_op_i64(t, i, 2 + i, false);
+    }
+    for i in 0..2usize {
+        b_op_i64(t, 2 + 4 * i, 3 + 4 * i, 16, true);
+    }
+
+    adst_output_permute_simd(t, 3);
+
+    let zero = _mm256_setzero_si256();
+    for i in 0..4usize {
+        t[1 + 2 * i] = _mm256_sub_epi64(zero, t[1 + 2 * i]);
+    }
+}
+
+/// Inverse ADST16 (`transform.rs::iadst16_impl`, spec §8.7.1.8) on 4 i64 lanes -- a verbatim
+/// mirror of the scalar op sequence.
+#[target_feature(enable = "avx2")]
+unsafe fn iadst16_i64(t: &mut [__m256i]) {
+    adst_input_permute_simd(t, 4);
+    let mut s = [_mm256_setzero_si256(); 16];
+
+    for i in 0..8usize {
+        sb_op_i64(&mut s, t, 2 * i, 1 + 2 * i, 31 - 4 * i as i32, true);
+    }
+    for i in 0..8usize {
+        sh_op_i64(t, &s, i, 8 + i);
+    }
+    for i in 0..4usize {
+        sb_op_i64(&mut s, t, 8 + 2 * i, 9 + 2 * i, 28 - 16 * i as i32, true);
+    }
+    for i in 0..4usize {
+        sh_op_i64(t, &s, 8 + i, 12 + i);
+    }
+    for i in 0..4usize {
+        h_op_i64(t, i, 4 + i, false);
+    }
+    for i in 0..2usize {
+        for j in 0..2usize {
+            sb_op_i64(
+                &mut s,
+                t,
+                4 + 8 * i + 3 * j,
+                5 + 8 * i + j,
+                24 - 16 * j as i32,
+                true,
+            );
+        }
+    }
+    for i in 0..2usize {
+        for j in 0..2usize {
+            sh_op_i64(t, &s, 4 + 8 * j + i, 6 + 8 * j + i);
+        }
+    }
+    for i in 0..2usize {
+        for j in 0..2usize {
+            h_op_i64(t, 8 * j + i, 2 + 8 * j + i, false);
+        }
+    }
+    for i in 0..2usize {
+        for j in 0..2usize {
+            let angle = 48 + 64 * (i ^ j) as i32;
+            b_op_i64(t, 2 + 4 * j + 8 * i, 3 + 4 * j + 8 * i, angle, false);
+        }
+    }
+
+    adst_output_permute_simd(t, 4);
+
+    let zero = _mm256_setzero_si256();
+    for i in 0..2usize {
+        for j in 0..2usize {
+            t[1 + 12 * j + 2 * i] = _mm256_sub_epi64(zero, t[1 + 12 * j + 2 * i]);
+        }
+    }
+}
+
+/// `iadst(t, n)` (`transform.rs::iadst`, spec §8.7.1.9) on 4 i64 lanes: ADST4/8/16 by size.
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn iadst_i64(t: &mut [__m256i], n: u32) {
+    match n {
+        2 => iadst4_i64(t),
+        3 => iadst8_i64(t),
+        4 => iadst16_i64(t),
+        _ => unreachable!("iadst_i64 only supports n = 2..=4"),
+    }
+}
+
+/// Inverse-DCT butterfly network (`transform.rs::idct`, spec §8.7.1.3) on 4 i64 lanes -- the
+/// mixed types' DCT axis. A verbatim structural mirror of [`idct_simd`] with the i64 ops
+/// (kept separate so the proven i32-lane DCT kernels' codegen is untouched). Assumes
+/// `idct_permute_simd` ran first (that permute reorders whole element vectors, so it is
+/// lane-agnostic and shared).
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn idct_i64(t: &mut [__m256i], n: u32) {
+    let n0 = 1i64 << n;
+    let n1 = 1i64 << (n - 1);
+    let n2 = 1i64 << (n - 2);
+
+    if n == 2 {
+        b_op_i64(t, 0, 1, 16, true);
+    } else {
+        idct_i64(t, n - 1);
+    }
+
+    for i in 0..n2 {
+        let a = (n1 + i) as usize;
+        let b = (n0 - 1 - i) as usize;
+        let angle = 32 - crate::transform::brev(5, a) as i32;
+        b_op_i64(t, a, b, angle, false);
+    }
+
+    if n >= 3 {
+        let n3 = 1i64 << (n - 3);
+        for i in 0..n3 {
+            for j in 0..2i64 {
+                let a = (n1 + 4 * i + 2 * j) as usize;
+                let b = (n1 + 1 + 4 * i + 2 * j) as usize;
+                h_op_i64(t, a, b, j == 1);
+            }
+        }
+    }
+
+    if n == 5 {
+        for i in 0..2i64 {
+            for j in 0..2i64 {
+                let a = (n0 - n as i64 + 3 - n2 * j - 4 * i) as usize;
+                let b = (n1 + n as i64 - 4 + n2 * j + 4 * i) as usize;
+                let angle = 28 - 16 * i as i32 + 56 * j as i32;
+                b_op_i64(t, a, b, angle, true);
+            }
+        }
+        let n3 = 1i64 << (n - 3);
+        for i in 0..2i64 {
+            for j in 0..4i64 {
+                let a = (n1 + n3 * j + i) as usize;
+                let b = (n1 + n2 - 5 + n3 * j - i) as usize;
+                h_op_i64(t, a, b, (j & 1) == 1);
+            }
+        }
+    }
+
+    if n >= 4 {
+        let imax_a: i64 = if n == 5 { 1 } else { 0 };
+        for i in 0..=imax_a {
+            for j in 0..2i64 {
+                let a = (n0 - n as i64 + 2 - i - n2 * j) as usize;
+                let b = (n1 + n as i64 - 3 + i + n2 * j) as usize;
+                let angle = 24 + 48 * j as i32;
+                b_op_i64(t, a, b, angle, true);
+            }
+        }
+        let imax_b: i64 = 2 * n as i64 - 7;
+        for j in 0..2i64 {
+            for i in 0..=imax_b {
+                let a = (n1 + n2 * j + i) as usize;
+                let b = (n1 + n2 - 1 + n2 * j - i) as usize;
+                h_op_i64(t, a, b, (j & 1) == 1);
+            }
+        }
+    }
+
+    if n >= 3 {
+        let n3 = 1i64 << (n - 3);
+        for i in 0..n3 {
+            let a = (n0 - n3 - 1 - i) as usize;
+            let b = (n1 + n3 + i) as usize;
+            b_op_i64(t, a, b, 16, true);
+        }
+    }
+
+    for i in 0..n1 {
+        let a = i as usize;
+        let b = (n0 - 1 - i) as usize;
+        h_op_i64(t, a, b, false);
+    }
+}
+
+/// Transposes a 4x4 i64 matrix (`r[i]` = row i, 4 i64 lanes) so `out[j]` = column j: an
+/// unpack{lo,hi}_epi64 pass within the 128-bit halves, then a `permute2x128` pass to gather
+/// the halves.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose4x4_i64(r: &[__m256i; 4]) -> [__m256i; 4] {
+    let t0 = _mm256_unpacklo_epi64(r[0], r[1]);
+    let t1 = _mm256_unpackhi_epi64(r[0], r[1]);
+    let t2 = _mm256_unpacklo_epi64(r[2], r[3]);
+    let t3 = _mm256_unpackhi_epi64(r[2], r[3]);
+    [
+        _mm256_permute2x128_si256(t0, t2, 0x20),
+        _mm256_permute2x128_si256(t1, t3, 0x20),
+        _mm256_permute2x128_si256(t0, t2, 0x31),
+        _mm256_permute2x128_si256(t1, t3, 0x31),
+    ]
+}
+
+/// One separable pass of the i64-lane 2D inverse transform (the 10/12-bit ADST-containing
+/// driver): transforms every "row" of `input` (n0 x n0, row-major i64) with the inverse DCT
+/// (`ADST == false`) or inverse ADST (`ADST == true`) and writes the result TRANSPOSED into
+/// `output`, exactly like [`xform_pass`] -- but 4 rows at a time on 4 i64 lanes. `n <= 4`
+/// (ADST exists only for 4x4/8x8/16x16; 32x32 is DCT-only and takes the i32-lane HBD DCT
+/// kernel).
+#[target_feature(enable = "avx2")]
+unsafe fn xform_pass_i64<const ADST: bool>(
+    input: &[i64; 256],
+    output: &mut [i64; 256],
+    n: u32,
+    round_shift: Option<u32>,
+) {
+    debug_assert!((2..=4).contains(&n));
+    let n0 = 1usize << n;
+    let mut cs = 0usize;
+    while cs < n0 {
+        // Build element vectors t[0..n0] (t[k] = coefficient k across rows cs..cs+4) by
+        // transposing the 4-row chunk one 4-column block at a time.
+        let mut t = [_mm256_setzero_si256(); 16];
+        let mut g = 0usize;
+        while g < n0 {
+            let mut rows4 = [_mm256_setzero_si256(); 4];
+            for (r, slot) in rows4.iter_mut().enumerate() {
+                *slot = _mm256_loadu_si256(input.as_ptr().add((cs + r) * n0 + g) as *const __m256i);
+            }
+            let cols = transpose4x4_i64(&rows4);
+            t[g..g + 4].copy_from_slice(&cols);
+            g += 4;
+        }
+        if ADST {
+            iadst_i64(&mut t, n);
+        } else {
+            idct_permute_simd(&mut t, n);
+            idct_i64(&mut t, n);
+        }
+        for (k, tk) in t[..n0].iter().enumerate() {
+            let v = round_shift.map_or(*tk, |sh| round2_i64(*tk, sh));
+            _mm256_storeu_si256(output.as_mut_ptr().add(k * n0 + cs) as *mut __m256i, v);
+        }
+        cs += 4;
+    }
+}
+
 /// Transposes a 4x4 i32 matrix (`r[i]` = row i) so `out[j]` = column j.
 #[inline]
 unsafe fn transpose4x4_i32(r: &[__m128i; 4]) -> [__m128i; 4] {
@@ -700,8 +1103,9 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_avx2(
 /// exactly like [`inverse_transform_dct_dct_reconstruct_avx2`]: the ADST axis runs the vector
 /// `iadst_simd`, the DCT axis (of the mixed types) the proven `idct_simd`, and the residual is
 /// added with the 8-bit clip. ADST exists only for 4x4/8x8/16x16 (`n <= 4`; 32x32 is DCT-only,
-/// spec §8.7.2). 8-bit only -- see the inverse-ADST section comment; the dispatch keeps
-/// 10/12-bit ADST and lossless WHT scalar.
+/// spec §8.7.2). 8-bit only -- see the inverse-ADST section comment; the dispatch routes
+/// 10/12-bit ADST to [`inverse_transform_adst_reconstruct_hbd_avx2`] and keeps lossless WHT
+/// scalar.
 ///
 /// # Safety
 /// Same contract as [`inverse_transform_dct_dct_reconstruct_avx2`], with `2 <= n <= 4`;
@@ -742,6 +1146,69 @@ pub unsafe fn inverse_transform_adst_reconstruct_avx2(
         _ => xform_pass::<false, false>(&buf2, &mut o, n, Some(shift)),
     }
     reconstruct_add_clip(plane_data, plane_width, start_x, start_y, &o, n0, 255);
+}
+
+/// High-bit-depth (10/12-bit) companion to [`inverse_transform_adst_reconstruct_avx2`]: the
+/// same fused inverse transform + reconstruction for the ADST-containing types, but on the
+/// i64-lane network (see the i64 section comment -- at 10/12-bit the ADST's unrounded `S`
+/// array exceeds i32 lane storage) with the clip at `(1 << bit_depth) - 1`. Both axes of a
+/// mixed block run in i64 (`xform_pass_i64`), so the driver is self-contained. The final
+/// column-pass outputs are narrowed to i32 for the shared [`reconstruct_add_clip`]: exact,
+/// because they are post-`round2(min(n+2, 6))` stored values that spec §8.7.1.1 bounds to
+/// signed `8 + BitDepth` <= 20 bits on a conformant stream (and even adversarial full-range
+/// inputs keep them under ~2^28: per-pass L-inf gain <= ~2^6, then >> at least 4). On
+/// NON-conformant streams this narrowing may wrap where the scalar i64 does not -- the same
+/// documented caveat as the i32-lane DCT kernels (SIMD vs scalar may legitimately diverge on
+/// garbage input).
+///
+/// # Safety
+/// Same contract as [`inverse_transform_adst_reconstruct_avx2`] (so `2 <= n <= 4` and
+/// `tx_type != DctDct`); `bit_depth` must be the stream's bit depth (10 or 12).
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2")]
+pub unsafe fn inverse_transform_adst_reconstruct_hbd_avx2(
+    plane_data: &mut [u16],
+    plane_width: usize,
+    start_x: usize,
+    start_y: usize,
+    dequant: &[i64],
+    n: u32,
+    tx_type: TxType,
+    bit_depth: u8,
+) {
+    // Release-mode assert (not debug_assert): a violated `n <= 4` here would compute
+    // out-of-bounds raw-pointer offsets into the [i64; 256] buffers below (UB), unlike
+    // the i32 sibling whose [i32; 1024] buffers would merely panic on slice indexing.
+    // Unreachable from the current dispatch (`compute_tx_type` forces DctDct for
+    // TX_32X32), so this is one predictable branch per block guarding a future
+    // dispatch change.
+    assert!((2..=4).contains(&n));
+    debug_assert!(tx_type != TxType::DctDct);
+    let n0 = 1usize << n;
+    let count = n0 * n0;
+    let mut buf = [0i64; 256];
+    let mut buf2 = [0i64; 256];
+    buf[..count].copy_from_slice(&dequant[..count]);
+    let shift = (n + 2).min(6);
+    // Row pass -> buf2 == R^T (same row/column tx-type split as the scalar 2D driver and the
+    // 8-bit entry above), then column pass -> buf == O (row-major) with the final round2.
+    match tx_type {
+        TxType::DctAdst | TxType::AdstAdst => xform_pass_i64::<true>(&buf, &mut buf2, n, None),
+        _ => xform_pass_i64::<false>(&buf, &mut buf2, n, None),
+    }
+    match tx_type {
+        TxType::AdstDct | TxType::AdstAdst => {
+            xform_pass_i64::<true>(&buf2, &mut buf, n, Some(shift))
+        }
+        _ => xform_pass_i64::<false>(&buf2, &mut buf, n, Some(shift)),
+    }
+    // Narrow to the i32 residual layout the shared reconstruction takes (exact -- see above).
+    let mut o = [0i32; 1024];
+    for (dst, &src) in o[..count].iter_mut().zip(buf[..count].iter()) {
+        *dst = src as i32;
+    }
+    let max_val = (1i32 << bit_depth) - 1;
+    reconstruct_add_clip(plane_data, plane_width, start_x, start_y, &o, n0, max_val);
 }
 
 /// Shared body of the two fused DCT_DCT entries above: 2D transform (`idct_2d_dct::<HBD>`),

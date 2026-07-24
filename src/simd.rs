@@ -10,8 +10,9 @@
 //! - `loop_filter`: the deblocking edge filters (spec §8.8.5, narrow / wide8 / wide16) for
 //!   both edge orientations; `loop_filter.rs` dispatches.
 //! - `transform`: the inverse DCT/ADST transforms fused with reconstruction (spec §8.7);
-//!   `tile/residual.rs` dispatches (DCT_DCT at all bit depths, ADST at 8-bit only -- see
-//!   the landmines in docs/implementation-notes.md).
+//!   `tile/residual.rs` dispatches (DCT_DCT and the ADST-containing types at all bit
+//!   depths; only lossless WHT stays scalar -- see the landmines in
+//!   docs/implementation-notes.md).
 //!
 //! A NEON mirror for aarch64 would be sibling `#[cfg(target_arch = "aarch64")]` modules
 //! behind the same dispatch points -- not implemented.
@@ -28,8 +29,8 @@ pub use inter::{
 };
 pub use loop_filter::{loop_filter_horiz8_avx2, loop_filter_vert8_avx2};
 pub use transform::{
-    inverse_transform_adst_reconstruct_avx2, inverse_transform_dct_dct_reconstruct_avx2,
-    inverse_transform_dct_dct_reconstruct_hbd_avx2,
+    inverse_transform_adst_reconstruct_avx2, inverse_transform_adst_reconstruct_hbd_avx2,
+    inverse_transform_dct_dct_reconstruct_avx2, inverse_transform_dct_dct_reconstruct_hbd_avx2,
 };
 
 use std::sync::OnceLock;

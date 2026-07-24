@@ -39,11 +39,14 @@ overview. A resolved bug needs no entry.
   (all sizes 4/8/16/32 -- the scalar recursive idct mirrored on i32 8-lane vectors, fused with
   the residual-add + `(1<<bit_depth)-1` clip so the result is written straight into the plane,
   skipping the i64 round-trip; 8-bit takes `inverse_transform_dct_dct_reconstruct_avx2`, 10/12-bit
-  the `_hbd_` variant whose butterfly products are widened to i64 -- see the landmine below).
-  The **ADST-containing transforms** (ADST_DCT / DCT_ADST / ADST_ADST, sizes 4/8/16 -- 32x32 is
-  DCT-only) are AVX2 at **8-bit only** (`inverse_transform_adst_reconstruct_avx2`, same fused
-  reconstruction; the ADST's unrounded `S` array fits i32 lanes only at 8-bit -- see the
-  landmine below). WHT (lossless) and 10/12-bit ADST stay scalar.
+  the `_hbd_` variant whose butterfly products are widened to i64 -- see the landmine below);
+  and the **ADST-containing transforms** (ADST_DCT / DCT_ADST / ADST_ADST, sizes 4/8/16 --
+  32x32 is DCT-only): 8-bit on the i32-lane networks (`inverse_transform_adst_reconstruct_avx2`,
+  same fused reconstruction), 10/12-bit on i64-lane networks
+  (`inverse_transform_adst_reconstruct_hbd_avx2`, 4 i64 lanes per vector -- the ADST's unrounded
+  `S` array needs `24 + BitDepth` bits of lane storage, and both axes of a mixed block run in
+  one self-contained i64 driver; see the landmine below). Among the transforms only WHT
+  (lossless) stays scalar.
   Runtime-detected and cached; `VP9DEC_NO_SIMD=1` forces scalar. Output must equal the scalar
   path — the sweep passes 315/315 in both configs.
 - **Tile-parallel decode.** A frame with >1 tile column and exactly 1 tile row decodes each tile
@@ -84,17 +87,22 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   `tests/tile_parallel_test.rs` after touching availability or prediction near tile edges. The
   merge copies only the pixel columns up to `mi_col_end*8`; padding past `mi_cols` is never
   copied, so it stays zero in the merged frame exactly as in a sequential decode.
-- **Three AVX2 kernel families (inter-pred, loop filter, DCT_DCT transform) are all-depth, each
-  by a different mechanism; the fourth (ADST) is 8-bit-only and MUST stay gated.** Inter-pred
-  takes a `max_val` clip bound, the loop filter scales its 8-bit constants by `<< (bit_depth-8)`,
-  and the DCT_DCT transform swaps its butterfly multiply width per depth (next landmine). The
-  ADST kernels (`inverse_transform_adst_reconstruct_avx2` and the `iadst*_simd` / `sb_op_simd` /
-  `sh_op_simd` network) are dispatched only at `bit_depth == 8`: at 10/12-bit the spec's bound
-  on the ADST's unrounded `S` array is `24 + BitDepth` (up to 36) bits -- beyond i32 *lane
-  storage*, not merely the products -- so the DCT's products-only i64 widening does NOT carry
-  over; widening the gate without an i64-lane `S` design would silently corrupt 10/12-bit
-  output. Any *new* SIMD kernel with hardcoded 8-bit constants or i32-tight arithmetic must
-  likewise gate on `bit_depth == 8` until it is made depth-aware.
+- **All four AVX2 kernel families (inter-pred, loop filter, DCT_DCT transform, ADST-containing
+  transforms) are all-depth, each by a different mechanism -- and the ADST's per-depth kernel
+  SPLIT is load-bearing.** Inter-pred takes a `max_val` clip bound, the loop filter scales its
+  8-bit constants by `<< (bit_depth-8)`, the DCT_DCT transform swaps its butterfly multiply
+  width per depth (next landmine), and the ADST-containing transforms swap the whole LANE WIDTH:
+  spec §8.7.1.1 bounds the ADST's unrounded `S` array to signed `24 + BitDepth` (up to 36)
+  bits -- beyond i32 lane *storage* at 10/12-bit, not merely the products -- so the DCT's
+  products-only i64 widening does not carry over there. The i32-lane ADST kernels
+  (`inverse_transform_adst_reconstruct_avx2` / `iadst*_simd` / `sb_op_simd` / `sh_op_simd`)
+  MUST stay dispatched only at `bit_depth == 8`; 10/12-bit routes to the i64-lane networks
+  (`inverse_transform_adst_reconstruct_hbd_avx2` / `iadst*_i64` / `idct_i64`, 4 i64 lanes per
+  vector, both axes of a mixed block in i64), whose exactness argument is different in kind:
+  they are the scalar's i64 arithmetic op for op (exact-mod-2^64 multiply, emulated 64-bit
+  arithmetic-shift `round2`), narrowing to i32 only after the final `round2` where spec
+  §8.7.1.1 re-bounds the value. Any *new* SIMD kernel with hardcoded 8-bit constants or
+  i32-tight arithmetic must likewise gate on `bit_depth == 8` until it is made depth-aware.
 - **The AVX2 DCT_DCT inverse transform stores lanes as i32 at every depth; only the butterfly
   multiplies are depth-gated.** Spec §8.7.1.1 bounds every stored transform intermediate to
   signed `8 + BitDepth` bits (<= 20 at 12-bit) -- that is why i32 lanes are safe at all depths --
@@ -105,8 +113,9 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   (`_mm256_mul_epi32`) and rounds in i64 (its `>> 14` is a LOGICAL 64-bit shift -- exact because
   only the low 32 bits are kept and logical/arithmetic shifts agree there). Do not route 10/12-bit
   to the 8-bit kernel or reuse the i32 `mullo` butterfly in depth-general code. WHT (lossless)
-  and 10/12-bit ADST stay scalar. On NON-conformant streams (coefficients past spec §8.7.1.1's
-  stored-value bounds) the SIMD i32 lanes may wrap where the scalar i64 arithmetic does not, so
+  stays scalar. On NON-conformant streams (coefficients past spec §8.7.1.1's
+  stored-value bounds) the SIMD i32 lanes may wrap where the scalar i64 arithmetic does not
+  (likewise the i64-lane ADST driver's final i32 narrowing), so
   SIMD-on vs `VP9DEC_NO_SIMD=1` outputs can legitimately diverge on garbage input -- a
   differential fuzzer comparing the two configs on a malformed corpus would misread that as a
   SIMD bug; only conformant streams are comparable.
@@ -166,9 +175,9 @@ skill; change-navigation is the `vp9dec-architecture` skill.
 
 ## Known gaps
 
-- **No SIMD for: intra prediction, the WHT (lossless) inverse transform, or 10/12-bit ADST**
-  (inter-prediction -- unscaled and reference-scaled -- the loop filter, and the DCT_DCT
-  transform are vectorized at all bit depths; the ADST-containing transforms at 8-bit; nor
+- **No SIMD for: intra prediction or the WHT (lossless) inverse transform** (inter-prediction
+  -- unscaled and reference-scaled -- the loop filter, and every non-lossless inverse
+  transform -- DCT_DCT and the ADST-containing types -- are vectorized at all bit depths; nor
   aarch64 NEON). The scalar path there is correct and bit-exact; this is a performance gap
   only, tracked in `docs/backlog.md`. (Intra prediction profiled at ~0.3% on inter content.)
 - **`SEG_LVL_ALT_L` / `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` have no official test vector.** They
