@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: Format check
+        run: cargo fmt --all --check
+      # Matches the project's documented lint gate (CLAUDE.md): warnings are surfaced but not
+      # denied, so a pre-existing lint doesn't block CI. Tighten to `-- -D warnings` once the
+      # tree is warning-clean.
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --all-targets
+      # The conformance/sweep tests skip cleanly when the (uncommitted, ~3.5 GB) vector corpus
+      # is absent, so the default suite runs fast in CI. Run both SIMD configurations, since
+      # bit-exact output must hold with AVX2 auto-detected AND with SIMD forced off.
+      - name: Test (SIMD auto-detected)
+        run: cargo test
+      - name: Test (forced scalar)
+        run: cargo test
+        env:
+          VP9DEC_NO_SIMD: "1"

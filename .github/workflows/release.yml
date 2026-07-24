@@ -1,0 +1,42 @@
+name: Release
+
+# Publishes to crates.io and cuts a GitHub Release when a `vX.Y.Z` tag is pushed.
+# Prerequisites (inert until both are in place):
+#   - a `CARGO_REGISTRY_TOKEN` repository secret holding a crates.io API token
+#   - the pushed tag must match the `version` in Cargo.toml (guarded below)
+# The full official conformance sweep (~3.5 GB corpus, release build) is the HUMAN release
+# gate and is intentionally NOT run here -- run it locally before tagging (see the
+# verify-vp9dec skill / CLAUDE.md). This workflow only runs the fast default suite.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches crate version
+        run: |
+          crate_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "v$crate_ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version v$crate_ver"
+            exit 1
+          fi
+      - name: Test
+        run: cargo test
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
