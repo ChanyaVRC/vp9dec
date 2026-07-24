@@ -1,9 +1,12 @@
 name: Release
 
 # Publishes to crates.io and cuts a GitHub Release when a `vX.Y.Z` tag is pushed.
-# Prerequisites (inert until both are in place):
-#   - a `CARGO_REGISTRY_TOKEN` repository secret holding a crates.io API token
+# Idempotent: skips `cargo publish` if that version is already on crates.io, and skips the
+# GitHub Release if it already exists -- so re-tagging or re-running is safe (e.g. a version
+# that was first published manually).
+# Prerequisites:
 #   - the pushed tag must match the `version` in Cargo.toml (guarded below)
+#   - a `CARGO_REGISTRY_TOKEN` repo secret -- only needed when actually publishing a new version
 # The full official conformance sweep (~3.5 GB corpus, release build) is the HUMAN release
 # gate and is intentionally NOT run here -- run it locally before tagging (see the
 # verify-vp9dec skill / CLAUDE.md). This workflow only runs the fast default suite.
@@ -32,11 +35,25 @@ jobs:
           fi
       - name: Test
         run: cargo test
-      - name: Publish to crates.io
+      - name: Publish to crates.io (skip if this version is already published)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
-      - name: Create GitHub Release
+        run: |
+          ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          code="$(curl -sS -H 'User-Agent: vp9dec release workflow' \
+            -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/vp9dec/$ver")"
+          if [ "$code" = "200" ]; then
+            echo "vp9dec $ver is already on crates.io -- skipping publish."
+          else
+            echo "Publishing vp9dec $ver to crates.io..."
+            cargo publish
+          fi
+      - name: Create GitHub Release (skip if it already exists)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists -- skipping."
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          fi
