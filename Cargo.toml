@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "A from-scratch, clean-room VP9 video decoder (Rust, zero dependency crates)"
 license = "MIT"
-publish = false
+repository = "https://github.com/ChanyaVRC/vp9dec"
+documentation = "https://docs.rs/vp9dec"
+readme = "README.md"
+keywords = ["vp9", "video", "codec", "decoder", "webm"]
+categories = ["multimedia::video", "multimedia::encoding"]
+exclude = [".claude", "CLAUDE.md"]
 
 [dependencies]
 
