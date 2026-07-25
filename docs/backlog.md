@@ -209,11 +209,27 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   session, 32-core): 1080p single-tile **52.3 -> 60.1 MP/s (+15%)**, 4-tile **66.6 -> 97.3 MP/s
   (+46%)**; LoopFilter stage ÷1.58 / ÷1.90 (chroma is proportionally more expensive than its pixel
   count, so the 3-way split balances better than the ~1.5x Y-bound estimate). Follow-up
-  (intra-plane luma wavefront): IN PROGRESS -- splitting the Y plane across threads needs an
-  UNSAFE shared-buffer wavefront with a 2-superblock row lag (SB(r,c)'s top-edge pass and
-  SB(r-1,c+1)'s left-edge pass write a shared 8x8 corner, so gating row r on `progress[r-1] >= c+2`
-  is required), higher reward on many-core (loop filter toward ÷5-6) at higher risk; being done as
-  a separate, exhaustively-verified step.
+  (intra-plane luma wavefront): DONE 2026-07-25 (`wavefront_filter_plane` + `PlaneView` +
+  `PlaneAccess`). Each plane is now filtered by a WAVEFRONT of worker threads (superblock rows
+  round-robin across `min(available_parallelism, sb_rows)` workers), replacing the concurrent-plane
+  split so luma AND chroma each get the full pool. A worker filters superblock (r,c) only after row
+  r-1 reached column c+2 -- a 2-superblock lag, because (r,c)'s top-edge (horizontal) pass and
+  (r-1,c+1)'s left-edge (vertical) pass write a shared 8x8 corner; a 1-column lag would race it.
+  The workers write DISJOINT pixels of one plane buffer through a shared `unsafe` raw view
+  (`PlaneView`, Send+Sync); Rust forbids the aliasing `&mut` this would need, so soundness rests on
+  the wavefront ordering plus `Release`/`Acquire` on a per-row progress counter. The sequential path
+  stays fully SAFE: the filter arithmetic is generic over a `PlaneAccess` trait (`Plane` = safe,
+  `PlaneView` = raw), and the AVX2 kernels take a `*mut u16` base. Landed in two verified steps: (2a)
+  the raw-access refactor alone, single-threaded (sweep 315/315 both configs -- isolating raw-access
+  correctness from any race), then (2b) the wavefront. Verified: new
+  `tests/loop_filter_parallel_test.rs` decodes HD clips with the wavefront and with a test-only
+  `FORCE_SEQUENTIAL_LOOP_FILTER` knob, asserting byte-identical over 5 parallel iters (617 frames x
+  5 all == the sequential reference); sweep 315/315 x3 (SIMD-on x2 + forced-scalar) + ffmpeg
+  cross-decode 10/10 + clippy/fmt. Perf (interleaved A/B vs the plane-parallel Phase above, same
+  session, 32-core): 1080p single-tile **78.7 -> 92.2 MP/s (+17%)**, 4-tile **111.9 -> 142.1 MP/s
+  (+27%)**; LoopFilter stage ÷1.71 / ÷1.81 -- below the wavefront's latency-bound ceiling because of
+  per-frame thread-spawn overhead (3 `thread::scope`s x ~17 workers per frame); a persistent pool
+  could close that if ever profiled as worth the complexity.
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 

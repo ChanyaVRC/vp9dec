@@ -61,6 +61,16 @@ overview. A resolved bug needs no entry.
   `tile_rows > 1` (above-context crosses tile-row boundaries) and single-column frames stay
   sequential. ~+22% on a 2-column 854x356 clip at introduction; the strip buffers added ~+17%
   on a 4-tile 1920x800 clip (per-frame worker alloc+zero shrank ~4x).
+- **Loop-filter parallelism.** The deblocking filter (once per frame, after tile decode joins) runs
+  each plane on a WAVEFRONT of worker threads (`loop_filter::wavefront_filter_plane`,
+  `std::thread::scope`, no external crate): superblock rows round-robin across
+  `min(available_parallelism, sb_rows)` workers, each row lagging the one above by 2 superblocks
+  (see the landmine). Workers write disjoint pixels of one plane buffer through an `unsafe` raw
+  `PlaneView`; the sequential / small-frame (`LF_PARALLEL_MIN_MI`) path uses `Plane` directly and is
+  fully safe — both behind the `PlaneAccess` trait so the filter arithmetic is written once, and the
+  AVX2 kernels take a `*mut u16` base. Bit-exact (sweep both configs +
+  `tests/loop_filter_parallel_test.rs` pins wavefront == forced-sequential over repeated iters).
+  ~+21% aggregate on 1080p over the earlier per-plane-thread loop filter.
 
 Architecture and the module map live in `README.md`; the acceptance gate is the `verify-vp9dec`
 skill; change-navigation is the `vp9dec-architecture` skill.
@@ -87,6 +97,19 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   `tests/tile_parallel_test.rs` after touching availability or prediction near tile edges. The
   merge copies only the pixel columns up to `mi_col_end*8`; padding past `mi_cols` is never
   copied, so it stays zero in the merged frame exactly as in a sequential decode.
+- **The loop-filter wavefront (`loop_filter::wavefront_filter_plane`) is `unsafe`, and its
+  2-superblock row lag is load-bearing.** Worker threads write DISJOINT pixels of one plane buffer
+  concurrently through a shared raw `PlaneView` (Rust forbids the aliasing `&mut` this would need),
+  so nothing checks that the accesses are actually disjoint — correctness rests entirely on the
+  wavefront ordering. Superblock (r,c) may be filtered only once row r-1 has finished column
+  **c+2**, not c+1: (r,c)'s horizontal (top-edge) pass and (r-1,c+1)'s vertical (left-edge) pass
+  both write a shared 8x8 corner where the superblocks meet, so a 1-column lead would let the row
+  above still be writing that corner. The gate is a per-row `AtomicU32` progress counter with
+  `Release` on publish / `Acquire` on wait (which also publishes a worker's written pixels before
+  the row below reads them at the boundary). Get the lag or the ordering wrong and you get an
+  INTERMITTENT race — it may pass a sweep once and fail later. After any change here, re-run
+  `tests/loop_filter_parallel_test.rs` (wavefront == forced-sequential, repeated) AND the full sweep
+  in both SIMD configs several times; a single green run is not enough to trust a concurrency change.
 - **All four AVX2 kernel families (inter-pred, loop filter, DCT_DCT transform, ADST-containing
   transforms) are all-depth, each by a different mechanism -- and the ADST's per-depth kernel
   SPLIT is load-bearing.** Inter-pred takes a `max_val` clip bound, the loop filter scales its

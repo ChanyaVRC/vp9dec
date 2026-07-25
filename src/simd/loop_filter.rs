@@ -15,7 +15,7 @@ use std::arch::x86_64::*;
 /// Vertical edges (pass==0) are handled by [`loop_filter_vert8_avx2`], which transposes the tap
 /// window into this kernel's row-major layout and reuses this exact arithmetic.
 ///
-/// `plane_data`/`plane_width` is the raw row-major plane buffer (stride == `plane_width`,
+/// `plane_base`/`plane_width` is the raw row-major plane buffer (stride == `plane_width`,
 /// `u16`-backed regardless of bit depth -- see `framebuffer.rs`; the caller only dispatches
 /// here for `bit_depth == 8`, so every sample is known to fit in `0..=255`).
 /// `(x0, y0)` is lane 0's position (loop_filter.rs's `sample_filtering(x, y, ...)` for the
@@ -46,7 +46,7 @@ use std::arch::x86_64::*;
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn loop_filter_horiz8_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     x0: usize,
     y0: usize,
@@ -58,7 +58,7 @@ pub unsafe fn loop_filter_horiz8_avx2(
     thresh: &[i32; 8],
     bit_depth: u8,
 ) {
-    let base = plane_data.as_mut_ptr();
+    let base = plane_base;
 
     // Loads 8 contiguous u16 samples (columns x0..x0+8) from row `y0 + dy`, widened to
     // 8xi32 -- one AVX2 lane per along-edge position, matching `get_off`'s
@@ -563,7 +563,7 @@ unsafe fn transpose8x8_u16(r: &[__m128i; 8]) -> [__m128i; 8] {
 /// kernel unchanged, and transposes the result back. All the bit-exact filter arithmetic (mask,
 /// narrow, wide8, wide16) is thus shared verbatim; only the load/store orientation differs.
 ///
-/// `plane_data`/`plane_width`, the 0/-1 lane masks, and `limit`/`blimit`/`thresh` mean exactly
+/// `plane_base`/`plane_width`, the 0/-1 lane masks, and `limit`/`blimit`/`thresh` mean exactly
 /// what they do for [`loop_filter_horiz8_avx2`]; `(x0, y0)` is lane 0's position and the other 7
 /// lanes are the next 7 rows `y0+1..=y0+7` at the same column `x0`.
 ///
@@ -578,7 +578,7 @@ unsafe fn transpose8x8_u16(r: &[__m128i; 8]) -> [__m128i; 8] {
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn loop_filter_vert8_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     x0: usize,
     y0: usize,
@@ -598,7 +598,7 @@ pub unsafe fn loop_filter_vert8_avx2(
     let center = if wide { 8usize } else { 4usize }; // q0's tap-row in the scratch
     let col0 = x0 - center; // leftmost tap column (p3 for the narrow window, p7 for the wide)
 
-    let base = plane_data.as_mut_ptr();
+    let base = plane_base;
     // scratch: up to 16 tap-rows x 8 lane-cols, row-major stride 8 -- the layout the horizontal
     // kernel reads (tap axis = scratch rows, along-edge axis = scratch cols). Only the first
     // `_win` rows are filled/used; the narrow case leaves rows 8..15 untouched (never read).
@@ -630,7 +630,7 @@ pub unsafe fn loop_filter_vert8_avx2(
     // `center` (q0). Its own narrow/wide8/wide16 selection and p3..q3 / p7..q7 window reads land
     // exactly on the scratch rows filled above.
     loop_filter_horiz8_avx2(
-        &mut scratch,
+        scratch.as_mut_ptr(),
         8,
         0,
         center,

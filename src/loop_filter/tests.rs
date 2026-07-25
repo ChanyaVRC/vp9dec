@@ -223,7 +223,7 @@ fn avx2_horiz8_matches_scalar_sample_filtering() {
         // are all in bounds.
         unsafe {
             crate::simd::loop_filter_horiz8_avx2(
-                plane_simd.as_mut_slice(),
+                plane_simd.as_mut_slice().as_mut_ptr(),
                 width,
                 0,
                 y0,
@@ -326,7 +326,7 @@ fn avx2_vert8_matches_scalar_sample_filtering() {
         // 0..=15) are in bounds across all 8 rows (y0==0, rows 0..=7).
         unsafe {
             crate::simd::loop_filter_vert8_avx2(
-                plane_simd.as_mut_slice(),
+                plane_simd.as_mut_slice().as_mut_ptr(),
                 width,
                 x0,
                 0,
