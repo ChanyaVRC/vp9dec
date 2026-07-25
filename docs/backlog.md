@@ -227,9 +227,18 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   5 all == the sequential reference); sweep 315/315 x3 (SIMD-on x2 + forced-scalar) + ffmpeg
   cross-decode 10/10 + clippy/fmt. Perf (interleaved A/B vs the plane-parallel Phase above, same
   session, 32-core): 1080p single-tile **78.7 -> 92.2 MP/s (+17%)**, 4-tile **111.9 -> 142.1 MP/s
-  (+27%)**; LoopFilter stage ÷1.71 / ÷1.81 -- below the wavefront's latency-bound ceiling because of
-  per-frame thread-spawn overhead (3 `thread::scope`s x ~17 workers per frame); a persistent pool
-  could close that if ever profiled as worth the complexity.
+  (+27%)**; LoopFilter stage ÷1.71 / ÷1.81, below the wavefront's latency-bound ceiling.
+  Further follow-up (fuse the per-plane scopes): DONE 2026-07-25 (`wavefront_filter_planes`). The
+  three planes were filtered in three separate `thread::scope`s, so all workers hard-barriered twice
+  per frame (each plane fully drained before the next began). Fusing them into ONE scope whose
+  workers flow across the independent planes removed both drains (and cut per-frame spawns 3x) --
+  the drain, not the spawns, was the dominant loss. LoopFilter stage a further ÷1.74-1.80
+  (single-tile 1309 -> 726 ms), **+7% single-tile / +11% 4-tile** on top of the wavefront, all still
+  SAFE `thread::scope`. Final state: the loop filter is now 11-18% of decode (~÷6.8 vs
+  true-sequential, ~83% of the latency-bound ceiling); 1080p single-tile ~98 MP/s, 4-tile ~155 MP/s.
+  A persistent CROSS-FRAME thread pool was then evaluated and REJECTED: the only thing left to
+  recover is the per-frame spawn (~17 workers x ~10us ~= 0.5% of decode), which does not justify the
+  `unsafe` lifetime erasure + global shared-pool concurrency such a pool would need.
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 

@@ -62,15 +62,19 @@ overview. A resolved bug needs no entry.
   sequential. ~+22% on a 2-column 854x356 clip at introduction; the strip buffers added ~+17%
   on a 4-tile 1920x800 clip (per-frame worker alloc+zero shrank ~4x).
 - **Loop-filter parallelism.** The deblocking filter (once per frame, after tile decode joins) runs
-  each plane on a WAVEFRONT of worker threads (`loop_filter::wavefront_filter_plane`,
-  `std::thread::scope`, no external crate): superblock rows round-robin across
+  all three planes in ONE `thread::scope` on a WAVEFRONT of worker threads
+  (`loop_filter::wavefront_filter_planes`, no external crate): superblock rows round-robin across
   `min(available_parallelism, sb_rows)` workers, each row lagging the one above by 2 superblocks
-  (see the landmine). Workers write disjoint pixels of one plane buffer through an `unsafe` raw
-  `PlaneView`; the sequential / small-frame (`LF_PARALLEL_MIN_MI`) path uses `Plane` directly and is
-  fully safe — both behind the `PlaneAccess` trait so the filter arithmetic is written once, and the
-  AVX2 kernels take a `*mut u16` base. Bit-exact (sweep both configs +
-  `tests/loop_filter_parallel_test.rs` pins wavefront == forced-sequential over repeated iters).
-  ~+21% aggregate on 1080p over the earlier per-plane-thread loop filter.
+  (see the landmine). Workers flow across the independent planes with no per-plane barrier (each
+  plane has its own progress array). Workers write disjoint pixels of one plane buffer through an
+  `unsafe` raw `PlaneView`; the sequential / small-frame (`LF_PARALLEL_MIN_MI`) path uses `Plane`
+  directly and is fully safe — both behind the `PlaneAccess` trait so the filter arithmetic is
+  written once, and the AVX2 kernels take a `*mut u16` base. Bit-exact (sweep both configs +
+  `tests/loop_filter_parallel_test.rs` pins wavefront == forced-sequential over repeated iters). The
+  loop filter went from the serial bottleneck (~38–52% of decode) to 11–18%; ~÷6.8 vs a
+  single-threaded loop filter, so 1080p decodes at ~98 MP/s (single-tile) / ~155 MP/s (4-tile). A
+  persistent cross-frame pool was evaluated and rejected (the residual per-frame spawn is ~0.5% of
+  decode, not worth the `unsafe` lifetime erasure it needs).
 
 Architecture and the module map live in `README.md`; the acceptance gate is the `verify-vp9dec`
 skill; change-navigation is the `vp9dec-architecture` skill.
@@ -97,7 +101,7 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   `tests/tile_parallel_test.rs` after touching availability or prediction near tile edges. The
   merge copies only the pixel columns up to `mi_col_end*8`; padding past `mi_cols` is never
   copied, so it stays zero in the merged frame exactly as in a sequential decode.
-- **The loop-filter wavefront (`loop_filter::wavefront_filter_plane`) is `unsafe`, and its
+- **The loop-filter wavefront (`loop_filter::wavefront_filter_planes`) is `unsafe`, and its
   2-superblock row lag is load-bearing.** Worker threads write DISJOINT pixels of one plane buffer
   concurrently through a shared raw `PlaneView` (Rust forbids the aliasing `&mut` this would need),
   so nothing checks that the accesses are actually disjoint — correctness rests entirely on the

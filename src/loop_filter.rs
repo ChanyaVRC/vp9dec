@@ -20,7 +20,7 @@
 //!
 //! For decode speed each plane is deblocked independently (the planes are disjoint buffers that
 //! never read one another) and, above a size threshold, in parallel: within a plane the superblock
-//! rows are filtered by a WAVEFRONT of worker threads ([`wavefront_filter_plane`]), each row
+//! rows are filtered by a WAVEFRONT of worker threads ([`wavefront_filter_planes`]), each row
 //! lagging the one above by two superblocks so their shared-corner writes stay ordered. This is
 //! bit-exact -- the per-plane (row, col, pass) raster order above is preserved exactly; only
 //! independent superblocks (and planes) ever run concurrently.
@@ -102,7 +102,7 @@ impl PlaneAccess for Plane {
 }
 
 /// Raw-pointer view of one plane's pixel buffer for the multi-threaded loop-filter wavefront
-/// ([`wavefront_filter_plane`]), where several worker threads write DISJOINT pixels of the *same*
+/// ([`wavefront_filter_planes`]), where several worker threads write DISJOINT pixels of the *same*
 /// plane at once. Rust forbids two `&mut Plane` (or overlapping `&mut [u16]`) to one buffer even
 /// when the touched pixels are disjoint, so the workers share this `Copy` raw view instead; the
 /// wavefront's per-row progress gate (a >=2 superblock-column lag with `Release`/`Acquire`) is what
@@ -119,7 +119,7 @@ struct PlaneView {
 // SAFETY: `PlaneView` is a bare pointer into a `Plane`'s `Vec<u16>`. It is only created from a
 // `&mut Plane` that outlives the `thread::scope` owning the workers (so the buffer stays alive and
 // is never moved/reallocated for the view's lifetime), and shared with workers that -- by the
-// wavefront ordering in `wavefront_filter_plane` -- never write the same pixel concurrently and
+// wavefront ordering in `wavefront_filter_planes` -- never write the same pixel concurrently and
 // always establish happens-before (the `Release`/`Acquire` progress counter) before reading a
 // pixel another worker wrote. Hence there is no data race despite the shared buffer.
 unsafe impl Send for PlaneView {}
@@ -842,7 +842,7 @@ fn superblock_loop_filter_edge_avx2<P: PlaneAccess>(
 /// Filters one plane over the whole frame sequentially in the spec's per-plane order (superblock
 /// raster; vertical then horizontal pass). The single-threaded fallback used by
 /// [`loop_filter_frame`] for small frames / single-core machines; larger frames filter each plane
-/// with [`wavefront_filter_plane`] instead.
+/// with [`wavefront_filter_planes`] instead.
 #[allow(clippy::too_many_arguments)]
 fn loop_filter_plane(
     plane: &mut Plane,
@@ -883,23 +883,26 @@ fn loop_filter_plane(
     }
 }
 
-/// Filters one plane using the intra-plane WAVEFRONT: its superblock rows are distributed
-/// round-robin across `n_threads` workers, each filtering its rows left-to-right in the spec's
-/// per-plane order (vertical then horizontal pass per superblock).
+/// Filters all three planes using the intra-plane WAVEFRONT in a SINGLE `thread::scope`: each of
+/// `n_threads` workers processes a round-robin subset of superblock rows, in the spec's per-plane
+/// order (vertical then horizontal pass per superblock), advancing through plane 0, then 1, then 2.
 ///
-/// A worker may filter superblock `(r, c)` only once row `r-1` has finished column `c+1` -- a
-/// **2-superblock-column lag**. One column would not be enough: `(r, c)`'s horizontal (top-edge)
-/// pass and `(r-1, c+1)`'s vertical (left-edge) pass both write a shared 8-sample corner where the
-/// two superblocks meet, so with only a 1-column lead the row above could still be writing that
-/// corner. `progress[r]` counts the superblock columns fully filtered in row `r`; its `Release`
-/// store / `Acquire` load also publishes the pixels a worker wrote before the dependent worker
-/// reads them. The result is **bit-identical to the sequential per-plane raster order**: every
-/// read/write dependency (left neighbour via same-thread ordering, above neighbour via the gate) is
-/// preserved, only independent superblocks run concurrently.
+/// A worker may filter superblock `(r, c)` of a plane only once that plane's row `r-1` has finished
+/// column `c+2` -- a **2-superblock-column lag**. One column would not be enough: `(r, c)`'s
+/// horizontal (top-edge) pass and `(r-1, c+1)`'s vertical (left-edge) pass both write a shared
+/// 8-sample corner where the superblocks meet, so with only a 1-column lead the row above could
+/// still be writing that corner. Each plane has its own `progress` counter array (superblock
+/// columns fully filtered per row); the `Release` store / `Acquire` load also publishes the pixels
+/// a worker wrote before the dependent worker reads them.
+///
+/// Bit-identical to the sequential per-plane raster order: every read/write dependency (left
+/// neighbour via same-thread ordering, above neighbour via the gate) is preserved. The three planes
+/// are independent, so fusing them into one scope (rather than three) changes only timing -- a
+/// worker that runs out of work in one plane flows straight into the next instead of idling at a
+/// per-plane barrier, and the per-frame thread spawns are paid once, not once per plane.
 #[allow(clippy::too_many_arguments)]
-fn wavefront_filter_plane(
-    plane: &mut Plane,
-    plane_idx: usize,
+fn wavefront_filter_planes(
+    planes: &mut [Plane; 3],
     mi_grid: &MiGrid,
     mi_cols: u32,
     mi_rows: u32,
@@ -912,52 +915,59 @@ fn wavefront_filter_plane(
 ) {
     let n_sb_rows = mi_rows.div_ceil(8) as usize;
     let n_sb_cols = mi_cols.div_ceil(8) as usize;
-    // `progress[r]` = number of superblock columns fully filtered (both passes) in superblock row
-    // `r`. A worker publishes with `Release`; the worker one row below reads with `Acquire`.
-    let progress_vec: Vec<AtomicU32> = (0..n_sb_rows).map(|_| AtomicU32::new(0)).collect();
-    let progress = progress_vec.as_slice();
-    let view = PlaneView::new(plane);
+    // One `progress` array per plane: `progress[p][r]` = superblock columns fully filtered (both
+    // passes) in row `r` of plane `p`. Published with `Release`, awaited with `Acquire`.
+    let progress: [Vec<AtomicU32>; 3] =
+        std::array::from_fn(|_| (0..n_sb_rows).map(|_| AtomicU32::new(0)).collect());
+    let progress = &progress;
+    let [p0, p1, p2] = planes;
+    let views = [PlaneView::new(p0), PlaneView::new(p1), PlaneView::new(p2)];
 
     std::thread::scope(|s| {
         for t in 0..n_threads {
             s.spawn(move || {
-                // Each worker owns a private `Copy` of the shared raw view; all writes go to the one
-                // underlying buffer, kept disjoint-in-time by the gate below.
-                let mut view = view;
-                let mut sb_row = t;
-                while sb_row < n_sb_rows {
-                    let row = (sb_row * 8) as u32;
-                    for sb_col in 0..n_sb_cols {
-                        // Wavefront gate: wait until the row above has finished column `sb_col + 1`
-                        // (the 2-superblock lag). Row 0 has no row above, so it runs unblocked.
-                        if sb_row > 0 {
-                            let need = (sb_col as u32 + 2).min(n_sb_cols as u32);
-                            while progress[sb_row - 1].load(Ordering::Acquire) < need {
-                                std::hint::spin_loop();
+                // Advance through the planes in order; each is an independent wavefront, so a worker
+                // that runs out of its rows in plane `p` flows straight into `p + 1` (no barrier).
+                for plane_idx in 0..3usize {
+                    // Private `Copy` of this plane's shared raw view; writes go to the one
+                    // underlying buffer, kept disjoint-in-time by the gate below.
+                    let mut view = views[plane_idx];
+                    let prog = &progress[plane_idx];
+                    let mut sb_row = t;
+                    while sb_row < n_sb_rows {
+                        let row = (sb_row * 8) as u32;
+                        for sb_col in 0..n_sb_cols {
+                            // Wavefront gate: wait until this plane's row above has finished column
+                            // `sb_col + 1` (the 2-superblock lag). Row 0 has no row above.
+                            if sb_row > 0 {
+                                let need = (sb_col as u32 + 2).min(n_sb_cols as u32);
+                                while prog[sb_row - 1].load(Ordering::Acquire) < need {
+                                    std::hint::spin_loop();
+                                }
                             }
+                            let col = (sb_col * 8) as u32;
+                            for pass in 0..2u32 {
+                                superblock_loop_filter(
+                                    &mut view,
+                                    mi_grid,
+                                    mi_cols,
+                                    mi_rows,
+                                    subsampling_x,
+                                    subsampling_y,
+                                    lvl_lookup,
+                                    sharpness,
+                                    plane_idx,
+                                    pass,
+                                    row,
+                                    col,
+                                    bit_depth,
+                                );
+                            }
+                            // Publish: this superblock (both passes) is done; unblock the row below.
+                            prog[sb_row].store(sb_col as u32 + 1, Ordering::Release);
                         }
-                        let col = (sb_col * 8) as u32;
-                        for pass in 0..2u32 {
-                            superblock_loop_filter(
-                                &mut view,
-                                mi_grid,
-                                mi_cols,
-                                mi_rows,
-                                subsampling_x,
-                                subsampling_y,
-                                lvl_lookup,
-                                sharpness,
-                                plane_idx,
-                                pass,
-                                row,
-                                col,
-                                bit_depth,
-                            );
-                        }
-                        // Publish: this superblock (both passes) is done; unblock the row below.
-                        progress[sb_row].store(sb_col as u32 + 1, Ordering::Release);
+                        sb_row += n_threads;
                     }
-                    sb_row += n_threads;
                 }
             });
         }
@@ -987,7 +997,7 @@ pub fn loop_filter_frame(
 
     // Each plane is deblocked independently (disjoint buffers; `mi_grid`/`lvl_lookup` are shared
     // read-only). Above `LF_PARALLEL_MIN_MI` each plane is filtered with the intra-plane wavefront
-    // (see `wavefront_filter_plane`) across `n_threads` workers; below it -- or with no usable
+    // (see `wavefront_filter_planes`) across `n_threads` workers; below it -- or with no usable
     // parallelism -- the planes are filtered sequentially on this thread. Both paths preserve every
     // plane's (row, col, pass) raster order spec §8.8 requires, so the output is bit-identical.
     let n_sb_rows = mi_rows.div_ceil(8) as usize;
@@ -1026,23 +1036,21 @@ pub fn loop_filter_frame(
         return;
     }
 
-    // Planes are processed one after another so every plane -- luma AND chroma -- gets the full
-    // thread pool (the earlier plane-parallel split capped luma, the long pole, at one thread).
-    for (plane_idx, plane) in planes.iter_mut().enumerate() {
-        wavefront_filter_plane(
-            plane,
-            plane_idx,
-            mi_grid,
-            mi_cols,
-            mi_rows,
-            subsampling_x,
-            subsampling_y,
-            &lvl_lookup,
-            sharpness,
-            bit_depth,
-            n_threads,
-        );
-    }
+    // All three planes are filtered in one fused wavefront pass (see `wavefront_filter_planes`): a
+    // single thread::scope whose workers flow across the independent planes, so no worker idles at a
+    // per-plane barrier and the per-frame thread spawns are paid once, not once per plane.
+    wavefront_filter_planes(
+        planes,
+        mi_grid,
+        mi_cols,
+        mi_rows,
+        subsampling_x,
+        subsampling_y,
+        &lvl_lookup,
+        sharpness,
+        bit_depth,
+        n_threads,
+    );
 }
 
 #[cfg(test)]
