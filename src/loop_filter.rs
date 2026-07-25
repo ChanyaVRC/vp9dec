@@ -1,8 +1,8 @@
 //! Deblocking (loop) filter (spec §8.8 "Loop filter process").
 //!
-//! Faithfully to spec §8.8, the entire frame is traversed with the following
-//! nested loops (taken directly from the frame-wide traversal pseudocode at
-//! the top of the section):
+//! Spec §8.8's reference traversal of the frame is the following nested loops (taken directly from
+//! the frame-wide traversal pseudocode at the top of the section); for parallelism the
+//! implementation reorganizes it to plane-outermost, preserving each plane's order (see below):
 //!
 //! ```text
 //! for ( row = 0; row < MiRows; row += 8 )
@@ -18,6 +18,13 @@
 //! (vertical -> horizontal, superblock raster order) must be strictly
 //! followed (see the NOTE in spec §8.8).
 //!
+//! For decode speed each plane is deblocked independently (the planes are disjoint buffers that
+//! never read one another) and, above a size threshold, in parallel: within a plane the superblock
+//! rows are filtered by a WAVEFRONT of worker threads ([`wavefront_filter_planes`]), each row
+//! lagging the one above by two superblocks so their shared-corner writes stay ordered. This is
+//! bit-exact -- the per-plane (row, col, pass) raster order above is preserved exactly; only
+//! independent superblocks (and planes) ever run concurrently.
+//!
 //! # Known simplifications
 //!
 //! - `isIntra` (`RefFrames[row][col][0] <= INTRA_FRAME`) and `modeType`
@@ -29,6 +36,8 @@
 //!   deltas and passes them into `parse_loop_filter_params`, which seeds from
 //!   them (or from the default values `[1, 0, -1, -1]`/`[0, 0]` when
 //!   `FrameIsIntra || error_resilient_mode`, i.e. `setup_past_independence`).
+
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::common::{get_uv_tx_size, INTRA_FRAME, MAX_SEGMENTS};
 use crate::framebuffer::Plane;
@@ -43,8 +52,127 @@ const MAX_REF_FRAMES: usize = 4;
 const MAX_MODE_LF_DELTAS: usize = 2;
 const MAX_LOOP_FILTER: i32 = 63;
 
+/// Minimum frame size (in MI units, `MiCols * MiRows`) at which [`loop_filter_frame`] filters
+/// the planes on separate threads. Below it the per-frame thread-spawn cost outweighs the win,
+/// so the planes are filtered sequentially on the calling thread. Bench-tuned (see
+/// `examples/bench.rs`); 4096 MI ~= 512x512 luma, so sub-VGA frames stay sequential.
+const LF_PARALLEL_MIN_MI: u64 = 4096;
+
+/// Test-only knob: forces [`loop_filter_frame`] down the sequential path even when the intra-plane
+/// wavefront would engage, so `tests/loop_filter_parallel_test.rs` can assert the parallel and
+/// sequential loop filter of a real decode are byte-identical. Compiled only for test builds (the
+/// self-referential `test-support` dev-dependency), mirroring `tile::FORCE_SEQUENTIAL_TILES`.
+#[cfg(feature = "test-support")]
+pub static FORCE_SEQUENTIAL_LOOP_FILTER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// `LvlLookup[ segmentId ][ ref ][ mode ]` (spec §8.8.1).
 type LvlLookup = [[[i32; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SEGMENTS];
+
+/// Pixel read/write access to one plane for the loop filter. This abstracts the filter code over
+/// the safe single-threaded [`Plane`] path (sequential / small frames and the per-plane threads)
+/// and the raw `PlaneView` path used by the intra-plane wavefront, so the filter arithmetic is
+/// written exactly once and each path keeps its own memory-safety story.
+trait PlaneAccess {
+    fn lf_get(&self, x: usize, y: usize) -> u16;
+    fn lf_set(&mut self, x: usize, y: usize, v: u16);
+    /// Base pointer of the row-major buffer, for the AVX2 kernels (which index it raw rather than
+    /// going through `lf_get`/`lf_set`); `lf_stride` is its row stride (`= width`).
+    fn lf_base_ptr(&mut self) -> *mut u16;
+    fn lf_stride(&self) -> usize;
+}
+
+impl PlaneAccess for Plane {
+    #[inline]
+    fn lf_get(&self, x: usize, y: usize) -> u16 {
+        self.get(x, y)
+    }
+    #[inline]
+    fn lf_set(&mut self, x: usize, y: usize, v: u16) {
+        self.set(x, y, v);
+    }
+    #[inline]
+    fn lf_base_ptr(&mut self) -> *mut u16 {
+        self.as_mut_slice().as_mut_ptr()
+    }
+    #[inline]
+    fn lf_stride(&self) -> usize {
+        self.width
+    }
+}
+
+/// Raw-pointer view of one plane's pixel buffer for the multi-threaded loop-filter wavefront
+/// ([`wavefront_filter_planes`]), where several worker threads write DISJOINT pixels of the *same*
+/// plane at once. Rust forbids two `&mut Plane` (or overlapping `&mut [u16]`) to one buffer even
+/// when the touched pixels are disjoint, so the workers share this `Copy` raw view instead; the
+/// wavefront's per-row progress gate (a >=2 superblock-column lag with `Release`/`Acquire`) is what
+/// actually keeps the accesses disjoint-or-ordered in time. The sequential path uses [`Plane`]
+/// directly (fully safe) through the same [`PlaneAccess`] trait.
+#[derive(Clone, Copy)]
+struct PlaneView {
+    ptr: *mut u16,
+    stride: usize,
+    x0: usize,
+    height: usize,
+}
+
+// SAFETY: `PlaneView` is a bare pointer into a `Plane`'s `Vec<u16>`. It is only created from a
+// `&mut Plane` that outlives the `thread::scope` owning the workers (so the buffer stays alive and
+// is never moved/reallocated for the view's lifetime), and shared with workers that -- by the
+// wavefront ordering in `wavefront_filter_planes` -- never write the same pixel concurrently and
+// always establish happens-before (the `Release`/`Acquire` progress counter) before reading a
+// pixel another worker wrote. Hence there is no data race despite the shared buffer.
+unsafe impl Send for PlaneView {}
+unsafe impl Sync for PlaneView {}
+
+impl PlaneView {
+    fn new(plane: &mut Plane) -> Self {
+        let stride = plane.width;
+        let x0 = plane.x0;
+        let height = plane.height;
+        Self {
+            ptr: plane.as_mut_slice().as_mut_ptr(),
+            stride,
+            x0,
+            height,
+        }
+    }
+
+    #[inline]
+    fn offset(&self, x: usize, y: usize) -> usize {
+        debug_assert!(
+            x >= self.x0 && x - self.x0 < self.stride && y < self.height,
+            "PlaneView access out of range"
+        );
+        y * self.stride + (x - self.x0)
+    }
+}
+
+impl PlaneAccess for PlaneView {
+    #[inline]
+    fn lf_get(&self, x: usize, y: usize) -> u16 {
+        // SAFETY: `offset` bounds-checks (debug). The wavefront guarantees any pixel this worker
+        // reads is either its own or one another worker finished-and-published (Acquire) first, so
+        // the read never races a concurrent write.
+        unsafe { *self.ptr.add(self.offset(x, y)) }
+    }
+    #[inline]
+    fn lf_set(&mut self, x: usize, y: usize, v: u16) {
+        // SAFETY: `offset` bounds-checks (debug). The wavefront guarantees this worker has sole
+        // access to (x, y) at this time (no other worker's superblock touches it concurrently).
+        unsafe {
+            *self.ptr.add(self.offset(x, y)) = v;
+        }
+    }
+    #[inline]
+    fn lf_base_ptr(&mut self) -> *mut u16 {
+        self.ptr
+    }
+    #[inline]
+    fn lf_stride(&self) -> usize {
+        self.stride
+    }
+}
 
 #[inline]
 fn round2(x: i32, n: u32) -> i32 {
@@ -166,17 +294,17 @@ fn filter_size_process(
 /// spec's `q_k`/`p_k`: negative `k` denotes the `p` side, non-negative `k`
 /// denotes the `q` side).
 #[inline]
-fn get_off(plane: &Plane, x: usize, y: usize, dx: i64, dy: i64, k: i64) -> i32 {
+fn get_off<P: PlaneAccess>(plane: &P, x: usize, y: usize, dx: i64, dy: i64, k: i64) -> i32 {
     let px = (x as i64 + dx * k) as usize;
     let py = (y as i64 + dy * k) as usize;
-    plane.get(px, py) as i32
+    plane.lf_get(px, py) as i32
 }
 
 #[inline]
-fn set_off(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, k: i64, v: i32) {
+fn set_off<P: PlaneAccess>(plane: &mut P, x: usize, y: usize, dx: i64, dy: i64, k: i64, v: i32) {
     let px = (x as i64 + dx * k) as usize;
     let py = (y as i64 + dy * k) as usize;
-    plane.set(px, py, v as u16);
+    plane.lf_set(px, py, v as u16);
 }
 
 /// Spec §8.8.5.1 "Filter mask process". Returns `(hevMask, filterMask, flatMask, flatMask2)`.
@@ -184,8 +312,8 @@ fn set_off(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, k: i64, v: i
 /// `adaptive_filter_strength`); the flat-mask threshold (fixed at `1` in the spec's 8-bit
 /// text) is scaled here the same way.
 #[allow(clippy::too_many_arguments)]
-fn compute_filter_mask(
-    plane: &Plane,
+fn compute_filter_mask<P: PlaneAccess>(
+    plane: &P,
     x: usize,
     y: usize,
     dx: i64,
@@ -257,8 +385,8 @@ fn compute_filter_mask(
 /// Spec §8.8.5.2 "Narrow filter process" (`filter4`). The `0x80` base and the `clamp4`
 /// range scale by bit depth (spec §8.8.5.2's `Round2(1, BitDepth-1)`-style base and the
 /// `<< (BitDepth - 8)` clamp range); both are identity at `bit_depth == 8`.
-fn narrow_filter(
-    plane: &mut Plane,
+fn narrow_filter<P: PlaneAccess>(
+    plane: &mut P,
     x: usize,
     y: usize,
     dx: i64,
@@ -301,7 +429,14 @@ fn narrow_filter(
 }
 
 /// Spec §8.8.5.3 "Wide filter process". `log2_size` is 3 (8-tap) or 4 (16-tap).
-fn wide_filter(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, log2_size: u32) {
+fn wide_filter<P: PlaneAccess>(
+    plane: &mut P,
+    x: usize,
+    y: usize,
+    dx: i64,
+    dy: i64,
+    log2_size: u32,
+) {
     let n: i64 = (1i64 << (log2_size - 1)) - 1;
     // F's index is -n..n-1. Stored in a 0-based array by adding offset n.
     let mut f = [0i32; 16];
@@ -328,8 +463,8 @@ fn wide_filter(plane: &mut Plane, x: usize, y: usize, dx: i64, dy: i64, log2_siz
 
 /// Spec §8.8.5 "Sample filtering process".
 #[allow(clippy::too_many_arguments)]
-fn sample_filtering(
-    plane: &mut Plane,
+fn sample_filtering<P: PlaneAccess>(
+    plane: &mut P,
     x: usize,
     y: usize,
     dx: i64,
@@ -449,8 +584,8 @@ fn edge_position_params(
 
 /// Spec §8.8.2 "Superblock loop filter process".
 #[allow(clippy::too_many_arguments)]
-fn superblock_loop_filter(
-    planes: &mut [Plane; 3],
+fn superblock_loop_filter<P: PlaneAccess>(
+    plane: &mut P,
     mi_grid: &MiGrid,
     mi_cols: u32,
     mi_rows: u32,
@@ -489,7 +624,7 @@ fn superblock_loop_filter(
         #[cfg(target_arch = "x86_64")]
         if crate::simd::avx2_enabled() {
             superblock_loop_filter_edge_avx2(
-                planes,
+                plane,
                 mi_grid,
                 mi_cols,
                 mi_rows,
@@ -533,7 +668,7 @@ fn superblock_loop_filter(
             if apply_filter && lvl > 0 {
                 let (limit, blimit, thresh) = adaptive_filter_strength(lvl, sharpness, bit_depth);
                 sample_filtering(
-                    &mut planes[plane_idx],
+                    plane,
                     (x >> sub_x) as usize,
                     (y >> sub_y) as usize,
                     dx,
@@ -561,8 +696,8 @@ fn superblock_loop_filter(
 /// `sample_filtering`'s three-way branch (see docs/implementation-notes.md "SIMD wave 3").
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
-fn superblock_loop_filter_edge_avx2(
-    planes: &mut [Plane; 3],
+fn superblock_loop_filter_edge_avx2<P: PlaneAccess>(
+    plane: &mut P,
     mi_grid: &MiGrid,
     mi_cols: u32,
     mi_rows: u32,
@@ -638,7 +773,12 @@ fn superblock_loop_filter_edge_avx2(
         }
 
         if eligible.iter().any(|&e| e != 0) {
-            let plane_width = planes[plane_idx].width;
+            let plane_width = plane.lf_stride();
+            // Raw base pointer of the plane buffer for the kernels. In the sequential path this is
+            // `Plane::as_mut_slice().as_mut_ptr()`; in the wavefront path it is the shared
+            // `PlaneView` pointer (see `PlaneView`'s safety note). Either way the kernel touches
+            // only the wavefront-exclusive window documented at each call below.
+            let base = plane.lf_base_ptr();
             if pass == 1 {
                 // SAFETY: `avx2_enabled()` was checked by the caller (`superblock_loop_filter`).
                 // The row window the kernel touches at columns x0..x0+8 (pass==1's dx=0,dy=1 taps
@@ -652,7 +792,7 @@ fn superblock_loop_filter_edge_avx2(
                 // group's other lanes are always valid memory too.
                 unsafe {
                     crate::simd::loop_filter_horiz8_avx2(
-                        planes[plane_idx].as_mut_slice(),
+                        base,
                         plane_width,
                         x0,
                         y0,
@@ -679,7 +819,7 @@ fn superblock_loop_filter_edge_avx2(
                 // value there).
                 unsafe {
                     crate::simd::loop_filter_vert8_avx2(
-                        planes[plane_idx].as_mut_slice(),
+                        base,
                         plane_width,
                         x0,
                         y0,
@@ -697,6 +837,141 @@ fn superblock_loop_filter_edge_avx2(
 
         i += 8;
     }
+}
+
+/// Filters one plane over the whole frame sequentially in the spec's per-plane order (superblock
+/// raster; vertical then horizontal pass). The single-threaded fallback used by
+/// [`loop_filter_frame`] for small frames / single-core machines; larger frames filter each plane
+/// with [`wavefront_filter_planes`] instead.
+#[allow(clippy::too_many_arguments)]
+fn loop_filter_plane(
+    plane: &mut Plane,
+    plane_idx: usize,
+    mi_grid: &MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    lvl_lookup: &LvlLookup,
+    sharpness: u8,
+    bit_depth: u8,
+) {
+    let mut row = 0u32;
+    while row < mi_rows {
+        let mut col = 0u32;
+        while col < mi_cols {
+            for pass in 0..2u32 {
+                superblock_loop_filter(
+                    plane,
+                    mi_grid,
+                    mi_cols,
+                    mi_rows,
+                    subsampling_x,
+                    subsampling_y,
+                    lvl_lookup,
+                    sharpness,
+                    plane_idx,
+                    pass,
+                    row,
+                    col,
+                    bit_depth,
+                );
+            }
+            col += 8;
+        }
+        row += 8;
+    }
+}
+
+/// Filters all three planes using the intra-plane WAVEFRONT in a SINGLE `thread::scope`: each of
+/// `n_threads` workers processes a round-robin subset of superblock rows, in the spec's per-plane
+/// order (vertical then horizontal pass per superblock), advancing through plane 0, then 1, then 2.
+///
+/// A worker may filter superblock `(r, c)` of a plane only once that plane's row `r-1` has finished
+/// column `c+2` -- a **2-superblock-column lag**. One column would not be enough: `(r, c)`'s
+/// horizontal (top-edge) pass and `(r-1, c+1)`'s vertical (left-edge) pass both write a shared
+/// 8-sample corner where the superblocks meet, so with only a 1-column lead the row above could
+/// still be writing that corner. Each plane has its own `progress` counter array (superblock
+/// columns fully filtered per row); the `Release` store / `Acquire` load also publishes the pixels
+/// a worker wrote before the dependent worker reads them.
+///
+/// Bit-identical to the sequential per-plane raster order: every read/write dependency (left
+/// neighbour via same-thread ordering, above neighbour via the gate) is preserved. The three planes
+/// are independent, so fusing them into one scope (rather than three) changes only timing -- a
+/// worker that runs out of work in one plane flows straight into the next instead of idling at a
+/// per-plane barrier, and the per-frame thread spawns are paid once, not once per plane.
+#[allow(clippy::too_many_arguments)]
+fn wavefront_filter_planes(
+    planes: &mut [Plane; 3],
+    mi_grid: &MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    lvl_lookup: &LvlLookup,
+    sharpness: u8,
+    bit_depth: u8,
+    n_threads: usize,
+) {
+    let n_sb_rows = mi_rows.div_ceil(8) as usize;
+    let n_sb_cols = mi_cols.div_ceil(8) as usize;
+    // One `progress` array per plane: `progress[p][r]` = superblock columns fully filtered (both
+    // passes) in row `r` of plane `p`. Published with `Release`, awaited with `Acquire`.
+    let progress: [Vec<AtomicU32>; 3] =
+        std::array::from_fn(|_| (0..n_sb_rows).map(|_| AtomicU32::new(0)).collect());
+    let progress = &progress;
+    let [p0, p1, p2] = planes;
+    let views = [PlaneView::new(p0), PlaneView::new(p1), PlaneView::new(p2)];
+
+    std::thread::scope(|s| {
+        for t in 0..n_threads {
+            s.spawn(move || {
+                // Advance through the planes in order; each is an independent wavefront, so a worker
+                // that runs out of its rows in plane `p` flows straight into `p + 1` (no barrier).
+                for plane_idx in 0..3usize {
+                    // Private `Copy` of this plane's shared raw view; writes go to the one
+                    // underlying buffer, kept disjoint-in-time by the gate below.
+                    let mut view = views[plane_idx];
+                    let prog = &progress[plane_idx];
+                    let mut sb_row = t;
+                    while sb_row < n_sb_rows {
+                        let row = (sb_row * 8) as u32;
+                        for sb_col in 0..n_sb_cols {
+                            // Wavefront gate: wait until this plane's row above has finished column
+                            // `sb_col + 1` (the 2-superblock lag). Row 0 has no row above.
+                            if sb_row > 0 {
+                                let need = (sb_col as u32 + 2).min(n_sb_cols as u32);
+                                while prog[sb_row - 1].load(Ordering::Acquire) < need {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                            let col = (sb_col * 8) as u32;
+                            for pass in 0..2u32 {
+                                superblock_loop_filter(
+                                    &mut view,
+                                    mi_grid,
+                                    mi_cols,
+                                    mi_rows,
+                                    subsampling_x,
+                                    subsampling_y,
+                                    lvl_lookup,
+                                    sharpness,
+                                    plane_idx,
+                                    pass,
+                                    row,
+                                    col,
+                                    bit_depth,
+                                );
+                            }
+                            // Publish: this superblock (both passes) is done; unblock the row below.
+                            prog[sb_row].store(sb_col as u32 + 1, Ordering::Release);
+                        }
+                        sb_row += n_threads;
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// Frame-wide entry point for spec §8.8 "Loop filter process".
@@ -718,34 +993,68 @@ pub fn loop_filter_frame(
     bit_depth: u8,
 ) {
     let lvl_lookup = build_lvl_lookup(lf, seg);
+    let sharpness = lf.sharpness;
 
-    let mut row = 0u32;
-    while row < mi_rows {
-        let mut col = 0u32;
-        while col < mi_cols {
-            for plane_idx in 0..3usize {
-                for pass in 0..2u32 {
-                    superblock_loop_filter(
-                        planes,
-                        mi_grid,
-                        mi_cols,
-                        mi_rows,
-                        subsampling_x,
-                        subsampling_y,
-                        &lvl_lookup,
-                        lf.sharpness,
-                        plane_idx,
-                        pass,
-                        row,
-                        col,
-                        bit_depth,
-                    );
-                }
-            }
-            col += 8;
+    // Each plane is deblocked independently (disjoint buffers; `mi_grid`/`lvl_lookup` are shared
+    // read-only). Above `LF_PARALLEL_MIN_MI` each plane is filtered with the intra-plane wavefront
+    // (see `wavefront_filter_planes`) across `n_threads` workers; below it -- or with no usable
+    // parallelism -- the planes are filtered sequentially on this thread. Both paths preserve every
+    // plane's (row, col, pass) raster order spec §8.8 requires, so the output is bit-identical.
+    // Test-only override: force the sequential path so the parallel/sequential equality test can
+    // use the wavefront-engaging clips as their own reference.
+    #[cfg(feature = "test-support")]
+    let force_sequential = FORCE_SEQUENTIAL_LOOP_FILTER.load(Ordering::Relaxed);
+    #[cfg(not(feature = "test-support"))]
+    let force_sequential = false;
+
+    // Cheap gates first, so only frames that actually parallelize pay for the
+    // `available_parallelism()` query; `n_threads == 1` then funnels into the sequential path below.
+    let n_threads = if force_sequential || (mi_cols as u64) * (mi_rows as u64) < LF_PARALLEL_MIN_MI
+    {
+        1
+    } else {
+        let n_sb_rows = mi_rows.div_ceil(8) as usize;
+        // One worker per superblock row is the most the wavefront can use (more would idle); cap at
+        // the machine's parallelism.
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(n_sb_rows.max(1))
+    };
+
+    if n_threads <= 1 {
+        for (plane_idx, plane) in planes.iter_mut().enumerate() {
+            loop_filter_plane(
+                plane,
+                plane_idx,
+                mi_grid,
+                mi_cols,
+                mi_rows,
+                subsampling_x,
+                subsampling_y,
+                &lvl_lookup,
+                sharpness,
+                bit_depth,
+            );
         }
-        row += 8;
+        return;
     }
+
+    // All three planes are filtered in one fused wavefront pass (see `wavefront_filter_planes`): a
+    // single thread::scope whose workers flow across the independent planes, so no worker idles at a
+    // per-plane barrier and the per-frame thread spawns are paid once, not once per plane.
+    wavefront_filter_planes(
+        planes,
+        mi_grid,
+        mi_cols,
+        mi_rows,
+        subsampling_x,
+        subsampling_y,
+        &lvl_lookup,
+        sharpness,
+        bit_depth,
+        n_threads,
+    );
 }
 
 #[cfg(test)]
