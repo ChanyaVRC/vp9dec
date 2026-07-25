@@ -4,7 +4,9 @@
 //! Call sites (`src/lib.rs::decode_one_frame`, `src/tile/residual.rs`) hold a
 //! [`StageTimer`] for the duration of a stage; on drop it adds the elapsed time to a
 //! thread-local per-[`Stage`] counter. `reset`/`snapshot` let the caller (the bench
-//! example) zero the counters before a decode run and read them back after.
+//! example) zero the counters before a decode run and read them back after. Tile workers
+//! return their thread-local snapshots to the parent thread, which merges them before the
+//! benchmark reads the final snapshot.
 //!
 //! Zero-cost when the `bench-timing` feature is off: the `imp` module below is swapped
 //! for a stub whose `StageTimer` is a field-less struct with no `Drop` impl and an
@@ -77,6 +79,15 @@ mod imp {
         COUNTERS.with(|c| std::array::from_fn(|i| c[i].get()))
     }
 
+    /// Adds a worker thread's snapshot to the current thread's counters.
+    pub(crate) fn merge_snapshot(snapshot: &[u64; super::STAGE_COUNT]) {
+        COUNTERS.with(|c| {
+            for (cell, &nanos) in c.iter().zip(snapshot) {
+                cell.set(cell.get().saturating_add(nanos));
+            }
+        });
+    }
+
     /// RAII stage timer: [`StageTimer::start`] records the start instant; dropping it
     /// (end of the enclosing scope) adds the elapsed time to that stage's counter.
     pub struct StageTimer {
@@ -112,6 +123,9 @@ mod imp {
         [0; super::STAGE_COUNT]
     }
 
+    #[inline(always)]
+    pub(crate) fn merge_snapshot(_snapshot: &[u64; super::STAGE_COUNT]) {}
+
     /// Field-less stand-in: `start` is a no-op and there is no `Drop` impl, so this
     /// compiles away completely (see module docs).
     pub struct StageTimer;
@@ -124,4 +138,28 @@ mod imp {
     }
 }
 
+pub(crate) use imp::merge_snapshot;
 pub use imp::{reset, snapshot, StageTimer};
+
+#[cfg(all(test, feature = "bench-timing"))]
+mod tests {
+    use super::{merge_snapshot, reset, snapshot, Stage, STAGE_COUNT};
+
+    #[test]
+    fn merge_snapshot_adds_worker_counters() {
+        reset();
+        let mut first = [0; STAGE_COUNT];
+        first[Stage::InterPredict as usize] = 17;
+        first[Stage::TokenDequantTransform as usize] = 23;
+        let mut second = [0; STAGE_COUNT];
+        second[Stage::InterPredict as usize] = 5;
+
+        merge_snapshot(&first);
+        merge_snapshot(&second);
+
+        let merged = snapshot();
+        assert_eq!(merged[Stage::InterPredict as usize], 22);
+        assert_eq!(merged[Stage::TokenDequantTransform as usize], 23);
+        assert_eq!(merged[Stage::Total as usize], 0);
+    }
+}
