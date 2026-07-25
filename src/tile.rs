@@ -37,7 +37,7 @@ mod residual;
 
 pub use mv_pred::Mv;
 #[cfg(feature = "test-support")]
-pub use parallel::FORCE_SEQUENTIAL_TILES;
+pub use parallel::{FORCE_SEQUENTIAL_TILES, FORCE_TILE_WORKERS};
 
 use std::sync::Arc;
 
@@ -511,7 +511,10 @@ impl TileDecoder {
         let use_parallel =
             use_parallel && !FORCE_SEQUENTIAL_TILES.load(std::sync::atomic::Ordering::Relaxed);
         if use_parallel {
-            return self.decode_tiles_parallel(data, tile_cols);
+            let max_workers = parallel::available_tile_workers();
+            if max_workers > 1 {
+                return self.decode_tiles_parallel(data, tile_cols, max_workers);
+            }
         }
 
         let tiles = Self::split_tiles(data, (tile_rows * tile_cols) as usize)?;

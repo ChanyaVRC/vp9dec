@@ -18,6 +18,27 @@ use super::{check_tile_read_bounds, get_tile_offset, MiGrid, TileDecoder, TileEr
 pub static FORCE_SEQUENTIAL_TILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test/benchmark-only override for the worker count reported to tile dispatch. Zero keeps the
+/// platform's [`std::thread::available_parallelism`] result; a positive value makes the
+/// single-worker fallback and bounded parallel cases reproducible on any development machine.
+#[cfg(feature = "test-support")]
+pub static FORCE_TILE_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) fn available_tile_workers() -> usize {
+    #[cfg(feature = "test-support")]
+    {
+        let forced = FORCE_TILE_WORKERS.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
 impl TileDecoder {
     /// Builds a fresh worker `TileDecoder` that shares this frame's read-only / config state
     /// (cheap `Arc` / `Copy` clones) but gets its own zeroed mutable buffers, sized to the tile
@@ -183,6 +204,7 @@ impl TileDecoder {
         &mut self,
         data: &[u8],
         tile_cols: u32,
+        max_workers: usize,
     ) -> Result<(), TileError> {
         let tiles = Self::split_tiles(data, tile_cols as usize)?;
 
@@ -191,14 +213,13 @@ impl TileDecoder {
         // (see `spawn_column_worker`), so the strip buffers of all `tile_cols` workers sum to
         // ~one frame regardless of the declared tile count -- but a wide stream can still declare
         // hundreds of tile columns, and spawning that many threads (each with its own `Counts`)
-        // at once is an attacker-controllable multiplier. Processing columns in chunks of
-        // `available_parallelism()` caps thread count and per-chunk overhead regardless of the
-        // declared tile count. Columns are independent, so chunk boundaries do not affect the
-        // result, and the first error in column order is still what propagates.
-        let chunk = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .max(1) as u32;
+        // at once is an attacker-controllable multiplier. The caller supplies the machine's
+        // worker limit and has already ruled out the single-worker case, where the direct
+        // sequential tile loop avoids worker allocation, thread spawn/join, and strip merge
+        // overhead. Columns are independent, so chunk boundaries do not affect the result, and
+        // the first error in column order is still what propagates.
+        debug_assert!(max_workers > 1);
+        let chunk = max_workers.min(tile_cols as usize) as u32;
 
         let mut c0 = 0u32;
         while c0 < tile_cols {

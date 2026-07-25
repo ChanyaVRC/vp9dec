@@ -21,6 +21,9 @@
 //! # Per-stage timing breakdown (needs the bench-timing feature -- see src/bench_timing.rs;
 //! # without it the stage numbers are all-zero). Runs one extra decode pass per file.
 //! cargo run --release --features bench-timing --example bench -- --stages [files...]
+//!
+//! # Reproduce a tile-worker limit for dispatch benchmarks (needs test-support).
+//! cargo run --release --features test-support --example bench -- --tile-workers=1 [files...]
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -61,6 +64,7 @@ fn main() {
     // tos/sintel movies are 17k+ frames per iteration; for a stage-proportion profile a few
     // hundred frames of the same content is plenty and finishes in seconds.
     let mut max_frames: Option<u64> = None;
+    let mut tile_workers: Option<usize> = None;
     let mut files: Vec<PathBuf> = Vec::new();
 
     for arg in std::env::args().skip(1) {
@@ -75,9 +79,21 @@ fn main() {
                 n.parse()
                     .unwrap_or_else(|_| panic!("--max-frames=N: N must be an integer, got {n:?}")),
             );
+        } else if let Some(n) = arg.strip_prefix("--tile-workers=") {
+            let n = n.parse().unwrap_or_else(|_| {
+                panic!("--tile-workers=N: N must be a positive integer, got {n:?}")
+            });
+            assert!(n > 0, "--tile-workers=N: N must be positive");
+            tile_workers = Some(n);
         } else {
             files.push(PathBuf::from(arg));
         }
+    }
+    if let Some(n) = tile_workers {
+        #[cfg(feature = "test-support")]
+        vp9dec::tile::FORCE_TILE_WORKERS.store(n, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "test-support"))]
+        panic!("--tile-workers requires --features test-support");
     }
     if files.is_empty() {
         let vectors_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -98,6 +114,9 @@ fn main() {
         }
     );
     println!("iterations per clip: {iters}\n");
+    if let Some(n) = tile_workers {
+        println!("forced tile workers: {n}\n");
+    }
 
     let mut total_megapixels = 0.0f64;
     let mut total_min_secs = 0.0f64;
