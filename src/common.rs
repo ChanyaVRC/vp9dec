@@ -4,6 +4,28 @@
 
 use crate::prob_tables::{BLOCK_8X8, MAX_TXSIZE_LOOKUP, SS_SIZE_LOOKUP, TX_4X4};
 
+/// Spec §4.6 `Clip3(x, y, z)` for the decoder's signed arithmetic paths.
+#[inline]
+pub(crate) fn clip3(low: i32, high: i32, value: i32) -> i32 {
+    if value < low {
+        low
+    } else if value > high {
+        high
+    } else {
+        value
+    }
+}
+
+/// Spec §4.7 `Round2(x, n)` for the decoder's `i32` prediction/filter paths.
+#[inline]
+pub(crate) fn round2(value: i32, bits: u32) -> i32 {
+    if bits == 0 {
+        value
+    } else {
+        (value + (1 << (bits - 1))) >> bits
+    }
+}
+
 /// `MAX_SEGMENTS` (spec §3). The number of `segment_id` values / size of the
 /// segmentation-map-indexed arrays.
 pub const MAX_SEGMENTS: usize = 8;
@@ -23,3 +45,7 @@ pub fn get_uv_tx_size(mi_size: u8, tx_size: u8, subsampling_x: u32, subsampling_
     let plane_sz = SS_SIZE_LOOKUP[mi_size as usize][subsampling_x as usize][subsampling_y as usize];
     tx_size.min(MAX_TXSIZE_LOOKUP[plane_sz as usize])
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/common.rs"]
+mod tests;

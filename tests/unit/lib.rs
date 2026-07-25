@@ -101,9 +101,10 @@ fn prev_segment_ids_reset_lifecycle() {
 /// A `FrameContext` distinguishable from `FrameContext::default()`, standing in for a
 /// context that has been backward-adapted (spec §8.4) away from its default values.
 fn adapted_context() -> FrameContext {
-    let mut ctx = FrameContext::default();
-    ctx.mv_hp_prob = [1, 2];
-    ctx
+    FrameContext {
+        mv_hp_prob: [1, 2],
+        ..FrameContext::default()
+    }
 }
 
 /// End-to-end check of `frame_context_reset`'s output against `FrameContextStore`:

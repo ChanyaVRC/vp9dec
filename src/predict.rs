@@ -18,6 +18,7 @@
 //! available; [`block_inter_predict_scalar`] is the always-kept fallback and
 //! the bit-exactness oracle the SIMD unit tests pin against.
 
+use crate::common::{clip3, round2};
 use crate::framebuffer::Plane;
 use crate::prob_tables::{
     BLOCK_8X8, D117_PRED, D135_PRED, D153_PRED, D207_PRED, D45_PRED, D63_PRED, DC_PRED, H_PRED,
@@ -27,20 +28,6 @@ use crate::subpel::{
     INTERP_EXTEND, REF_SCALE_SHIFT, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, SUBPEL_SHIFTS,
 };
 use crate::tile::Mv;
-
-#[inline]
-fn round2(x: i32, n: u32) -> i32 {
-    if n == 0 {
-        x
-    } else {
-        (x + (1 << (n - 1))) >> n
-    }
-}
-
-#[inline]
-fn clip3(low: i32, high: i32, v: i32) -> i32 {
-    v.clamp(low, high)
-}
 
 /// Spec §8.5.1's `predict_intra` process.
 ///
@@ -614,7 +601,7 @@ fn block_inter_predict(
 /// Scalar body of [`block_inter_predict`] (the spec §8.5.2.4 two-pass loops, verbatim): the
 /// always-kept fallback for every case the AVX2 kernels don't take (`VP9DEC_NO_SIMD=1`, edge
 /// blocks near reference-frame borders on the unscaled path, non-x86_64), and the
-/// bit-exactness oracle `src/simd/tests.rs`'s unit tests pin the kernels against (hence
+/// bit-exactness oracle `tests/unit/simd.rs`'s unit tests pin the kernels against (hence
 /// `pub(crate)`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn block_inter_predict_scalar(
@@ -729,66 +716,5 @@ pub fn predict_inter(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::prob_tables::TX_4X4 as TX4;
-
-    fn make_plane(width: usize, height: usize, fill: u8) -> Plane {
-        let mut p = Plane::new(width, height);
-        for y in 0..height {
-            for x in 0..width {
-                p.set(x, y, fill as u16);
-            }
-        }
-        p
-    }
-
-    #[test]
-    fn dc_pred_with_no_neighbors_uses_bit_depth_midpoint() {
-        let mut plane = Plane::new(8, 8);
-        predict_intra(&mut plane, 0, 0, false, false, false, TX4, DC_PRED, 7, 7, 8);
-        assert_eq!(plane.get(0, 0), 128);
-        assert_eq!(plane.get(3, 3), 128);
-    }
-
-    #[test]
-    fn v_pred_copies_above_row() {
-        let mut plane = make_plane(8, 8, 0);
-        for x in 0..4 {
-            plane.set(x, 3, 50 + x as u16);
-        }
-        predict_intra(&mut plane, 0, 4, false, true, false, TX4, V_PRED, 7, 7, 8);
-        for x in 0..4 {
-            assert_eq!(plane.get(x, 4), 50 + x as u16);
-            assert_eq!(plane.get(x, 5), 50 + x as u16);
-        }
-    }
-
-    #[test]
-    fn h_pred_copies_left_col() {
-        let mut plane = make_plane(8, 8, 0);
-        for y in 0..4 {
-            plane.set(3, y, 60 + y as u16);
-        }
-        predict_intra(&mut plane, 4, 0, true, false, false, TX4, H_PRED, 7, 7, 8);
-        for y in 0..4 {
-            assert_eq!(plane.get(4, y), 60 + y as u16);
-            assert_eq!(plane.get(5, y), 60 + y as u16);
-        }
-    }
-
-    #[test]
-    fn tm_pred_clips_to_valid_range() {
-        let mut plane = make_plane(8, 8, 0);
-        for x in 0..4 {
-            plane.set(4 + x, 3, 255);
-        }
-        for y in 0..4 {
-            plane.set(3, 4 + y, 255);
-        }
-        plane.set(3, 3, 0);
-        predict_intra(&mut plane, 4, 4, true, true, false, TX4, TM_PRED, 7, 7, 8);
-        // 255 + 255 - 0 is clipped to 255.
-        assert_eq!(plane.get(4, 4), 255);
-    }
-}
+#[path = "../tests/unit/predict.rs"]
+mod tests;

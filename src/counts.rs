@@ -19,12 +19,71 @@ pub type TokenCounts = [[[[[[u32; 3]; 6]; 6]; 2]; 2]; 4];
 /// `counts_more_coefs[TX_SIZES][BLOCK_TYPES][REF_TYPES][COEF_BANDS][PREV_COEF_CONTEXTS][2]`.
 pub type MoreCoefsCounts = [[[[[[u32; 2]; 6]; 6]; 2]; 2]; 4];
 
-/// All counter arrays enumerated by the "Clear counts process" in spec §8.3.
+/// Element-wise wrapping addition helpers for the fixed-size counter fields.
 ///
-/// `#[repr(C)]` + the `const` size assertion below make [`Counts::add_assign`]'s flat-`u32`
-/// reinterpretation sound by construction (guaranteed field-order layout, provably no
-/// padding), not by layout luck.
-#[repr(C)]
+/// Only the runtime-slice loop stays out of line. The dimensional helpers safely flatten each
+/// fixed-size array without exposing fixed trip counts to release LTO's loop optimizer.
+#[inline(never)]
+fn add_counter_slice(dst: &mut [u32], src: &[u32]) {
+    debug_assert_eq!(dst.len(), src.len());
+    for (dst, src) in dst.iter_mut().zip(src) {
+        *dst = dst.wrapping_add(*src);
+    }
+}
+
+fn add_counter_1d<const A: usize>(dst: &mut [u32; A], src: &[u32; A]) {
+    add_counter_slice(dst, src);
+}
+
+fn add_counter_2d<const A: usize, const B: usize>(dst: &mut [[u32; B]; A], src: &[[u32; B]; A]) {
+    add_counter_slice(dst.as_flattened_mut(), src.as_flattened());
+}
+
+fn add_counter_3d<const A: usize, const B: usize, const C: usize>(
+    dst: &mut [[[u32; C]; B]; A],
+    src: &[[[u32; C]; B]; A],
+) {
+    add_counter_slice(
+        dst.as_flattened_mut().as_flattened_mut(),
+        src.as_flattened().as_flattened(),
+    );
+}
+
+type CounterArray6<
+    const A: usize,
+    const B: usize,
+    const C: usize,
+    const D: usize,
+    const E: usize,
+    const F: usize,
+> = [[[[[[u32; F]; E]; D]; C]; B]; A];
+
+fn add_counter_6d<
+    const A: usize,
+    const B: usize,
+    const C: usize,
+    const D: usize,
+    const E: usize,
+    const F: usize,
+>(
+    dst: &mut CounterArray6<A, B, C, D, E, F>,
+    src: &CounterArray6<A, B, C, D, E, F>,
+) {
+    add_counter_slice(
+        dst.as_flattened_mut()
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .as_flattened_mut(),
+        src.as_flattened()
+            .as_flattened()
+            .as_flattened()
+            .as_flattened()
+            .as_flattened(),
+    );
+}
+
+/// All counter arrays enumerated by the "Clear counts process" in spec §8.3.
 #[derive(Debug, Clone)]
 pub struct Counts {
     pub intra_mode: [[u32; 10]; 4],
@@ -52,36 +111,6 @@ pub struct Counts {
     pub token: TokenCounts,
     pub more_coefs: MoreCoefsCounts,
 }
-
-/// Compile-time no-padding proof for [`Counts::add_assign`]: with `#[repr(C)]` the struct is
-/// laid out field-by-field in declaration order, so its size equals the summed field sizes
-/// exactly when there is no padding anywhere. Adding/reshaping a field breaks this assertion
-/// until the sum (and `add_assign`'s flat view) is re-audited.
-const _: () = assert!(
-    std::mem::size_of::<Counts>()
-        == std::mem::size_of::<[[u32; 10]; 4]>()      // intra_mode
-            + std::mem::size_of::<[[u32; 10]; 10]>()  // uv_mode
-            + std::mem::size_of::<[[u32; 4]; 16]>()   // partition
-            + std::mem::size_of::<[[u32; 3]; 4]>()    // interp_filter
-            + std::mem::size_of::<[[u32; 4]; 7]>()    // inter_mode
-            + std::mem::size_of::<[[[u32; 4]; 2]; 4]>() // tx_size
-            + std::mem::size_of::<[[u32; 2]; 4]>()    // is_inter
-            + std::mem::size_of::<[[u32; 2]; 5]>()    // comp_mode
-            + std::mem::size_of::<[[[u32; 2]; 2]; 5]>() // single_ref
-            + std::mem::size_of::<[[u32; 2]; 5]>()    // comp_ref
-            + std::mem::size_of::<[[u32; 2]; 3]>()    // skip
-            + std::mem::size_of::<[u32; 4]>()         // mv_joint
-            + std::mem::size_of::<[[u32; 2]; 2]>()    // mv_sign
-            + std::mem::size_of::<[[u32; 11]; 2]>()   // mv_class
-            + std::mem::size_of::<[[u32; 2]; 2]>()    // mv_class0_bit
-            + std::mem::size_of::<[[[u32; 4]; 2]; 2]>() // mv_class0_fr
-            + std::mem::size_of::<[[u32; 2]; 2]>()    // mv_class0_hp
-            + std::mem::size_of::<[[[u32; 2]; 10]; 2]>() // mv_bits
-            + std::mem::size_of::<[[u32; 4]; 2]>()    // mv_fr
-            + std::mem::size_of::<[[u32; 2]; 2]>()    // mv_hp
-            + std::mem::size_of::<TokenCounts>()      // token
-            + std::mem::size_of::<MoreCoefsCounts>() // more_coefs
-);
 
 impl Default for Counts {
     fn default() -> Self {
@@ -122,23 +151,56 @@ impl Counts {
     /// total before backward probability adaptation. Order-independent (integer addition is
     /// associative/commutative), so the merged total is identical to a single-threaded decode's.
     ///
-    /// Every field of `Counts` is a `u32` array, so the struct is a contiguous block of `u32`
-    /// with no padding; summing the flat `u32` view is exactly a field-wise sum but avoids
-    /// enumerating all 28 fields. `#[repr(C)]` + the `const` size assertion at the struct
-    /// prove the no-padding layout at compile time; the sibling unit test additionally checks
-    /// the summing behavior across field shapes.
+    /// The exhaustive destructuring below intentionally has no `..`: adding a new field to
+    /// `Counts` fails to compile until its merge is added here as well.
     pub fn add_assign(&mut self, other: &Counts) {
-        debug_assert_eq!(std::mem::size_of::<Counts>() % 4, 0);
-        let n = std::mem::size_of::<Counts>() / 4;
-        // SAFETY: `Counts` is `#[repr(C)]` with only `u32`-array fields and provably no
-        // padding (the `const` assertion above), so it is soundly viewed as `n` contiguous
-        // `u32`s; `self` and `other` are the same type, so their flat views line up
-        // field-for-field.
-        let dst = unsafe { std::slice::from_raw_parts_mut(self as *mut Counts as *mut u32, n) };
-        let src = unsafe { std::slice::from_raw_parts(other as *const Counts as *const u32, n) };
-        for (d, &s) in dst.iter_mut().zip(src.iter()) {
-            *d = d.wrapping_add(s);
-        }
+        let Counts {
+            intra_mode,
+            uv_mode,
+            partition,
+            interp_filter,
+            inter_mode,
+            tx_size,
+            is_inter,
+            comp_mode,
+            single_ref,
+            comp_ref,
+            skip,
+            mv_joint,
+            mv_sign,
+            mv_class,
+            mv_class0_bit,
+            mv_class0_fr,
+            mv_class0_hp,
+            mv_bits,
+            mv_fr,
+            mv_hp,
+            token,
+            more_coefs,
+        } = self;
+
+        add_counter_2d(intra_mode, &other.intra_mode);
+        add_counter_2d(uv_mode, &other.uv_mode);
+        add_counter_2d(partition, &other.partition);
+        add_counter_2d(interp_filter, &other.interp_filter);
+        add_counter_2d(inter_mode, &other.inter_mode);
+        add_counter_3d(tx_size, &other.tx_size);
+        add_counter_2d(is_inter, &other.is_inter);
+        add_counter_2d(comp_mode, &other.comp_mode);
+        add_counter_3d(single_ref, &other.single_ref);
+        add_counter_2d(comp_ref, &other.comp_ref);
+        add_counter_2d(skip, &other.skip);
+        add_counter_1d(mv_joint, &other.mv_joint);
+        add_counter_2d(mv_sign, &other.mv_sign);
+        add_counter_2d(mv_class, &other.mv_class);
+        add_counter_2d(mv_class0_bit, &other.mv_class0_bit);
+        add_counter_3d(mv_class0_fr, &other.mv_class0_fr);
+        add_counter_2d(mv_class0_hp, &other.mv_class0_hp);
+        add_counter_3d(mv_bits, &other.mv_bits);
+        add_counter_2d(mv_fr, &other.mv_fr);
+        add_counter_2d(mv_hp, &other.mv_hp);
+        add_counter_6d(token, &other.token);
+        add_counter_6d(more_coefs, &other.more_coefs);
     }
 }
 
@@ -364,51 +426,5 @@ pub fn adapt_noncoef_probs(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn add_assign_sums_counters_across_all_field_shapes() {
-        // Guards the flat-u32-reinterpret layout assumption in `Counts::add_assign`: set fields of
-        // several different shapes (2D/1D/6D nested arrays, first/middle/last struct fields) and
-        // confirm each sums independently, and that an untouched field stays 0.
-        let mut a = Counts::new();
-        let mut b = Counts::new();
-        a.intra_mode[1][2] = 5; // first field
-        a.mv_joint[3] = 4;
-        a.token[3][1][0][5][4][2] = 7; // second-to-last field
-        b.intra_mode[1][2] = 10;
-        b.mv_joint[3] = 100;
-        b.token[3][1][0][5][4][2] = 1;
-        b.more_coefs[2][1][1][3][2][0] = 9; // last field
-        a.add_assign(&b);
-        assert_eq!(a.intra_mode[1][2], 15);
-        assert_eq!(a.mv_joint[3], 104);
-        assert_eq!(a.token[3][1][0][5][4][2], 8);
-        assert_eq!(a.more_coefs[2][1][1][3][2][0], 9);
-        assert_eq!(a.uv_mode[0][0], 0, "untouched field must stay 0");
-    }
-
-    #[test]
-    fn merge_prob_with_no_observations_keeps_preprob_untouched_direction() {
-        // When den == 0, prob=128 and count=0, so factor=0, and out=preProb is returned as-is.
-        assert_eq!(merge_prob(200, 0, 0, 20, 128), 200);
-    }
-
-    #[test]
-    fn merge_prob_saturates_toward_observed_ratio_with_enough_counts() {
-        // ct0=0, ct1=100 (reaches count_sat=20) -> when factor=maxUpdateFactor=128,
-        // outProb moves away from preProb toward 1, roughly Round2( preProb*128 + 1*128, 8 ).
-        let out = merge_prob(200, 0, 100, 20, 128);
-        assert!(out < 200);
-    }
-
-    #[test]
-    fn merge_probs_binary_tree_updates_single_prob() {
-        let mut probs = [100u8, 0, 0];
-        let counts = [10u32, 30u32];
-        merge_probs(&BINARY_TREE, 0, &mut probs, &counts, 20, 128);
-        // Since ct1 (=30) is larger, prob moves in the decreasing direction.
-        assert!(probs[0] < 100);
-    }
-}
+#[path = "../tests/unit/counts.rs"]
+mod tests;

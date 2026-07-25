@@ -174,11 +174,14 @@ impl Default for PersistentState {
 }
 
 /// A parsed uncompressed frame header.
+// `New` is the overwhelmingly common path and is consumed immediately by the decoder; boxing it
+// would add one heap allocation to every newly decoded frame merely to shrink this transient enum.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameHeader {
     /// `show_existing_frame == 1`. No new decode is performed; the frame at the given index is displayed.
     ShowExistingFrame { frame_to_show_map_idx: u8 },
-    /// A newly decoded frame (only `frame_type == KEY_FRAME` in M1).
+    /// A newly decoded frame with the remaining uncompressed-header fields.
     New(NewFrameHeader),
 }
 
@@ -534,6 +537,24 @@ pub struct SegmentationParams {
     pub feature_data: SegFeatureData,
 }
 
+impl Default for SegmentationParams {
+    /// A disabled segmentation configuration with neutral "not coded" probabilities and no
+    /// active features. This is the initial/test-fixture state; frame parsing still preserves
+    /// feature state explicitly when the bitstream does not update it.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            update_map: false,
+            tree_probs: [255; 7],
+            pred_prob: [255; 3],
+            temporal_update: false,
+            abs_or_delta_update: false,
+            feature_enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+            feature_data: [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
+        }
+    }
+}
+
 /// `segmentation_params()` (spec §6.2.11). `reset`/`prev_features` mirror
 /// [`parse_loop_filter_params`]'s `reset`/`prev_deltas`: `reset` is
 /// `FrameIsIntra || error_resilient_mode` (the `setup_past_independence()`
@@ -836,4 +857,5 @@ pub fn parse_uncompressed_header(
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/header.rs"]
 mod tests;

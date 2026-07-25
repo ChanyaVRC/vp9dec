@@ -704,4 +704,5 @@ impl TileDecoder {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/tile/mode_info.rs"]
 mod tests;

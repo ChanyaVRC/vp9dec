@@ -2,10 +2,10 @@
 //!
 //! The official multi-tile vectors (`vp90-2-08-tile_1x{2,4,8}`) normally take the tile-parallel
 //! fast path (`tile::decode_tiles_parallel`, engaged for >1 tile column and 1 tile row). This
-//! test decodes each vector normally (parallel) and with one available tile worker (automatic
-//! sequential fallback). Every displayed frame's planes must match exactly, pinning both
-//! dispatch modes and the column-strip worker buffers + merge against the sequential reference.
-//! Skips cleanly if the vectors haven't been downloaded.
+//! test forces two available tile workers (parallel) and then one worker (automatic sequential
+//! fallback), so both dispatch modes are covered even on a single-core CI runner. Every displayed
+//! frame's planes must match exactly, pinning the column-strip worker buffers + merge against the
+//! sequential reference. Skips cleanly if the vectors haven't been downloaded.
 
 mod common;
 
@@ -45,8 +45,8 @@ fn parallel_tile_decode_matches_sequential_byte_for_byte() {
             continue;
         };
 
+        FORCE_TILE_WORKERS.store(2, Ordering::Relaxed);
         let parallel = decode_displayed_frames(&bytes);
-
         FORCE_TILE_WORKERS.store(1, Ordering::Relaxed);
         let sequential = decode_displayed_frames(&bytes);
         FORCE_TILE_WORKERS.store(0, Ordering::Relaxed);

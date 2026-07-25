@@ -2,9 +2,9 @@
 //! [`crate::bool_coder::BoolDecoder`], [`BitWriter`] for the raw bit-level uncompressed-header
 //! reader), used to hand-build synthetic bitstreams for round-trip tests.
 //!
-//! Used directly by unit tests inside `src/` (via `#[cfg(test)]`), and by integration tests
-//! under `tests/` via the `test-support` feature, which this crate's own dev-dependency on
-//! itself enables. Never compiled into a normal release build.
+//! Used by unit and integration tests under `tests/`; integration tests access it via the
+//! `test-support` feature, which this crate's own dev-dependency on itself enables. Never
+//! compiled into a normal release build.
 
 /// A bool encoder for tests only.
 ///

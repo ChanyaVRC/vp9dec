@@ -1,85 +1,10 @@
 //! Unit tests for the `tile` module (split out per the out-of-line test convention).
 
 use super::*;
-use crate::header::{ColorConfig, FrameType, LoopFilterParams, NewFrameHeader, QuantizationParams};
-use crate::prob_tables::{
-    BLOCK_4X4, BLOCK_64X64 as B64, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, ONLY_4X4, SINGLE_REFERENCE,
+use crate::prob_tables::{BLOCK_4X4, BLOCK_64X64 as B64, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS};
+use crate::unit_test_support::{
+    minimal_compressed_header, minimal_new_frame_header as minimal_header, BoolEncoder,
 };
-use crate::test_support::BoolEncoder;
-
-/// A disabled `SegmentationParams` (the M2 default / most existing tests).
-fn no_segmentation() -> crate::header::SegmentationParams {
-    crate::header::SegmentationParams {
-        enabled: false,
-        update_map: false,
-        tree_probs: [255; 7],
-        pred_prob: [255; 3],
-        temporal_update: false,
-        abs_or_delta_update: false,
-        feature_enabled: [[false; 4]; 8],
-        feature_data: [[0; 4]; 8],
-    }
-}
-
-/// Builds a minimal `NewFrameHeader` for tests. An 8x8 (1 MI, 1 SB) key frame.
-fn minimal_header(width: u32, height: u32) -> NewFrameHeader {
-    NewFrameHeader {
-        profile: 0,
-        frame_type: FrameType::KeyFrame,
-        show_frame: true,
-        error_resilient_mode: false,
-        frame_is_intra: true,
-        intra_only: false,
-        reset_frame_context: 0,
-        ref_frame_idx: [0, 0, 0],
-        ref_frame_sign_bias: [false; 4],
-        allow_high_precision_mv: false,
-        interpolation_filter: crate::prob_tables::SWITCHABLE,
-        color_config: Some(ColorConfig {
-            bit_depth: 8,
-            color_space: 0,
-            color_range: false,
-            subsampling_x: 1,
-            subsampling_y: 1,
-        }),
-        width,
-        height,
-        render_width: width,
-        render_height: height,
-        refresh_frame_flags: 0xFF,
-        refresh_frame_context: true,
-        frame_parallel_decoding_mode: false,
-        frame_context_idx: 0,
-        loop_filter: LoopFilterParams {
-            level: 0,
-            sharpness: 0,
-            delta_enabled: false,
-            ref_deltas: [1, 0, -1, -1],
-            mode_deltas: [0, 0],
-        },
-        quantization: QuantizationParams {
-            base_q_idx: 0,
-            delta_q_y_dc: 0,
-            delta_q_uv_dc: 0,
-            delta_q_uv_ac: 0,
-            lossless: true,
-        },
-        segmentation: no_segmentation(),
-        tile_cols_log2: 0,
-        tile_rows_log2: 0,
-        header_size_in_bytes: 0,
-    }
-}
-
-fn default_compressed_header() -> CompressedHeader {
-    CompressedHeader {
-        tx_mode: ONLY_4X4,
-        probs: Arc::new(CompressedHeaderProbs::default()),
-        reference_mode: SINGLE_REFERENCE,
-        comp_fixed_ref: 0,
-        comp_var_ref: [0, 0],
-    }
-}
 
 #[test]
 fn get_tile_offset_matches_spec_formula() {
@@ -100,7 +25,7 @@ fn single_skip_block_decodes_without_residual_error() {
     // hasRows = (r+0) < 1 = true (r=0), hasCols = true. So from the top level,
     // has_rows=has_cols=true and the whole tree must be read.
     let header = minimal_header(8, 8);
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
     let mut enc = BoolEncoder::new();
@@ -147,7 +72,7 @@ fn non_skip_block_with_immediate_eob_decodes_successfully() {
     // immediate-EOB path: it must still update the EOB adaptation count while leaving the
     // already-predicted pixels unchanged.
     let header = minimal_header(8, 8);
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
     let mut enc = BoolEncoder::new();
@@ -191,7 +116,7 @@ fn column_worker_strips_are_sized_and_merged_by_absolute_position() {
     // padded grid 32 columns. Two tile columns as get_tile_offset would split them: [0,16)
     // and [16,25) (the last tile ends at MiCols).
     let header = minimal_header(200, 80);
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
     let mut w0 = decoder.spawn_column_worker(0, 16);
@@ -230,7 +155,7 @@ fn invalid_tile_size_is_rejected() {
     // tile_cols_log2 to 1 to require a tile size field.
     let mut header = header;
     header.tile_cols_log2 = 1;
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
     // Less than 4 bytes, so not even the tile size field can be read.

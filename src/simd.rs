@@ -22,6 +22,7 @@ mod loop_filter;
 mod transform;
 
 #[cfg(all(test, target_arch = "x86_64"))]
+#[path = "../tests/unit/simd.rs"]
 mod tests;
 
 pub use inter::{

@@ -529,12 +529,20 @@ impl TileDecoder {
                 self.mi_col_start = get_tile_offset(tile_col, self.mi_cols, self.tile_cols_log2);
                 self.mi_col_end = get_tile_offset(tile_col + 1, self.mi_cols, self.tile_cols_log2);
 
-                let mut r = BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
-                self.decode_tile(&mut r)?;
-                check_tile_read_bounds(&r, tile_bytes)?;
-                r.exit_bool();
+                self.decode_tile_bytes(tile_bytes)?;
             }
         }
+        Ok(())
+    }
+
+    /// Decodes one already-split tile and performs the shared arithmetic-reader completion
+    /// checks. Both the sequential loop above and the tile-column workers use this exact
+    /// lifecycle so malformed-tile handling cannot drift between the two paths.
+    fn decode_tile_bytes(&mut self, tile_bytes: &[u8]) -> Result<(), TileError> {
+        let mut r = BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
+        self.decode_tile(&mut r)?;
+        check_tile_read_bounds(&r, tile_bytes)?;
+        r.exit_bool();
         Ok(())
     }
 
@@ -744,4 +752,5 @@ impl TileDecoder {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/tile.rs"]
 mod tests;

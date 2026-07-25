@@ -1,7 +1,7 @@
 //! Unit tests for the `header` module (split out per the out-of-line test convention).
 
 use super::*;
-use crate::test_support::BitWriter;
+use crate::unit_test_support::BitWriter;
 
 /// Builds a minimal key frame uncompressed header.
 /// profile=0, 8x8, lossless, segmentation disabled, no tile split.
