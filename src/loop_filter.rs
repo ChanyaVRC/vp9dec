@@ -66,6 +66,18 @@ const LF_PARALLEL_MIN_MI: u64 = 4096;
 pub static FORCE_SEQUENTIAL_LOOP_FILTER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only knob: forces eligible frames to use at least two wavefront workers even on a
+/// single-logical-CPU test host. See [`FORCE_SEQUENTIAL_LOOP_FILTER`].
+#[cfg(feature = "test-support")]
+pub static FORCE_PARALLEL_LOOP_FILTER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only count of calls to [`wavefront_filter_planes`], used to reject a vacuous
+/// parallel-vs-sequential equality test.
+#[cfg(feature = "test-support")]
+pub static WAVEFRONT_INVOCATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// `LvlLookup[ segmentId ][ ref ][ mode ]` (spec §8.8.1).
 type LvlLookup = [[[i32; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SEGMENTS];
 
@@ -913,6 +925,9 @@ fn wavefront_filter_planes(
     bit_depth: u8,
     n_threads: usize,
 ) {
+    #[cfg(feature = "test-support")]
+    WAVEFRONT_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+
     let n_sb_rows = mi_rows.div_ceil(8) as usize;
     let n_sb_cols = mi_cols.div_ceil(8) as usize;
     // One `progress` array per plane: `progress[p][r]` = superblock columns fully filtered (both
@@ -1006,20 +1021,31 @@ pub fn loop_filter_frame(
     let force_sequential = FORCE_SEQUENTIAL_LOOP_FILTER.load(Ordering::Relaxed);
     #[cfg(not(feature = "test-support"))]
     let force_sequential = false;
+    #[cfg(feature = "test-support")]
+    let force_parallel = FORCE_PARALLEL_LOOP_FILTER.load(Ordering::Relaxed);
+    #[cfg(not(feature = "test-support"))]
+    let force_parallel = false;
 
     // Cheap gates first, so only frames that actually parallelize pay for the
     // `available_parallelism()` query; `n_threads == 1` then funnels into the sequential path below.
-    let n_threads = if force_sequential || (mi_cols as u64) * (mi_rows as u64) < LF_PARALLEL_MIN_MI
+    let n_threads = if force_sequential
+        || (!force_parallel && (mi_cols as u64) * (mi_rows as u64) < LF_PARALLEL_MIN_MI)
     {
         1
     } else {
         let n_sb_rows = mi_rows.div_ceil(8) as usize;
         // One worker per superblock row is the most the wavefront can use (more would idle); cap at
-        // the machine's parallelism.
-        std::thread::available_parallelism()
+        // the machine's parallelism. The test-only override raises the floor to two workers so
+        // the equality test cannot silently exercise the sequential path on a one-CPU host.
+        let available = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(1)
-            .min(n_sb_rows.max(1))
+            .unwrap_or(1);
+        let available = if force_parallel {
+            available.max(2)
+        } else {
+            available
+        };
+        available.min(n_sb_rows.max(1))
     };
 
     if n_threads <= 1 {
