@@ -607,19 +607,22 @@ impl Decoder {
                 .save(header.effective_frame_context_idx(), final_probs);
         }
 
-        // Reference frame update process (spec §8.10). Arc-wrapped so `Dpb::update` shares
-        // this frame's pixel data across every refreshed slot instead of deep-cloning it
-        // per slot (up to 8x on a keyframe).
-        let ref_data = Arc::new(build_ref_frame_data(
-            tile_decoder.planes(),
-            header.width,
-            header.height,
-            &color_config,
-        ));
-        self.dpb.update(header.refresh_frame_flags, &ref_data);
-        for (slot, size) in self.persist.ref_frame_sizes.iter_mut().enumerate() {
-            if (header.refresh_frame_flags >> slot) & 1 == 1 {
-                *size = (header.width, header.height);
+        // Reference frame update process (spec §8.10). A zero refresh mask changes no DPB slot,
+        // so avoid cropping and copying all three planes for data that would be discarded.
+        if header.refresh_frame_flags != 0 {
+            // Arc-wrapped so `Dpb::update` shares this frame's pixel data across every refreshed
+            // slot instead of deep-cloning it per slot (up to 8x on a keyframe).
+            let ref_data = Arc::new(build_ref_frame_data(
+                tile_decoder.planes(),
+                header.width,
+                header.height,
+                &color_config,
+            ));
+            self.dpb.update(header.refresh_frame_flags, &ref_data);
+            for (slot, size) in self.persist.ref_frame_sizes.iter_mut().enumerate() {
+                if (header.refresh_frame_flags >> slot) & 1 == 1 {
+                    *size = (header.width, header.height);
+                }
             }
         }
 
