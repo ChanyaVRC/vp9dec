@@ -212,24 +212,34 @@ impl TileDecoder {
                 })
                 .collect();
 
-            let results: Vec<Result<(), TileError>> = std::thread::scope(|scope| {
+            let results: Vec<(
+                Result<(), TileError>,
+                [u64; crate::bench_timing::STAGE_COUNT],
+            )> = std::thread::scope(|scope| {
                 let handles: Vec<_> = workers
                     .iter_mut()
                     .zip(tiles[c0 as usize..c1 as usize].iter())
                     .map(|(w, &tile_bytes)| {
-                        scope.spawn(move || -> Result<(), TileError> {
-                            let mut r =
-                                BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
-                            w.decode_tile(&mut r)?;
-                            check_tile_read_bounds(&r, tile_bytes)?;
-                            r.exit_bool();
-                            Ok(())
+                        scope.spawn(move || {
+                            crate::bench_timing::reset();
+                            let result = (|| -> Result<(), TileError> {
+                                let mut r =
+                                    BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
+                                w.decode_tile(&mut r)?;
+                                check_tile_read_bounds(&r, tile_bytes)?;
+                                r.exit_bool();
+                                Ok(())
+                            })();
+                            (result, crate::bench_timing::snapshot())
                         })
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             });
-            for res in results {
+            for (_, snapshot) in &results {
+                crate::bench_timing::merge_snapshot(snapshot);
+            }
+            for (res, _) in results {
                 res?;
             }
             for w in &workers {

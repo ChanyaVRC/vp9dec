@@ -209,6 +209,9 @@ fn print_stage_breakdown(ivf_bytes: &[u8], max_frames: Option<u64>) {
     let total_ns = snap[0] as f64;
 
     println!("  -- stage breakdown --");
+    println!(
+        "  note: indented TileDecode stages sum worker elapsed time; their Total-wall % may exceed 100%"
+    );
     for (name, ns) in STAGE_NAMES.iter().zip(snap.iter()) {
         let ms = *ns as f64 / 1e6;
         let pct = if total_ns > 0.0 {
