@@ -39,7 +39,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::common::{get_uv_tx_size, INTRA_FRAME, MAX_SEGMENTS};
+use crate::common::{clip3, get_uv_tx_size, round2, INTRA_FRAME, MAX_SEGMENTS};
 use crate::framebuffer::Plane;
 use crate::header::{LoopFilterParams, SegmentationParams, SEG_LVL_ALT_L};
 use crate::prob_tables::{
@@ -184,20 +184,6 @@ impl PlaneAccess for PlaneView {
     fn lf_stride(&self) -> usize {
         self.stride
     }
-}
-
-#[inline]
-fn round2(x: i32, n: u32) -> i32 {
-    if n == 0 {
-        x
-    } else {
-        (x + (1 << (n - 1))) >> n
-    }
-}
-
-#[inline]
-fn clip3(low: i32, high: i32, v: i32) -> i32 {
-    v.clamp(low, high)
 }
 
 /// Spec §8.8.1 "Loop filter frame init process".
@@ -1084,4 +1070,5 @@ pub fn loop_filter_frame(
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/loop_filter.rs"]
 mod tests;

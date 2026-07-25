@@ -4,11 +4,10 @@
 //! `std::thread::scope` driver. Split out of `tile.rs` (which keeps the sequential
 //! tile/superblock traversal this path is bit-identical to).
 
-use crate::bool_coder::BoolDecoder;
 use crate::counts::Counts;
 use crate::framebuffer::Plane;
 
-use super::{check_tile_read_bounds, get_tile_offset, MiGrid, TileDecoder, TileError};
+use super::{get_tile_offset, MiGrid, TileDecoder, TileError};
 
 /// Test-only knob: forces [`TileDecoder::decode_tiles`] down the sequential loop even when the
 /// tile-parallel fast path would engage, so tests can assert that the parallel and sequential
@@ -243,14 +242,7 @@ impl TileDecoder {
                     .map(|(w, &tile_bytes)| {
                         scope.spawn(move || {
                             crate::bench_timing::reset();
-                            let result = (|| -> Result<(), TileError> {
-                                let mut r =
-                                    BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
-                                w.decode_tile(&mut r)?;
-                                check_tile_read_bounds(&r, tile_bytes)?;
-                                r.exit_bool();
-                                Ok(())
-                            })();
+                            let result = w.decode_tile_bytes(tile_bytes);
                             (result, crate::bench_timing::snapshot())
                         })
                     })

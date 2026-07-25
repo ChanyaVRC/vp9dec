@@ -1,95 +1,14 @@
 //! Unit tests for the `tile::mode_info` module (split out per the out-of-line test convention).
 
 use super::*;
-use crate::compressed_header::{CompressedHeader, CompressedHeaderProbs};
+use crate::compressed_header::CompressedHeaderProbs;
 use crate::counts::Counts;
-use crate::header::{ColorConfig, FrameType, LoopFilterParams, NewFrameHeader, QuantizationParams};
-use crate::prob_tables::{BLOCK_32X32, BLOCK_8X8, ONLY_4X4};
-use crate::test_support::BoolEncoder;
+use crate::prob_tables::{BLOCK_32X32, BLOCK_8X8};
+use crate::unit_test_support::{
+    minimal_compressed_header, minimal_inter_frame_header as minimal_inter_header,
+    minimal_new_frame_header as minimal_header, BoolEncoder,
+};
 use std::sync::Arc;
-
-/// A disabled `SegmentationParams` (the M2 default / most existing tests).
-fn no_segmentation() -> crate::header::SegmentationParams {
-    crate::header::SegmentationParams {
-        enabled: false,
-        update_map: false,
-        tree_probs: [255; 7],
-        pred_prob: [255; 3],
-        temporal_update: false,
-        abs_or_delta_update: false,
-        feature_enabled: [[false; 4]; 8],
-        feature_data: [[0; 4]; 8],
-    }
-}
-
-/// Builds a minimal `NewFrameHeader` for tests. An 8x8 (1 MI, 1 SB) key frame.
-fn minimal_header(width: u32, height: u32) -> NewFrameHeader {
-    NewFrameHeader {
-        profile: 0,
-        frame_type: FrameType::KeyFrame,
-        show_frame: true,
-        error_resilient_mode: false,
-        frame_is_intra: true,
-        intra_only: false,
-        reset_frame_context: 0,
-        ref_frame_idx: [0, 0, 0],
-        ref_frame_sign_bias: [false; 4],
-        allow_high_precision_mv: false,
-        interpolation_filter: crate::prob_tables::SWITCHABLE,
-        color_config: Some(ColorConfig {
-            bit_depth: 8,
-            color_space: 0,
-            color_range: false,
-            subsampling_x: 1,
-            subsampling_y: 1,
-        }),
-        width,
-        height,
-        render_width: width,
-        render_height: height,
-        refresh_frame_flags: 0xFF,
-        refresh_frame_context: true,
-        frame_parallel_decoding_mode: false,
-        frame_context_idx: 0,
-        loop_filter: LoopFilterParams {
-            level: 0,
-            sharpness: 0,
-            delta_enabled: false,
-            ref_deltas: [1, 0, -1, -1],
-            mode_deltas: [0, 0],
-        },
-        quantization: QuantizationParams {
-            base_q_idx: 0,
-            delta_q_y_dc: 0,
-            delta_q_uv_dc: 0,
-            delta_q_uv_ac: 0,
-            lossless: true,
-        },
-        segmentation: no_segmentation(),
-        tile_cols_log2: 0,
-        tile_rows_log2: 0,
-        header_size_in_bytes: 0,
-    }
-}
-
-/// Builds a minimal inter (non-intra-only) frame uncompressed header.
-fn minimal_inter_header(width: u32, height: u32) -> NewFrameHeader {
-    let mut h = minimal_header(width, height);
-    h.frame_type = FrameType::NonKeyFrame;
-    h.frame_is_intra = false;
-    h.ref_frame_idx = [0, 1, 2];
-    h
-}
-
-fn default_compressed_header() -> CompressedHeader {
-    CompressedHeader {
-        tx_mode: ONLY_4X4,
-        probs: Arc::new(CompressedHeaderProbs::default()),
-        reference_mode: SINGLE_REFERENCE,
-        comp_fixed_ref: 0,
-        comp_var_ref: [0, 0],
-    }
-}
 
 /// `intra_segment_id()` reads `segment_tree` when `update_map == 1`.
 #[test]
@@ -98,7 +17,7 @@ fn intra_segment_id_reads_tree_when_update_map() {
     header.segmentation.enabled = true;
     header.segmentation.update_map = true;
     header.segmentation.tree_probs = [128; 7];
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
     // segment_tree[14] = {2,4,6,8,10,12, 0,-1,-2,-3,-4,-5,-6,-7} (spec §9.3.1). Leaf
@@ -119,7 +38,7 @@ fn intra_segment_id_reads_tree_when_update_map() {
 #[test]
 fn intra_segment_id_is_zero_without_update_map() {
     let header = minimal_header(8, 8); // segmentation disabled.
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
     // An empty tile: if intra_segment_id tried to read a bit, this would panic/error.
@@ -133,7 +52,7 @@ fn intra_segment_id_is_zero_without_update_map() {
 fn get_segment_id_takes_min_over_block_region() {
     // 32x32 -> MiCols=MiRows=4. prev_segment_ids laid out row-major 4x4.
     let header = minimal_header(32, 32);
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     #[rustfmt::skip]
         let prev_segment_ids = vec![
             3, 3, 3, 3,
@@ -167,7 +86,7 @@ fn inter_segment_id_temporal_prediction_uses_prev_map() {
     header.segmentation.update_map = true;
     header.segmentation.temporal_update = true;
     header.segmentation.pred_prob = [64; 3];
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let prev_segment_ids = vec![6u8]; // MiCols=MiRows=1 at 8x8.
     let mut decoder = TileDecoder::new_with_prev(
         &header,
@@ -195,7 +114,7 @@ fn read_skip_seg_lvl_skip_forces_without_reading_bit() {
     let mut header = minimal_header(8, 8);
     header.segmentation.enabled = true;
     header.segmentation.feature_enabled[2][SEG_LVL_SKIP] = true;
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
     // Empty tile data: if read_skip tried to read a bit, BoolDecoder::new would still
@@ -215,7 +134,7 @@ fn read_is_inter_seg_lvl_ref_frame_forces_without_reading_bit() {
     header.segmentation.enabled = true;
     header.segmentation.feature_enabled[1][SEG_LVL_REF_FRAME] = true;
     header.segmentation.feature_data[1][SEG_LVL_REF_FRAME] = LAST_FRAME as i32;
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
     let n = NeighborRefInfo {
         avail_u: false,
@@ -241,7 +160,7 @@ fn read_ref_frames_seg_lvl_ref_frame_returns_feature_value() {
     header.segmentation.enabled = true;
     header.segmentation.feature_enabled[4][SEG_LVL_REF_FRAME] = true;
     header.segmentation.feature_data[4][SEG_LVL_REF_FRAME] = GOLDEN_FRAME as i32;
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
     let n = NeighborRefInfo {
         avail_u: false,
@@ -272,7 +191,7 @@ fn read_ref_frames_seg_lvl_ref_frame_returns_feature_value() {
 #[test]
 fn read_mv_component_class0_roundtrip() {
     let header = minimal_inter_header(64, 64);
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
     let probs = CompressedHeaderProbs::default();
 
@@ -297,7 +216,7 @@ fn read_mv_component_class0_roundtrip() {
 #[test]
 fn read_mv_component_negative_class0_roundtrip() {
     let header = minimal_inter_header(64, 64);
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
     let probs = CompressedHeaderProbs::default();
 
@@ -318,7 +237,7 @@ fn read_mv_component_negative_class0_roundtrip() {
 #[test]
 fn read_mv_component_higher_class_roundtrip() {
     let header = minimal_inter_header(64, 64);
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
     let probs = CompressedHeaderProbs::default();
 
@@ -345,7 +264,7 @@ fn read_mv_component_higher_class_roundtrip() {
 fn read_mv_full_roundtrip_with_best_mv_offset() {
     // read_mv(ref) = BestMv + diffMv. mv_joint = MV_JOINT_HNZVNZ (both components nonzero).
     let header = minimal_inter_header(64, 64);
-    let compressed = default_compressed_header();
+    let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
     let probs = CompressedHeaderProbs::default();
     let best_mv: Mv = [10, -20];

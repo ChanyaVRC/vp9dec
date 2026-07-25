@@ -194,11 +194,10 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   convention); `tests/common`'s `i420_bytes` emits `U16` planes that way so the hashes match.
 - **`cargo fmt` is safe tree-wide.** `rustfmt <one file>` on the crate root used to reformat the
   whole crate; the tree was normalized once, so a plain `cargo fmt` now touches only your change.
-- **Large unit-test modules live out-of-line** in a sibling `<module>/tests.rs` (declared with
-  `#[cfg(test)] mod tests;`): `transform`, `header`, `loop_filter`, `simd`, `tile`,
-  `tile::mode_info`, and the crate root (`src/tests.rs`). Smaller modules keep their tests
-  inline. Split a module's tests out when the test body grows large (a few hundred lines)
-  rather than inlining a block that rivals the source in size.
+- **Unit-test bodies live under `tests/unit/`**, included from their owning source module with
+  `#[cfg(test)] #[path = "..."] mod tests;`. They therefore retain private-module access without
+  widening the decoder API, while `src/` remains production implementation. Shared unit fixtures
+  live in `tests/unit/support.rs`; Cargo integration tests remain the top-level `tests/*.rs` files.
 
 ## Known gaps
 

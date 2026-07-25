@@ -3,28 +3,6 @@
 use super::*;
 
 #[test]
-fn round2_matches_spec_formula() {
-    assert_eq!(round2(0, 1), 0);
-    assert_eq!(round2(1, 1), 1);
-    assert_eq!(round2(3, 3), 0); // (3+4)>>3 = 0
-    assert_eq!(round2(4, 3), 1); // (4+4)>>3 = 1
-}
-
-/// A `SegmentationParams` with segmentation disabled (the M2 default).
-fn no_segmentation() -> SegmentationParams {
-    SegmentationParams {
-        enabled: false,
-        update_map: false,
-        tree_probs: [255; 7],
-        pred_prob: [255; 3],
-        temporal_update: false,
-        abs_or_delta_update: false,
-        feature_enabled: [[false; 4]; MAX_SEGMENTS],
-        feature_data: [[0; 4]; MAX_SEGMENTS],
-    }
-}
-
-#[test]
 fn lvl_lookup_without_deltas_is_flat_level() {
     let lf = LoopFilterParams {
         level: 20,
@@ -33,7 +11,7 @@ fn lvl_lookup_without_deltas_is_flat_level() {
         ref_deltas: [1, 0, -1, -1],
         mode_deltas: [0, 0],
     };
-    let table = build_lvl_lookup(&lf, &no_segmentation());
+    let table = build_lvl_lookup(&lf, &SegmentationParams::default());
     for seg in table.iter() {
         for r in seg.iter() {
             for m in r.iter() {
@@ -53,7 +31,7 @@ fn lvl_lookup_applies_intra_ref_delta() {
         ref_deltas: [1, 0, -1, -1],
         mode_deltas: [0, 0],
     };
-    let table = build_lvl_lookup(&lf, &no_segmentation());
+    let table = build_lvl_lookup(&lf, &SegmentationParams::default());
     // intraLvl = 40 + 1*(1<<1) = 42
     assert_eq!(table[0][INTRA_FRAME as usize][0], 42);
 }
@@ -67,9 +45,11 @@ fn lvl_lookup_seg_lvl_alt_l_absolute_override() {
         ref_deltas: [1, 0, -1, -1],
         mode_deltas: [0, 0],
     };
-    let mut seg = no_segmentation();
-    seg.enabled = true;
-    seg.abs_or_delta_update = true;
+    let mut seg = SegmentationParams {
+        enabled: true,
+        abs_or_delta_update: true,
+        ..SegmentationParams::default()
+    };
     seg.feature_enabled[3][SEG_LVL_ALT_L] = true;
     seg.feature_data[3][SEG_LVL_ALT_L] = 50;
     let table = build_lvl_lookup(&lf, &seg);
@@ -91,9 +71,10 @@ fn lvl_lookup_seg_lvl_alt_l_delta_is_clipped() {
         ref_deltas: [1, 0, -1, -1],
         mode_deltas: [0, 0],
     };
-    let mut seg = no_segmentation();
-    seg.enabled = true;
-    seg.abs_or_delta_update = false;
+    let mut seg = SegmentationParams {
+        enabled: true,
+        ..SegmentationParams::default()
+    };
     seg.feature_enabled[2][SEG_LVL_ALT_L] = true;
     seg.feature_data[2][SEG_LVL_ALT_L] = 10; // 60 + 10 = 70, clipped to 63.
     let table = build_lvl_lookup(&lf, &seg);

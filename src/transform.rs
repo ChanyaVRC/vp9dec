@@ -540,4 +540,5 @@ pub fn inverse_transform_block(dequant: &mut [i64], n: u32, tx_type: TxType, los
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/transform.rs"]
 mod tests;

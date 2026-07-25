@@ -38,7 +38,7 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   the tap window (8x8 / 8x16) into the row-major layout the horizontal kernel wants, reuses that
   proven kernel unchanged, and transposes back -- so all mask / narrow / wide8 / wide16
   arithmetic is shared verbatim; only the load/store orientation differs. Bit-exact both SIMD
-  configs (full sweep 315/315) + ffmpeg cross-decode; a 500-trial `loop_filter/tests.rs` unit
+  configs (full sweep 315/315) + ffmpeg cross-decode; a 500-trial `tests/unit/loop_filter.rs` unit
   test pins the kernel against the scalar `sample_filtering`. **37.65 -> 41.63 MP/s, 1.11x** on
   1920x800 (tos, 17620 frames). Both loop-filter passes are now AVX2.
 - Wave 4b (AVX2 8-bit DCT_DCT inverse transform, all sizes 4/8/16/32): DONE 2026-07-23
@@ -263,8 +263,8 @@ Remaining (moved to P1's SIMD scope, not blocking): a u16 SIMD path for 10/12-bi
   may differ, still `Err` from the same packet; invalid gate stays 21/21); `residual()`'s
   per-plane inter-predict block and `tokens_and_reconstruct`'s dequant/transform tail split out
   at spec-process seams (R3); `src/simd.rs` (2,595 lines) split into a hub +
-  `simd/{inter, loop_filter, transform, tests}.rs` (S1/S2); the twin loop-filter AVX2 edge
-  dispatchers merged into one pass-parameterized `superblock_loop_filter_edge_avx2` (S3);
+  `simd/{inter, loop_filter, transform}.rs` plus `tests/unit/simd.rs` (S1/S2); the twin loop-filter
+  AVX2 edge dispatchers merged into one pass-parameterized `superblock_loop_filter_edge_avx2` (S3);
   `refresh_probs` and the PrevSegmentIds refresh extracted from `decode_one_frame` (A5). `fetch-vectors.sh` captured `rc=$?` after
   the `fi`, reading the if-statement's status (always 0 when curl failed) instead of curl's, so
   the FAIL line always printed "curl exit 0"; moved the failure handling into an `else` branch
@@ -299,11 +299,10 @@ decision is now that they MAY be done. What "doing" each means, honestly:
   `FrameIsIntra || error_resilient_mode`); the `reset_frame_context == 2` `save_probs` path
   keeps using the raw value. Behaviour-preserving by construction (same u8 indices reach
   load/save/reset); a header unit test pins the accessor over all input combinations.
-- **Out-of-line test files for big modules**: DONE 2026-07-22. Standardized on the split
-  layout for the large modules (following `transform.rs`): `header`, `lib` (crate root ->
-  `src/tests.rs`), `loop_filter`, `tile`, and `tile::mode_info` now keep their unit tests in a
-  sibling `<module>/tests.rs` via `#[cfg(test)] mod tests;`. Convention recorded in
-  `implementation-notes.md`. Smaller modules keep inline tests.
+- **Out-of-line unit-test files**: DONE 2026-07-25. All unit-test bodies now live under
+  `tests/unit/` and are included from their owning module with `#[cfg(test)] #[path = "..."]`.
+  This preserves private access without widening the decoder API and keeps `src/` focused on
+  production/test-support implementation. Convention recorded in `implementation-notes.md`.
 - **`prob_tables.rs` naming residue**: DECIDED keep (2026-07-22). A rename touches every
   `prob_tables::` import across the crate for a cosmetic gain; not worth the churn (the module
   holds probability/tree/geometry constant data, which the name adequately covers). Revisit only

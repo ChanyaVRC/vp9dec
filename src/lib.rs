@@ -57,6 +57,9 @@ pub mod test_support;
 pub mod tile;
 #[doc(hidden)]
 pub mod transform;
+#[cfg(test)]
+#[path = "../tests/unit/support.rs"]
+mod unit_test_support;
 
 use std::sync::Arc;
 
@@ -383,6 +386,34 @@ impl Decoder {
         }
     }
 
+    /// Reference frame update process (spec §8.10). A zero refresh mask changes no DPB slot,
+    /// so avoid cropping/copying all three planes only to discard them.
+    fn refresh_reference_frames(
+        &mut self,
+        header: &header::NewFrameHeader,
+        color_config: &ColorConfig,
+        planes: &[framebuffer::Plane; 3],
+    ) {
+        if header.refresh_frame_flags == 0 {
+            return;
+        }
+
+        // Arc-wrapped so `Dpb::update` shares this frame's pixel data across every refreshed
+        // slot instead of deep-cloning it per slot (up to 8x on a keyframe).
+        let ref_data = Arc::new(build_ref_frame_data(
+            planes,
+            header.width,
+            header.height,
+            color_config,
+        ));
+        self.dpb.update(header.refresh_frame_flags, &ref_data);
+        for (slot, size) in self.persist.ref_frame_sizes.iter_mut().enumerate() {
+            if (header.refresh_frame_flags >> slot) & 1 == 1 {
+                *size = (header.width, header.height);
+            }
+        }
+    }
+
     /// Decodes one container chunk (one IVF frame, one WebM block, etc.). Callers must pass
     /// chunks extracted from an IVF or similar container in bitstream order (decode order),
     /// not display order.
@@ -607,24 +638,7 @@ impl Decoder {
                 .save(header.effective_frame_context_idx(), final_probs);
         }
 
-        // Reference frame update process (spec §8.10). A zero refresh mask changes no DPB slot,
-        // so avoid cropping and copying all three planes for data that would be discarded.
-        if header.refresh_frame_flags != 0 {
-            // Arc-wrapped so `Dpb::update` shares this frame's pixel data across every refreshed
-            // slot instead of deep-cloning it per slot (up to 8x on a keyframe).
-            let ref_data = Arc::new(build_ref_frame_data(
-                tile_decoder.planes(),
-                header.width,
-                header.height,
-                &color_config,
-            ));
-            self.dpb.update(header.refresh_frame_flags, &ref_data);
-            for (slot, size) in self.persist.ref_frame_sizes.iter_mut().enumerate() {
-                if (header.refresh_frame_flags >> slot) & 1 == 1 {
-                    *size = (header.width, header.height);
-                }
-            }
-        }
+        self.refresh_reference_frames(&header, &color_config, tile_decoder.planes());
 
         // compute_image_size is never called for show_existing_frame, so by the time we
         // reach here it has always been called (spec §7.2.6). Recorded for UsePrevFrameMvs.
@@ -762,4 +776,5 @@ fn refresh_probs(
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/lib.rs"]
 mod tests;
