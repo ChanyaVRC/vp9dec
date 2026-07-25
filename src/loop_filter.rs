@@ -1,8 +1,8 @@
 //! Deblocking (loop) filter (spec §8.8 "Loop filter process").
 //!
-//! Faithfully to spec §8.8, the entire frame is traversed with the following
-//! nested loops (taken directly from the frame-wide traversal pseudocode at
-//! the top of the section):
+//! Spec §8.8's reference traversal of the frame is the following nested loops (taken directly from
+//! the frame-wide traversal pseudocode at the top of the section); for parallelism the
+//! implementation reorganizes it to plane-outermost, preserving each plane's order (see below):
 //!
 //! ```text
 //! for ( row = 0; row < MiRows; row += 8 )
@@ -1000,14 +1000,6 @@ pub fn loop_filter_frame(
     // (see `wavefront_filter_planes`) across `n_threads` workers; below it -- or with no usable
     // parallelism -- the planes are filtered sequentially on this thread. Both paths preserve every
     // plane's (row, col, pass) raster order spec §8.8 requires, so the output is bit-identical.
-    let n_sb_rows = mi_rows.div_ceil(8) as usize;
-    // One worker per superblock row is the most the wavefront can use (extra workers would idle);
-    // cap at the machine's parallelism.
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(n_sb_rows.max(1));
-
     // Test-only override: force the sequential path so the parallel/sequential equality test can
     // use the wavefront-engaging clips as their own reference.
     #[cfg(feature = "test-support")]
@@ -1015,10 +1007,22 @@ pub fn loop_filter_frame(
     #[cfg(not(feature = "test-support"))]
     let force_sequential = false;
 
-    if force_sequential
-        || (mi_cols as u64) * (mi_rows as u64) < LF_PARALLEL_MIN_MI
-        || n_threads <= 1
+    // Cheap gates first, so only frames that actually parallelize pay for the
+    // `available_parallelism()` query; `n_threads == 1` then funnels into the sequential path below.
+    let n_threads = if force_sequential || (mi_cols as u64) * (mi_rows as u64) < LF_PARALLEL_MIN_MI
     {
+        1
+    } else {
+        let n_sb_rows = mi_rows.div_ceil(8) as usize;
+        // One worker per superblock row is the most the wavefront can use (more would idle); cap at
+        // the machine's parallelism.
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(n_sb_rows.max(1))
+    };
+
+    if n_threads <= 1 {
         for (plane_idx, plane) in planes.iter_mut().enumerate() {
             loop_filter_plane(
                 plane,
