@@ -140,12 +140,12 @@ fn single_skip_block_decodes_without_residual_error() {
 }
 
 #[test]
-fn non_skip_block_with_all_zero_tokens_decodes_successfully() {
+fn non_skip_block_with_immediate_eob_decodes_successfully() {
     // A non-skip 8x8 (1 MI) block. Since lossless, tx_size is always TX_4X4, and the Y
     // plane has 2x2=4 4x4 transform blocks, while U/V each have 1.
-    // Setting the first more_coefs to false in each block (no coefficients) verifies the
-    // full token decoding / inverse quantization / inverse transform / reconstruction
-    // pipeline with a minimal configuration.
+    // Setting the first more_coefs to false in each block (no coefficients) exercises the
+    // immediate-EOB path: it must still update the EOB adaptation count while leaving the
+    // already-predicted pixels unchanged.
     let header = minimal_header(8, 8);
     let compressed = default_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
@@ -179,6 +179,10 @@ fn non_skip_block_with_all_zero_tokens_decodes_successfully() {
     // predicted value (DC_PRED, and since no reference is available, the bit_depth
     // midpoint 128).
     assert_eq!(decoder.planes()[0].get(0, 0), 128);
+    assert_eq!(decoder.counts().more_coefs[0][0][0][0][0][0], 4);
+    assert_eq!(decoder.counts().more_coefs[0][1][0][0][0][0], 2);
+    assert_eq!(decoder.counts().token[0][0][0][0][0], [0; 3]);
+    assert_eq!(decoder.counts().token[0][1][0][0][0], [0; 3]);
 }
 
 #[test]

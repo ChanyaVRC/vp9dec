@@ -357,16 +357,51 @@ impl TileDecoder {
         let x4 = (start_x >> 2) as u32;
         let y4 = (start_y >> 2) as u32;
 
+        // The first more_coefs bit decides whether this block has any coefficient tokens at
+        // all. Read it before initializing/zeroing the 5 KiB token scratch below; an immediate
+        // EOB also needs no dequant scratch or inverse transform because adding an all-zero
+        // residual leaves the prediction unchanged.
+        let first_ctx = {
+            let mut above = 0u32;
+            let mut left = 0u32;
+            for i in 0..numpts {
+                if x4 + i < max_x_ctx {
+                    above |= self.above_nonzero_context[plane][(x4 + i) as usize] as u32;
+                }
+                if y4 + i < max_y_ctx {
+                    left |= self.left_nonzero_context[plane][((y4 + i) % 16) as usize] as u32;
+                }
+            }
+            (above + left) as usize
+        };
+        let first_band = if tx_sz == TX_4X4 {
+            COEFBAND_4X4[0] as usize
+        } else {
+            coefband_8x8plus(0) as usize
+        };
+        let first_probs = self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize]
+            [first_band][first_ctx];
+        let more_coefs = r.read_bool(first_probs[0]);
+        self.counts.more_coefs[tx_sz as usize][plane_type][is_inter as usize][first_band]
+            [first_ctx][more_coefs as usize] += 1;
+        if !more_coefs {
+            return false;
+        }
+
         // Fixed-size scratch (seg_eob <= 1024, the 32x32 max transform): avoids a per-block
         // heap allocation. Only the first seg_eob entries are read below.
         let mut tokens = [0i32; 1024];
         let mut token_cache = [0u8; 1024];
-        let mut check_eob = true;
+        // The c=0 EOB bit was consumed by the preflight above. Once a non-zero token is read,
+        // the normal loop resumes checking EOB before the next coefficient position.
+        let mut check_eob = false;
         let mut c = 0usize;
 
         while c < seg_eob {
             let pos = scan[c] as usize;
-            let band = if tx_sz == TX_4X4 {
+            let band = if c == 0 {
+                first_band
+            } else if tx_sz == TX_4X4 {
                 COEFBAND_4X4[c] as usize
             } else {
                 coefband_8x8plus(c) as usize
@@ -374,17 +409,7 @@ impl TileDecoder {
 
             // Derivation of ctx (spec §9.3.2, shared by more_coefs/token).
             let ctx = if c == 0 {
-                let mut above = 0u32;
-                let mut left = 0u32;
-                for i in 0..numpts {
-                    if x4 + i < max_x_ctx {
-                        above |= self.above_nonzero_context[plane][(x4 + i) as usize] as u32;
-                    }
-                    if y4 + i < max_y_ctx {
-                        left |= self.left_nonzero_context[plane][((y4 + i) % 16) as usize] as u32;
-                    }
-                }
-                (above + left) as usize
+                first_ctx
             } else {
                 let nn = 4usize << tx_sz;
                 let i = pos / nn;
@@ -407,8 +432,11 @@ impl TileDecoder {
                 ((1 + token_cache[nb0] as u32 + token_cache[nb1] as u32) >> 1) as usize
             };
 
-            let probs =
-                self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][band][ctx];
+            let probs = if c == 0 {
+                first_probs
+            } else {
+                self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
+            };
 
             if check_eob {
                 // The more_coefs (EOB) count feeds the EOB-node adaptation (spec §8.4.3, the
