@@ -16,6 +16,8 @@ finer than the summaries below lives in the git log.
 | M3 first half | Inter-frame bitstream decode: non-key header, inter probability tables, mode info, MV prediction, residual tokens — everything up to but not including pixel generation. |
 | M3 second half | Motion compensation (subpel interpolation, compound, reference scaling), the 8-slot DPB, forward/backward probability adaptation, loop-filter deltas — full multi-frame MD5 conformance. |
 | M4 | The full official-vector sweep, then profiles 1-3 (10/12-bit and 4:2:2 / 4:4:0 / 4:4:4). 315/315 vectors bit-exact. |
+| M5 | Decode performance: all-depth AVX2 for inter prediction, loop filtering, and every non-lossless inverse transform; tile-column parallel decode and a loop-filter wavefront. The sweep remained 315/315 with SIMD enabled and forced scalar; 1080p reached about 98 MP/s single-tile and 155 MP/s with four tiles. |
+| M6 | Hardening and maintenance: official invalid vectors reached 21/21, deterministic malformed-input fuzzing guarded against panics, decoder structure was consolidated, and unit-test bodies moved under `tests/unit/`. |
 
 ## Notes from the build
 
