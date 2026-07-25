@@ -20,6 +20,29 @@ use vp9dec::test_support::{BitWriter, BoolEncoder};
 pub const WIDTH: u32 = 16;
 pub const HEIGHT: u32 = 16;
 
+/// Non-RGB key-frame format and tiling knobs for synthetic streams. The default reproduces
+/// [`build_keyframe_header`]'s historical profile-0, 8-bit 4:2:0, single-tile encoding.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyframeConfig {
+    pub profile: u8,
+    pub bit_depth: u8,
+    pub subsampling_x: u8,
+    pub subsampling_y: u8,
+    pub tile_cols_log2: u32,
+}
+
+impl Default for KeyframeConfig {
+    fn default() -> Self {
+        Self {
+            profile: 0,
+            bit_depth: 8,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            tile_cols_log2: 0,
+        }
+    }
+}
+
 /// Finds the `(node, bit)` sequence that `BoolDecoder::read_tree` (`src/bool_coder.rs`)
 /// would read, in order, to arrive at `leaf`, by walking the tree structure the same way
 /// `read_tree` does. Used instead of hand-transcribing bit paths for `SEGMENT_TREE` /
@@ -168,10 +191,54 @@ pub fn build_keyframe_header(
     segmentation: &SegSpec,
     header_size_in_bytes: u16,
 ) -> Vec<u8> {
+    build_keyframe_header_with_config(
+        width,
+        height,
+        loop_filter_level,
+        loop_filter_delta_enabled,
+        segmentation,
+        header_size_in_bytes,
+        KeyframeConfig::default(),
+    )
+}
+
+/// Generalized form of [`build_keyframe_header`] for synthetic profile/bit-depth/subsampling
+/// and tile-column coverage. It deliberately emits a non-RGB color config and one tile row,
+/// which are the only variants currently needed by the synthetic integration tests.
+pub fn build_keyframe_header_with_config(
+    width: u32,
+    height: u32,
+    loop_filter_level: u8,
+    loop_filter_delta_enabled: bool,
+    segmentation: &SegSpec,
+    header_size_in_bytes: u16,
+    config: KeyframeConfig,
+) -> Vec<u8> {
+    assert!(width > 0 && height > 0, "frame dimensions must be nonzero");
+    assert!(config.profile <= 3, "VP9 profile must be in 0..=3");
+    if config.profile >= 2 {
+        assert!(
+            config.bit_depth == 10 || config.bit_depth == 12,
+            "profiles 2/3 require 10- or 12-bit samples"
+        );
+    } else {
+        assert_eq!(config.bit_depth, 8, "profiles 0/1 require 8-bit samples");
+    }
+    if config.profile == 0 || config.profile == 2 {
+        assert_eq!(
+            (config.subsampling_x, config.subsampling_y),
+            (1, 1),
+            "profiles 0/2 have fixed 4:2:0 subsampling"
+        );
+    }
+
     let mut w = BitWriter::new();
     w.push_bits(2, 2); // frame_marker
-    w.push_bits(0, 1); // profile_low_bit
-    w.push_bits(0, 1); // profile_high_bit -> profile 0
+    w.push_bits((config.profile & 1) as u32, 1); // profile_low_bit
+    w.push_bits((config.profile >> 1) as u32, 1); // profile_high_bit
+    if config.profile == 3 {
+        w.push_flag(false); // reserved_zero
+    }
     w.push_flag(false); // show_existing_frame
     w.push_bits(0, 1); // frame_type = KEY_FRAME
     w.push_flag(true); // show_frame
@@ -179,8 +246,16 @@ pub fn build_keyframe_header(
     w.push_bits(0x49, 8);
     w.push_bits(0x83, 8);
     w.push_bits(0x42, 8);
+    if config.profile >= 2 {
+        w.push_flag(config.bit_depth == 12);
+    }
     w.push_bits(0, 3); // color_space = CS_UNKNOWN
     w.push_flag(false); // color_range
+    if config.profile == 1 || config.profile == 3 {
+        w.push_bits(config.subsampling_x as u32, 1);
+        w.push_bits(config.subsampling_y as u32, 1);
+        w.push_flag(false); // reserved_zero
+    }
     w.push_bits(width - 1, 16);
     w.push_bits(height - 1, 16);
     w.push_flag(false); // render_size same as frame size
@@ -198,9 +273,41 @@ pub fn build_keyframe_header(
     w.push_flag(false); // delta_q_uv_dc coded?
     w.push_flag(false); // delta_q_uv_ac coded?
     segmentation.write(&mut w);
-    w.push_bits(0, 1); // tile_rows_log2 (callers keep width <= 64, so Sb64Cols == 1 and the tile-cols loop never runs)
+    write_tile_info(&mut w, width, config.tile_cols_log2);
     w.push_bits(header_size_in_bytes as u32, 16);
     w.finish()
+}
+
+/// Writes `tile_info()` for one tile row, deriving the legal column range from the frame width
+/// exactly as spec §6.2.14 does. A terminating zero is present only when the requested value is
+/// below `max_log2_tile_cols`; reaching the maximum consumes no terminator bit.
+fn write_tile_info(w: &mut BitWriter, width: u32, tile_cols_log2: u32) {
+    const MAX_TILE_WIDTH_B64: u32 = 64;
+    const MIN_TILE_WIDTH_B64: u32 = 4;
+
+    let sb64_cols = (width + 63) >> 6;
+    let mut min_log2 = 0;
+    while (MAX_TILE_WIDTH_B64 << min_log2) < sb64_cols {
+        min_log2 += 1;
+    }
+    let mut max_log2 = 1;
+    while (sb64_cols >> max_log2) >= MIN_TILE_WIDTH_B64 {
+        max_log2 += 1;
+    }
+    max_log2 -= 1;
+
+    assert!(
+        (min_log2..=max_log2).contains(&tile_cols_log2),
+        "tile_cols_log2={tile_cols_log2} is outside the legal {min_log2}..={max_log2} range \
+         for width {width}"
+    );
+    for _ in min_log2..tile_cols_log2 {
+        w.push_flag(true);
+    }
+    if tile_cols_log2 < max_log2 {
+        w.push_flag(false);
+    }
+    w.push_flag(false); // tile_rows_log2 = 0
 }
 
 /// `explicit_size`: `None` inherits ref_frame_idx[0]'s slot size (`found_ref = 1`); `Some`
