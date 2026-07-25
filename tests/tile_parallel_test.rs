@@ -2,9 +2,9 @@
 //!
 //! The official multi-tile vectors (`vp90-2-08-tile_1x{2,4,8}`) normally take the tile-parallel
 //! fast path (`tile::decode_tiles_parallel`, engaged for >1 tile column and 1 tile row). This
-//! test decodes each vector twice -- once normally (parallel) and once with the test-only
-//! `FORCE_SEQUENTIAL_TILES` knob -- and requires every displayed frame's planes to match
-//! exactly, pinning the column-strip worker buffers + merge against the sequential reference.
+//! test decodes each vector normally (parallel) and with one available tile worker (automatic
+//! sequential fallback). Every displayed frame's planes must match exactly, pinning both
+//! dispatch modes and the column-strip worker buffers + merge against the sequential reference.
 //! Skips cleanly if the vectors haven't been downloaded.
 
 mod common;
@@ -12,7 +12,7 @@ mod common;
 use std::sync::atomic::Ordering;
 
 use vp9dec::ivf::IvfReader;
-use vp9dec::tile::FORCE_SEQUENTIAL_TILES;
+use vp9dec::tile::FORCE_TILE_WORKERS;
 use vp9dec::Decoder;
 
 const TILE_VECTORS: [&str; 3] = [
@@ -47,9 +47,9 @@ fn parallel_tile_decode_matches_sequential_byte_for_byte() {
 
         let parallel = decode_displayed_frames(&bytes);
 
-        FORCE_SEQUENTIAL_TILES.store(true, Ordering::Relaxed);
+        FORCE_TILE_WORKERS.store(1, Ordering::Relaxed);
         let sequential = decode_displayed_frames(&bytes);
-        FORCE_SEQUENTIAL_TILES.store(false, Ordering::Relaxed);
+        FORCE_TILE_WORKERS.store(0, Ordering::Relaxed);
 
         assert_eq!(
             parallel.len(),
