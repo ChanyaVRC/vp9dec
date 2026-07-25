@@ -193,6 +193,27 @@ Single-threaded scalar decode measures ~19 MP/s (1920-width content: 12-13 fps; 
   (interleaved A/B vs HEAD, same session): 1920x800 4-tile **~78 -> ~91 MP/s (min), ~+17%** (the
   per-frame alloc+zero of 4 full frame+grid buffers, ~27 MiB/frame, dominated); 854x356 2-tile
   ~parity (+~1%, within this machine's noise).
+- Loop-filter plane-parallel (a third realtime lever, after SIMD and tile-parallel): DONE
+  2026-07-25 (`loop_filter::loop_filter_frame` / `loop_filter_plane`). The deblocking filter runs
+  once per frame on the main thread AFTER the tile decode joins, so on multi-tile HD it had become
+  the serial tail -- profiled at 38.5% of single-tile COMPUTE and 52% of 4-tile WALL-CLOCK (both
+  big compute stages, InterPredict and LoopFilter, are already AVX2, so this is a threading lever,
+  not a new kernel). The three plane buffers are disjoint and never read one another (each
+  superblock filter touches only its own plane; `mi_grid`/`lvl_lookup` are shared read-only), so
+  the plane loop is hoisted OUTERMOST and the planes filtered on separate `std::thread::scope`
+  threads (luma on the caller, chroma spawned) -- bit-exact by construction (each plane's
+  (row,col,pass) raster order per spec §8.8 is preserved exactly; only the interleaving between the
+  independent planes changes). `superblock_loop_filter`/`_edge_avx2` refactored to take a single
+  `&mut Plane`; size-gated (`LF_PARALLEL_MIN_MI`, sub-VGA stays sequential). Bit-exact (sweep
+  315/315 both SIMD configs + ffmpeg cross-decode 10/10 + full suite). Perf (interleaved A/B, same
+  session, 32-core): 1080p single-tile **52.3 -> 60.1 MP/s (+15%)**, 4-tile **66.6 -> 97.3 MP/s
+  (+46%)**; LoopFilter stage ÷1.58 / ÷1.90 (chroma is proportionally more expensive than its pixel
+  count, so the 3-way split balances better than the ~1.5x Y-bound estimate). Follow-up
+  (intra-plane luma wavefront): IN PROGRESS -- splitting the Y plane across threads needs an
+  UNSAFE shared-buffer wavefront with a 2-superblock row lag (SB(r,c)'s top-edge pass and
+  SB(r-1,c+1)'s left-edge pass write a shared 8x8 corner, so gating row r on `progress[r-1] >= c+2`
+  is required), higher reward on many-core (loop filter toward ÷5-6) at higher risk; being done as
+  a separate, exhaustively-verified step.
 - NEON (aarch64) mirror: not started (x86_64 only so far); sibling module behind the same
   `predict.rs` dispatch point when an aarch64 target is needed.
 

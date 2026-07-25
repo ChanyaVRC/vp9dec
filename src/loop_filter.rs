@@ -18,6 +18,11 @@
 //! (vertical -> horizontal, superblock raster order) must be strictly
 //! followed (see the NOTE in spec §8.8).
 //!
+//! For decode speed the plane loop is hoisted to the OUTERMOST position and the three planes
+//! are filtered concurrently ([`loop_filter_frame`]): the planes are disjoint buffers that
+//! never read one another, so reordering the (independent) plane dimension is bit-exact --
+//! within each plane the required (row, col, pass) raster order above is preserved exactly.
+//!
 //! # Known simplifications
 //!
 //! - `isIntra` (`RefFrames[row][col][0] <= INTRA_FRAME`) and `modeType`
@@ -42,6 +47,12 @@ use crate::tile::MiGrid;
 const MAX_REF_FRAMES: usize = 4;
 const MAX_MODE_LF_DELTAS: usize = 2;
 const MAX_LOOP_FILTER: i32 = 63;
+
+/// Minimum frame size (in MI units, `MiCols * MiRows`) at which [`loop_filter_frame`] filters
+/// the planes on separate threads. Below it the per-frame thread-spawn cost outweighs the win,
+/// so the planes are filtered sequentially on the calling thread. Bench-tuned (see
+/// `examples/bench.rs`); 4096 MI ~= 512x512 luma, so sub-VGA frames stay sequential.
+const LF_PARALLEL_MIN_MI: u64 = 4096;
 
 /// `LvlLookup[ segmentId ][ ref ][ mode ]` (spec §8.8.1).
 type LvlLookup = [[[i32; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SEGMENTS];
@@ -450,7 +461,7 @@ fn edge_position_params(
 /// Spec §8.8.2 "Superblock loop filter process".
 #[allow(clippy::too_many_arguments)]
 fn superblock_loop_filter(
-    planes: &mut [Plane; 3],
+    plane: &mut Plane,
     mi_grid: &MiGrid,
     mi_cols: u32,
     mi_rows: u32,
@@ -489,7 +500,7 @@ fn superblock_loop_filter(
         #[cfg(target_arch = "x86_64")]
         if crate::simd::avx2_enabled() {
             superblock_loop_filter_edge_avx2(
-                planes,
+                plane,
                 mi_grid,
                 mi_cols,
                 mi_rows,
@@ -533,7 +544,7 @@ fn superblock_loop_filter(
             if apply_filter && lvl > 0 {
                 let (limit, blimit, thresh) = adaptive_filter_strength(lvl, sharpness, bit_depth);
                 sample_filtering(
-                    &mut planes[plane_idx],
+                    plane,
                     (x >> sub_x) as usize,
                     (y >> sub_y) as usize,
                     dx,
@@ -562,7 +573,7 @@ fn superblock_loop_filter(
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 fn superblock_loop_filter_edge_avx2(
-    planes: &mut [Plane; 3],
+    plane: &mut Plane,
     mi_grid: &MiGrid,
     mi_cols: u32,
     mi_rows: u32,
@@ -638,7 +649,7 @@ fn superblock_loop_filter_edge_avx2(
         }
 
         if eligible.iter().any(|&e| e != 0) {
-            let plane_width = planes[plane_idx].width;
+            let plane_width = plane.width;
             if pass == 1 {
                 // SAFETY: `avx2_enabled()` was checked by the caller (`superblock_loop_filter`).
                 // The row window the kernel touches at columns x0..x0+8 (pass==1's dx=0,dy=1 taps
@@ -652,7 +663,7 @@ fn superblock_loop_filter_edge_avx2(
                 // group's other lanes are always valid memory too.
                 unsafe {
                     crate::simd::loop_filter_horiz8_avx2(
-                        planes[plane_idx].as_mut_slice(),
+                        plane.as_mut_slice(),
                         plane_width,
                         x0,
                         y0,
@@ -679,7 +690,7 @@ fn superblock_loop_filter_edge_avx2(
                 // value there).
                 unsafe {
                     crate::simd::loop_filter_vert8_avx2(
-                        planes[plane_idx].as_mut_slice(),
+                        plane.as_mut_slice(),
                         plane_width,
                         x0,
                         y0,
@@ -696,6 +707,49 @@ fn superblock_loop_filter_edge_avx2(
         }
 
         i += 8;
+    }
+}
+
+/// Filters one plane over the whole frame in the spec's per-plane order (superblock raster;
+/// vertical then horizontal pass). Split out of [`loop_filter_frame`] so the three
+/// data-independent planes can be filtered on separate threads.
+#[allow(clippy::too_many_arguments)]
+fn loop_filter_plane(
+    plane: &mut Plane,
+    plane_idx: usize,
+    mi_grid: &MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    lvl_lookup: &LvlLookup,
+    sharpness: u8,
+    bit_depth: u8,
+) {
+    let mut row = 0u32;
+    while row < mi_rows {
+        let mut col = 0u32;
+        while col < mi_cols {
+            for pass in 0..2u32 {
+                superblock_loop_filter(
+                    plane,
+                    mi_grid,
+                    mi_cols,
+                    mi_rows,
+                    subsampling_x,
+                    subsampling_y,
+                    lvl_lookup,
+                    sharpness,
+                    plane_idx,
+                    pass,
+                    row,
+                    col,
+                    bit_depth,
+                );
+            }
+            col += 8;
+        }
+        row += 8;
     }
 }
 
@@ -718,33 +772,96 @@ pub fn loop_filter_frame(
     bit_depth: u8,
 ) {
     let lvl_lookup = build_lvl_lookup(lf, seg);
+    let sharpness = lf.sharpness;
 
-    let mut row = 0u32;
-    while row < mi_rows {
-        let mut col = 0u32;
-        while col < mi_cols {
-            for plane_idx in 0..3usize {
-                for pass in 0..2u32 {
-                    superblock_loop_filter(
-                        planes,
-                        mi_grid,
-                        mi_cols,
-                        mi_rows,
-                        subsampling_x,
-                        subsampling_y,
-                        &lvl_lookup,
-                        lf.sharpness,
-                        plane_idx,
-                        pass,
-                        row,
-                        col,
-                        bit_depth,
-                    );
-                }
-            }
-            col += 8;
-        }
-        row += 8;
+    // The three plane buffers are disjoint and never read one another (each superblock filter
+    // touches only its own plane; `mi_grid`/`lvl_lookup` are shared read-only), so the planes are
+    // filtered concurrently. Hoisting the plane loop outermost is bit-exact: within each plane the
+    // (row, col, pass) raster order spec §8.8 requires is preserved exactly -- only the
+    // interleaving *between* the independent planes changes.
+    let [y, u, v] = planes;
+    if (mi_cols as u64) * (mi_rows as u64) >= LF_PARALLEL_MIN_MI {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                loop_filter_plane(
+                    u,
+                    1,
+                    mi_grid,
+                    mi_cols,
+                    mi_rows,
+                    subsampling_x,
+                    subsampling_y,
+                    &lvl_lookup,
+                    sharpness,
+                    bit_depth,
+                );
+            });
+            s.spawn(|| {
+                loop_filter_plane(
+                    v,
+                    2,
+                    mi_grid,
+                    mi_cols,
+                    mi_rows,
+                    subsampling_x,
+                    subsampling_y,
+                    &lvl_lookup,
+                    sharpness,
+                    bit_depth,
+                );
+            });
+            // Luma (the ~2/3-of-work long pole) stays on the calling thread.
+            loop_filter_plane(
+                y,
+                0,
+                mi_grid,
+                mi_cols,
+                mi_rows,
+                subsampling_x,
+                subsampling_y,
+                &lvl_lookup,
+                sharpness,
+                bit_depth,
+            );
+        });
+    } else {
+        // Small frame: thread-spawn overhead would outweigh the win -- filter sequentially.
+        loop_filter_plane(
+            y,
+            0,
+            mi_grid,
+            mi_cols,
+            mi_rows,
+            subsampling_x,
+            subsampling_y,
+            &lvl_lookup,
+            sharpness,
+            bit_depth,
+        );
+        loop_filter_plane(
+            u,
+            1,
+            mi_grid,
+            mi_cols,
+            mi_rows,
+            subsampling_x,
+            subsampling_y,
+            &lvl_lookup,
+            sharpness,
+            bit_depth,
+        );
+        loop_filter_plane(
+            v,
+            2,
+            mi_grid,
+            mi_cols,
+            mi_rows,
+            subsampling_x,
+            subsampling_y,
+            &lvl_lookup,
+            sharpness,
+            bit_depth,
+        );
     }
 }
 
