@@ -1,6 +1,6 @@
 [package]
 name = "vp9dec"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A from-scratch, clean-room VP9 video decoder (Rust, zero dependency crates)"
 license = "MIT"
@@ -15,6 +15,66 @@ exclude = [".claude", "CLAUDE.md"]
 
 [dev-dependencies]
 vp9dec = { path = ".", features = ["test-support"] }
+
+# Cargo removes versionless path dev-dependencies from a published package. Requiring the
+# feature on each integration target keeps repository `cargo test` unchanged (the self
+# dev-dependency enables it), while a packaged crate can skip them by default or run them
+# explicitly with `--features test-support`.
+[[test]]
+name = "api_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "bbb_cross_check"
+required-features = ["test-support"]
+
+[[test]]
+name = "conformance_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "invalid_vector_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "loop_filter_parallel_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "robustness_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "simd_scalar_differential_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "structured_fuzz_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "sweep_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "synthetic_hbd_tile_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "synthetic_scaled_ref_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "synthetic_seg_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "synthetic_superframe_test"
+required-features = ["test-support"]
+
+[[test]]
+name = "tile_parallel_test"
+required-features = ["test-support"]
 
 [features]
 test-support = []
