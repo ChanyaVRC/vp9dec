@@ -1,5 +1,5 @@
 //! Per-stage wall-clock accounting for `examples/bench.rs`'s `--stages` breakdown
-//! (SIMD wave 1 measurement infrastructure; see docs/implementation-notes.md "SIMD wave 1").
+//! (the measurement infrastructure summarized under M5 in `docs/history.md`).
 //!
 //! Call sites (`src/lib.rs::decode_one_frame`, `src/tile/residual.rs`) hold a
 //! [`StageTimer`] for the duration of a stage; on drop it adds the elapsed time to a

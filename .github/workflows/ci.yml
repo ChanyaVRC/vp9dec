@@ -9,12 +9,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: rustfmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install rustfmt + clippy
         run: rustup component add rustfmt clippy
       - name: Format check
@@ -33,7 +36,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build
         run: cargo build --all-targets
       # The conformance/sweep tests skip cleanly when the (uncommitted, ~3.5 GB) vector corpus
@@ -45,3 +48,22 @@ jobs:
         run: cargo test
         env:
           VP9DEC_NO_SIMD: "1"
+
+  test-aarch64:
+    name: test / ubuntu-24.04-arm (native aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify runner architecture
+        run: |
+          test "$(uname -m)" = "aarch64"
+          rustc -vV | grep -q "^host: aarch64-unknown-linux-gnu$"
+      - name: Build
+        run: cargo build --all-targets
+      # This executes the scalar fallback on real Arm64 hardware. The forced-scalar rerun above
+      # is x86-specific coverage and would exercise the same path again on this runner.
+      - name: Test
+        run: cargo test

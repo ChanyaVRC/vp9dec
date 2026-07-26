@@ -8,9 +8,9 @@
 //! motion compensation / sub-pixel interpolation is performed via
 //! [`predict_inter`](crate::predict::predict_inter) (spec §8.5.2).
 //!
-//! [`TileDecoder::residual`] implements `residual()` from spec §6.4.21, and for each plane
+//! `TileDecoder::residual` implements `residual()` from spec §6.4.21, and for each plane
 //! performs intra prediction ([`crate::predict::predict_intra`]) -> token decoding
-//! ([`TileDecoder::tokens_and_reconstruct`], spec §6.4.24-6.4.26) -> inverse quantization,
+//! (`TileDecoder::tokens_and_reconstruct`, spec §6.4.24-6.4.26) -> inverse quantization,
 //! inverse transform, and reconstruction (spec §8.6.2), writing the result into the frame
 //! buffers in [`TileDecoder::planes`].
 //! The loop filter (spec §8.8) is applied separately, via [`TileDecoder::apply_loop_filter`],
@@ -167,12 +167,12 @@ impl Default for MiInfo {
 /// arrays into a single struct. Its size is `Sb64Cols*8 x Sb64Rows*8`
 /// (allocated to also cover the portion of edge superblocks that extends past the frame).
 ///
-/// A tile-parallel worker instead holds a *column strip* ([`MiGrid::new_strip`]) covering only
+/// A tile-parallel worker instead holds a *column strip* (`MiGrid::new_strip`) covering only
 /// the absolute MI columns `[col0, col0 + cols)`; accessors keep taking **absolute** columns
 /// (the origin is subtracted internally), mirroring [`Plane`]'s strip scheme.
 ///
 /// Not `Clone`: the previous frame's grid is shared into the next frame's `TileDecoder` via
-/// `Arc<MiGrid>` (see [`crate::Decoder::prev_mi_grid`]) rather than deep-cloned.
+/// `Arc<MiGrid>` (see `crate::Decoder::prev_mi_grid`) rather than deep-cloned.
 #[derive(Debug)]
 pub struct MiGrid {
     cols: usize,

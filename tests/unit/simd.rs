@@ -95,8 +95,9 @@ fn avx2_w4_matches_w8_leftmost_four_columns() {
 /// the scalar `predict::block_inter_predict_scalar` across: widths (4 -- the padded single
 /// group -- and the 8-wide-group multiples), scale steps on both axes (upscale 1, the
 /// spec-conformant range up to the §8.5.2.3 maximum 32, mixed x/y including one axis
-/// unscaled), start positions engaging the left/top edge clamp, the right/bottom clamp,
-/// and interior subpel phases, and all bit depths (8/10/12 via `max_val`). The filter
+/// unscaled, and fully unscaled 16/16), start positions engaging the left/top edge clamp,
+/// the right/bottom clamp, and interior subpel phases, and all bit depths (8/10/12 via
+/// `max_val`). The filter
 /// index rotates pseudo-randomly across the matrix, covering all 4 filter banks over the
 /// run. The (w=64, x_step=32) case lands `span` exactly on the MAX_INTERMEDIATE_HEIGHT
 /// scratch bound.
@@ -121,6 +122,7 @@ fn scaled_inter_predict_avx2_matches_scalar() {
                 (1i64, 32i64),
                 (8, 8),
                 (9, 27),
+                (16, 16),
                 (16, 24),
                 (24, 16),
                 (31, 31),

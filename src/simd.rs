@@ -1,12 +1,12 @@
 //! AVX2 SIMD kernels, x86_64-only (`core::arch::x86_64` intrinsics, zero dependencies),
-//! runtime-detected and force-disabled via [`avx2_enabled`]. The scalar decode paths own
+//! runtime-detected and force-disabled via [`crate::simd::avx2_enabled`]. The scalar decode paths own
 //! every dispatch point and fallback; this module owns only the vector kernels, split by
 //! pipeline stage into submodules (all entry points re-exported here, so call sites use
 //! `crate::simd::<kernel>`):
 //!
 //! - `inter`: the inter-prediction two-pass 8-tap subpel convolution (spec §8.5.2.4),
-//!   unscaled (widths 8+ and 4) and scaled-reference (SVC / resize); `predict.rs`
-//!   dispatches.
+//!   direct-load unscaled kernels (widths 8+ and 4) plus a general edge-clamping kernel
+//!   for scaled references and unscaled reference-edge blocks; `predict.rs` dispatches.
 //! - `loop_filter`: the deblocking edge filters (spec §8.8.5, narrow / wide8 / wide16) for
 //!   both edge orientations; `loop_filter.rs` dispatches.
 //! - `transform`: the inverse DCT/ADST transforms fused with reconstruction (spec §8.7);
@@ -41,10 +41,10 @@ use std::sync::OnceLock;
 /// `predict::block_inter_predict` calls this once per inter-predicted plane block).
 ///
 /// `VP9DEC_NO_SIMD` (any value, checked once) forces the scalar path even on an
-/// AVX2-capable machine -- the wave-2 verification hook to exercise the fallback path
-/// (see docs/implementation-notes.md "SIMD wave 2"): the official/ffmpeg-cross-decode
-/// sweeps are run once with this unset (SIMD path) and once with it set (scalar path),
-/// both expected to pass, to prove the two agree.
+/// AVX2-capable machine. The full official sweep runs once with this unset and once with
+/// it set; `tests/simd_scalar_differential_test.rs` also uses isolated processes to compare
+/// the two modes on generated conformant streams. The independent ffmpeg cross-decode is a
+/// separate acceptance check.
 pub fn avx2_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {

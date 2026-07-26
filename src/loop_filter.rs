@@ -20,7 +20,7 @@
 //!
 //! For decode speed each plane is deblocked independently (the planes are disjoint buffers that
 //! never read one another) and, above a size threshold, in parallel: within a plane the superblock
-//! rows are filtered by a WAVEFRONT of worker threads ([`wavefront_filter_planes`]), each row
+//! rows are filtered by a WAVEFRONT of worker threads (`wavefront_filter_planes`), each row
 //! lagging the one above by two superblocks so their shared-corner writes stay ordered. This is
 //! bit-exact -- the per-plane (row, col, pass) raster order above is preserved exactly; only
 //! independent superblocks (and planes) ever run concurrently.
@@ -691,7 +691,8 @@ fn superblock_loop_filter<P: PlaneAccess>(
 /// same `edge_position_params` the scalar loop uses -- only the pixel arithmetic is vectorized.
 /// All three filter sizes (TX_4X4 narrow / TX_8X8 wide8 / TX_16X16 wide2) are batched; the
 /// kernel's per-lane `is_tx8`/`is_tx16` masks pick each lane's filter, mirroring
-/// `sample_filtering`'s three-way branch (see docs/implementation-notes.md "SIMD wave 3").
+/// `sample_filtering`'s three-way branch (see the current SIMD summary in
+/// `docs/implementation-notes.md`).
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 fn superblock_loop_filter_edge_avx2<P: PlaneAccess>(

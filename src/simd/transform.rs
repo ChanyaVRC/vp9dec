@@ -1068,7 +1068,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_avx2(
 
 /// High-bit-depth (10/12-bit) companion to [`inverse_transform_dct_dct_reconstruct_avx2`]: the
 /// same fused DCT_DCT inverse transform + reconstruction, but with the butterfly products
-/// widened to i64 (see [`b_op_simd_hbd`] -- at 10/12-bit they overflow the 8-bit kernel's i32
+/// widened to i64 (see `b_op_simd_hbd` -- at 10/12-bit they overflow the 8-bit kernel's i32
 /// `mullo`) and the reconstruction clip at `(1 << bit_depth) - 1`. Bit-exact with the scalar
 /// transform-then-reconstruct for conformant 10/12-bit streams (spec §8.7.1.1's `8 + BitDepth`
 /// bound keeps all stored intermediates inside the i32 lanes).
@@ -1153,7 +1153,7 @@ pub unsafe fn inverse_transform_adst_reconstruct_avx2(
 /// i64-lane network (see the i64 section comment -- at 10/12-bit the ADST's unrounded `S`
 /// array exceeds i32 lane storage) with the clip at `(1 << bit_depth) - 1`. Both axes of a
 /// mixed block run in i64 (`xform_pass_i64`), so the driver is self-contained. The final
-/// column-pass outputs are narrowed to i32 for the shared [`reconstruct_add_clip`]: exact,
+/// column-pass outputs are narrowed to i32 for the shared `reconstruct_add_clip`: exact,
 /// because they are post-`round2(min(n+2, 6))` stored values that spec §8.7.1.1 bounds to
 /// signed `8 + BitDepth` <= 20 bits on a conformant stream (and even adversarial full-range
 /// inputs keep them under ~2^28: per-pass L-inf gain <= ~2^6, then >> at least 4). On

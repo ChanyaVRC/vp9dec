@@ -196,10 +196,10 @@ fn parses_inter_frame_using_ref_frame_size() {
 
 #[test]
 fn effective_frame_context_idx_forces_zero_only_for_intra_or_error_resilient() {
-    // Fold check (backlog "frame_context_idx dual field"): the raw f(2) value is the single
-    // stored field, and effective_frame_context_idx() derives the load/save index by forcing
-    // it to 0 exactly when FrameIsIntra || error_resilient_mode -- reproducing the old
-    // parse-time computation. The raw field itself is never mutated by the reset.
+    // Regression check: the raw f(2) value is the single stored field, and
+    // effective_frame_context_idx() derives the load/save index by forcing it to 0 exactly
+    // when FrameIsIntra || error_resilient_mode. The raw field itself is never mutated by
+    // the reset.
     let mut prev = PersistentState::default();
     prev.ref_frame_sizes[0] = (8, 8);
     let (header, _) =

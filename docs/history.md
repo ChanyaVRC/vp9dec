@@ -18,6 +18,7 @@ finer than the summaries below lives in the git log.
 | M4 | The full official-vector sweep, then profiles 1-3 (10/12-bit and 4:2:2 / 4:4:0 / 4:4:4). 315/315 vectors bit-exact. |
 | M5 | Decode performance: all-depth AVX2 for inter prediction, loop filtering, and every non-lossless inverse transform; tile-column parallel decode and a loop-filter wavefront. The sweep remained 315/315 with SIMD enabled and forced scalar; 1080p reached about 98 MP/s single-tile and 155 MP/s with four tiles. |
 | M6 | Hardening and maintenance: official invalid vectors reached 21/21, deterministic malformed-input fuzzing guarded against panics, decoder structure was consolidated, and unit-test bodies moved under `tests/unit/`. |
+| M7 | Coverage close-out: a wide profile-3 HBD stream covered multi-tile `U16` strips; structure-aware fuzzing reached stateful entropy paths; 27 generated conformant scenarios compared SIMD with forced scalar in isolated processes; and the last material x86 inter-prediction fallback (unscaled reference edges) moved to AVX2. Measurement kept intra prediction and lossless WHT scalar, while NEON remains conditional on a concrete aarch64 target. |
 
 ## Notes from the build
 
