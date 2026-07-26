@@ -2,8 +2,8 @@ name: Release
 
 # Publishes to crates.io and cuts a GitHub Release when a `vX.Y.Z` tag is pushed.
 # Idempotent: skips `cargo publish` if that version is already on crates.io, and skips the
-# GitHub Release if it already exists -- so re-tagging or re-running is safe (e.g. a version
-# that was first published manually).
+# GitHub Release if it already exists, so rerunning the same tag is safe (e.g. a version that
+# was first published manually). Published tags themselves must never be moved.
 # Prerequisites:
 #   - the pushed tag must match the `version` in Cargo.toml (guarded below)
 #   - a `CARGO_REGISTRY_TOKEN` repo secret -- only needed when actually publishing a new version
@@ -26,6 +26,8 @@ jobs:
       contents: write # to create the GitHub Release
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Verify tag matches crate version
         run: |
           crate_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -33,8 +35,17 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version v$crate_ver"
             exit 1
           fi
-      - name: Test
-        run: cargo test
+      - name: Test source tree
+        run: cargo test --locked
+      - name: Verify packaged crate
+        run: |
+          crate_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          cargo package --locked
+          package_root="$(mktemp -d)"
+          tar -xzf "target/package/vp9dec-$crate_ver.crate" -C "$package_root"
+          package_manifest="$package_root/vp9dec-$crate_ver/Cargo.toml"
+          cargo test --locked --manifest-path "$package_manifest"
+          cargo test --locked --manifest-path "$package_manifest" --all-features
       - name: Publish to crates.io (skip if this version is already published)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -46,7 +57,7 @@ jobs:
             echo "vp9dec $ver is already on crates.io -- skipping publish."
           else
             echo "Publishing vp9dec $ver to crates.io..."
-            cargo publish
+            cargo publish --locked
           fi
       - name: Create GitHub Release (skip if it already exists)
         env:

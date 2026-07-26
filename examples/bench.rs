@@ -93,7 +93,7 @@ fn main() {
         #[cfg(feature = "test-support")]
         vp9dec::tile::FORCE_TILE_WORKERS.store(n, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(feature = "test-support"))]
-        panic!("--tile-workers requires --features test-support");
+        panic!("--tile-workers={n} requires --features test-support");
     }
     if files.is_empty() {
         let vectors_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
