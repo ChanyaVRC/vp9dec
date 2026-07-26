@@ -77,13 +77,15 @@ Pipeline order, hub-first:
 - **High-bit-depth scaling in `loop_filter`.** Its constants are 8-bit and scale by
   `<< (bit_depth - 8)` (identity at 8-bit). Any loop-filter change must be re-checked at
   8 / 10 / 12-bit, not just 8-bit.
-- **Only the ADST SIMD kernels are 8-bit-gated.** The AVX2 inter-prediction (unscaled and
-  reference-scaled), loop-filter, and DCT_DCT-transform kernels run at **all** bit depths, each
-  depth-aware by a different mechanism (a `max_val` clip bound / `<< (bit_depth-8)` constant
-  scaling / i64-widened butterfly products). The ADST-containing transform kernels dispatch only
-  at `bit_depth == 8` (their unrounded `S` array exceeds i32 lane storage at 10/12-bit) and MUST
-  stay gated. Any new kernel with hardcoded 8-bit constants or i32-tight arithmetic needs the
-  same gate until made depth-aware — see the landmines in `docs/implementation-notes.md`.
+- **ADST SIMD splits by bit depth; both paths are load-bearing.** AVX2 inter-prediction
+  (including unscaled reference edges), loop filtering, DCT_DCT transforms, and ADST-containing
+  transforms all run at **all** bit depths, but by different mechanisms. The 8-bit ADST entry
+  (`inverse_transform_adst_reconstruct_avx2`) uses i32 lanes and MUST stay 8-bit-gated because
+  the unrounded `S` array exceeds i32 lane storage at 10/12-bit. HBD dispatches to the distinct
+  i64-lane entry (`inverse_transform_adst_reconstruct_hbd_avx2`), which keeps both transform axes
+  in i64 until the final re-bounded result. Do not route HBD through the i32 network or remove the
+  split. Any new kernel with hardcoded 8-bit constants or i32-tight arithmetic needs an 8-bit
+  gate until made depth-aware — see the landmines in `docs/implementation-notes.md`.
 - **Do not "fix" the sub-8x8 chroma MV block index in `residual.rs`.** `(y * num4x4w + x)` is
   bit-exact-correct; a plausible, spec-grounded "correction" to it once *regressed* the official
   4:2:2 vector. Verify against the sweep before touching it.

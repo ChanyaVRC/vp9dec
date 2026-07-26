@@ -25,11 +25,13 @@ overview. A resolved bug needs no entry.
   (performance only — the sweep is byte-identical before/after).
 - **SIMD.** AVX2 covers, for **all bit depths**: inter-prediction -- unscaled (widths 8/16/32/64
   via `block_inter_predict_avx2`, width 4 via the 128-bit `block_inter_predict_avx2_w4`) and
-  reference-scaled (SVC / resize, `block_inter_predict_scaled_avx2`: the horizontal pass's
-  per-column subpel phase + source column are row-invariant, so they are precomputed per call
-  and each tap's samples fetched by `_mm256_i32gather_epi32` from a per-row i32 scratch of the
-  edge-clamped source span; the vertical pass's phase/base row are uniform per output row --
-  no gathers; edge clamping happens inside the kernel, so no `in_bounds` fallback); the subpel
+  the general edge-clamping path (`block_inter_predict_scaled_avx2`), used both for reference-
+  scaled prediction (SVC / resize) and for unscaled blocks whose filter window crosses a
+  reference edge: the horizontal pass's per-column subpel phase + source column are row-
+  invariant, so they are precomputed per call and each tap's samples fetched by
+  `_mm256_i32gather_epi32` from a per-row i32 scratch of the edge-clamped source span; the
+  vertical pass's phase/base row are uniform per output row -- no gathers; edge clamping happens
+  inside the kernel, so no scalar border fallback; the subpel
   FIR is bit-depth-agnostic and its i32 accumulation holds a 12-bit sample, so only the `clip1`
   bound differs -- the caller passes `max_val = (1<<bit_depth)-1`; loop-filter edges on
   **both** passes -- horizontal (`loop_filter_horiz8_avx2`) and vertical (`loop_filter_vert8_avx2`,
@@ -48,7 +50,12 @@ overview. A resolved bug needs no entry.
   one self-contained i64 driver; see the landmine below). Among the transforms only WHT
   (lossless) stays scalar.
   Runtime-detected and cached; `VP9DEC_NO_SIMD=1` forces scalar. Output must equal the scalar
-  path — the sweep passes 315/315 in both configs.
+  path — the sweep passes 315/315 in both configs. Routing unscaled reference-edge blocks
+  through the general kernel cut their measured stage time by 2.66-2.90x and improved whole-
+  clip throughput by 28-35% on representative 426p/1080p content. A focused width-4 edge
+  benchmark covered 8/10/12-bit, heights 4/8, and all four borders: all 24 cells were faster
+  than scalar (1.21x minimum, 1.38x aggregate), so the padded 8-lane gather is still a win for
+  the narrowest blocks.
 - **Tile-parallel decode.** A frame with >1 tile column and exactly 1 tile row decodes each tile
   column on its own worker `TileDecoder` (`std::thread::scope`, no external crate), then merges
   the disjoint column strips (planes + mi_grid) and sums the per-worker adaptation counts back
@@ -75,6 +82,12 @@ overview. A resolved bug needs no entry.
   single-threaded loop filter, so 1080p decodes at ~98 MP/s (single-tile) / ~155 MP/s (4-tile). A
   persistent cross-frame pool was evaluated and rejected (the residual per-frame spawn is ~0.5% of
   decode, not worth the `unsafe` lifetime erasure it needs).
+- **Generated robustness / differential coverage.** `tests/structured_fuzz_test.rs` preserves
+  uncompressed headers, chunk/superframe/tile boundaries, and valid prefix frames while mutating
+  compressed-header or tile entropy suffixes; `VP9DEC_FUZZ_LONG_ITERS` enables a bounded extended
+  campaign. `tests/simd_scalar_differential_test.rs` starts isolated SIMD and forced-scalar
+  processes and compares the exact input plus decoded output of 27 conformant generated
+  scenarios spanning profiles, bit depths, subsampling, segmentation, HBD tiles, and 2x scaling.
 
 Architecture and the module map live in `README.md`; the acceptance gate is the `verify-vp9dec`
 skill; change-navigation is the `vp9dec-architecture` skill.
@@ -145,8 +158,10 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   (likewise the i64-lane ADST driver's final i32 narrowing), so
   SIMD-on vs `VP9DEC_NO_SIMD=1` outputs can legitimately diverge on garbage input -- a
   differential fuzzer comparing the two configs on a malformed corpus would misread that as a
-  SIMD bug; only conformant streams are comparable.
-- **The scaled inter-pred dispatch's two bound checks (`predict.rs`: `intermediate_height` and
+  SIMD bug; only conformant streams are comparable. The generated differential test above
+  deliberately emits skipped/lossless conformant blocks, so malformed coefficient overflow
+  cannot contaminate its oracle.
+- **The edge-clamping inter-pred dispatch's two bound checks (`predict.rs`: `intermediate_height` and
   the horizontal `span`, both `<= MAX_INTERMEDIATE_HEIGHT`) are safety guards for the unsafe
   kernel's fixed scratch -- redundant by construction since the per-block ratio rejection, but
   keep them.** Out-of-range scaling ratios never reach any predict path anymore: `decode_block`
@@ -201,11 +216,14 @@ skill; change-navigation is the `vp9dec-architecture` skill.
 
 ## Known gaps
 
-- **No SIMD for: intra prediction or the WHT (lossless) inverse transform** (inter-prediction
-  -- unscaled and reference-scaled -- the loop filter, and every non-lossless inverse
-  transform -- DCT_DCT and the ADST-containing types -- are vectorized at all bit depths; nor
-  aarch64 NEON). The scalar path there is correct and bit-exact; this is a performance gap
-  only, tracked in `docs/backlog.md`. (Intra prediction profiled at ~0.3% on inter content.)
+- **Deliberately scalar / target-conditional SIMD paths.** Intra prediction and the lossless
+  4x4 WHT remain scalar; aarch64 uses the same scalar fallback and has no NEON mirror. The x86
+  measurement gate found intra prediction at 0.3-1.7% on representative inter content and 3.1%
+  (0.9 ms total) on the short intra-only vector. The WHT-containing inverse-transform stage was
+  7.9% (1.6 ms total) on a two-frame lossless vector, but is absent from ordinary lossy content.
+  These do not justify more architecture-specific code for the current workload. Revisit only
+  for a measured intra/lossless workload or a concrete aarch64 deployment target; neither is
+  open work today.
 - **`SEG_LVL_ALT_L` / `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` have no official test vector.** They
   are proven instead by synthetic round-trip vectors (`tests/synthetic_seg_test.rs`)
   cross-decoded byte-identically by ffmpeg's `libvpx-vp9` and native `vp9` decoders.

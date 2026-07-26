@@ -1,9 +1,10 @@
 //! AVX2 SIMD mirror of `predict::block_inter_predict`'s scalar two-pass 8-tap subpel
 //! convolution (spec §8.5.2.4): specialized kernels for the common UNSCALED case
-//! (`x_step == y_step == 16`, i.e. reference frame same size as the current frame -- see
-//! docs/implementation-notes.md "SIMD wave 2") plus a general SCALED-reference kernel
-//! (SVC / resize, [`block_inter_predict_scaled_avx2`]). `predict.rs` owns the dispatch and
-//! the scalar fallback; this module owns only the vector kernels.
+//! (`x_step == y_step == 16`, i.e. reference frame same size as the current frame) plus a
+//! general edge-clamping kernel
+//! ([`block_inter_predict_scaled_avx2`]). The latter handles both scaled references (SVC /
+//! resize) and unscaled blocks whose 8-tap window crosses a reference edge. `predict.rs`
+//! owns the dispatch and the scalar fallback; this module owns only the vector kernels.
 
 use crate::predict::{MAX_BLOCK_DIM, MAX_INTERMEDIATE_HEIGHT};
 use crate::subpel::SUBPEL_FILTERS;
@@ -18,7 +19,8 @@ use std::arch::x86_64::*;
 /// (`p & 15` and `p >> 4 - c` are both step-invariant when `step == 16`).
 ///
 /// `w` must be a multiple of 8 (this processes 8 output columns per AVX2 lane group;
-/// width-4 blocks stay on the scalar path). `h <= MAX_BLOCK_DIM`,
+/// width-4 blocks use the companion `_w4` kernel or the general edge-clamping kernel).
+/// `h <= MAX_BLOCK_DIM`,
 /// `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`. Works for all bit depths: `ref_data` is
 /// `Plane::as_slice()`'s `u16` buffer (every plane is `u16`-backed, see `framebuffer.rs`), the
 /// subpel FIR is bit-depth-agnostic, and the i32 accumulation holds a 12-bit sample through both
@@ -32,9 +34,8 @@ use std::arch::x86_64::*;
 /// `src_col0..src_col0 + w + 7` of `ref_data` (row-major, stride `ref_width`) -- lies
 /// within `ref_data`'s bounds. Unlike the scalar path, this function does **not**
 /// clamp/border-replicate: reproducing that with AVX2 would need a byte gather (x86 has
-/// none), so the caller instead falls back to the scalar path whenever any of those
-/// reads would land outside `ref_data` (only near reference-frame edges -- see
-/// `predict.rs`'s `in_bounds` check).
+/// none), so the caller instead routes an out-of-bounds window to the general
+/// edge-clamping AVX2 kernel (see `predict.rs`'s `unscaled_in_bounds` check).
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn block_inter_predict_avx2(
@@ -136,8 +137,9 @@ pub unsafe fn block_inter_predict_avx2(
 /// Same contract as [`block_inter_predict_avx2`] with `w == 4`: caller must have confirmed
 /// `avx2_enabled()` and that every source pixel this reads -- rows
 /// `src_row0..src_row0 + intermediate_height` and columns `src_col0..src_col0 + 4 + 7` of
-/// `ref_data` (row-major, stride `ref_width`) -- is within bounds (the caller's `in_bounds`
-/// check covers this, falling back to the scalar path near reference-frame edges).
+/// `ref_data` (row-major, stride `ref_width`) -- is within bounds (the caller's
+/// `unscaled_in_bounds` check covers this and routes reference-edge blocks to the general
+/// edge-clamping kernel).
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn block_inter_predict_avx2_w4(
@@ -205,11 +207,12 @@ pub unsafe fn block_inter_predict_avx2_w4(
     }
 }
 
-/// AVX2 mirror of `predict::block_inter_predict_scalar`'s two-pass 8-tap subpel FIR for the
-/// SCALED-reference case (spec §8.5.2.3-8.5.2.4: `x_step`/`y_step` != 16 -- SVC / resize
-/// streams, where the reference frame is a different size than the current frame). Same
-/// arithmetic, accumulation order, `round2(7)` and `clip1` as the scalar loops -- bit-exact by
-/// construction. What differs structurally from the unscaled kernels:
+/// General edge-clamping AVX2 mirror of `predict::block_inter_predict_scalar`'s two-pass
+/// 8-tap subpel FIR (spec §8.5.2.3-8.5.2.4). Used for scaled references (`x_step`/`y_step`
+/// differ from 16 -- SVC / resize) and for unscaled blocks whose filter window crosses a
+/// reference edge. Same arithmetic, accumulation order, `round2(7)` and `clip1` as the scalar
+/// loops -- bit-exact by construction. What differs structurally from the direct-load unscaled
+/// kernels:
 ///
 /// - **Horizontal pass**: the source position `p = x + x_step*c` gives every output column its
 ///   own subpel phase `p & 15` (filter row) and source column `p >> 4`. Both are ROW-invariant,

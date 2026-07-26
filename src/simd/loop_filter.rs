@@ -11,13 +11,13 @@ use std::arch::x86_64::*;
 /// (§8.8.5.3, `log2_size == 3`) and wide 16-tap (§8.8.5.3, `log2_size == 4`, the `TX_16X16`
 /// "wide2" filter) deblocking filters, applied to 8 contiguous along-edge positions on a
 /// HORIZONTAL edge (loop_filter.rs pass==1: taps run in the row direction, i.e. `dx=0,dy=1`
-/// in that file's terms) -- see docs/implementation-notes.md "SIMD wave 3".
+/// in that file's terms) -- see the current SIMD summary in `docs/implementation-notes.md`.
 /// Vertical edges (pass==0) are handled by [`loop_filter_vert8_avx2`], which transposes the tap
 /// window into this kernel's row-major layout and reuses this exact arithmetic.
 ///
 /// `plane_base`/`plane_width` is the raw row-major plane buffer (stride == `plane_width`,
-/// `u16`-backed regardless of bit depth -- see `framebuffer.rs`; the caller only dispatches
-/// here for `bit_depth == 8`, so every sample is known to fit in `0..=255`).
+/// `u16`-backed regardless of bit depth -- see `framebuffer.rs`. The caller passes `bit_depth`;
+/// the kernel scales its constants accordingly and supports 8/10/12-bit samples.
 /// `(x0, y0)` is lane 0's position (loop_filter.rs's `sample_filtering(x, y, ...)` for the
 /// first of the 8 lanes); the other 7 lanes are the next 7 contiguous columns
 /// `x0+1..=x0+7` at the same row `y0` (this orientation's along-edge axis -- see the

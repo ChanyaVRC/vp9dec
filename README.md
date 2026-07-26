@@ -93,13 +93,21 @@ RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_s
 | Segmentation: seg-id decode, `SEG_LVL_ALT_Q` | Included in the `vp90-2-15-segkey*` bit-exact matches in the sweep |
 | Segmentation: `SEG_LVL_ALT_L`, `SEG_LVL_REF_FRAME`, `SEG_LVL_SKIP` (no official vector exists for these -- see below) | Synthetic round-trip vectors (`tests/synthetic_seg_test.rs`) cross-decoded byte-identically by two independent third-party VP9 decoders (ffmpeg's `libvpx-vp9` and its native `vp9`), 8/8 `[xdecode]` checks (4 scenarios x 2 decoders) |
 | Loop filter, including the `SEG_LVL_ALT_L` level-override path and the frame-level `loop_filter_level == 0` gate | Exercised by the whole sweep; the `SEG_LVL_ALT_L` and level-0-gate synthetic vectors additionally pin exact hand-derived pixel values (not just "output changed") that match both ffmpeg decoders |
+| Profile-3 HBD multi-tile output (a combination too wide for the official HBD vectors) | A conformant synthetic 512x64 10-bit 4:4:4 key frame (`tests/synthetic_hbd_tile_test.rs`) produces exact split-plane values, matches forced-sequential tile decode, and cross-decodes byte-identically with ffmpeg's `libvpx-vp9` and native `vp9` decoders |
 | Malformed-input rejection at libvpx parity | The official libvpx `invalid-*` corpus (`kVP9InvalidFileTests`): `tests/invalid_vector_test.rs` decodes each vector packet by packet and requires an `Err` at exactly the packet libvpx's `.res` sidecar first rejects -- 21/21. (`tests/robustness_test.rs` separately fuzzes for no-panic-on-arbitrary-corruption.) |
+
+Internal regression coverage additionally compares exact SIMD and forced-scalar reports for 27
+generated conformant scenarios in isolated processes (`tests/simd_scalar_differential_test.rs`).
+`tests/structured_fuzz_test.rs` preserves uncompressed headers, prior chunks, superframe indexes,
+and tile partitioning while mutating compressed-header or tile entropy suffixes, complementing
+the arbitrary-corruption fuzz.
 
 ### Known limits
 
 | Limit | Detail |
 | --- | --- |
-| No SIMD for intra prediction or the WHT (lossless) inverse transform | The AVX2 kernels (`src/simd/{inter, loop_filter, transform}.rs`, re-exported by the `src/simd.rs` hub) cover inter prediction (unscaled and reference-scaled), the loop filter (both edge directions), and every non-lossless inverse transform (DCT_DCT and the ADST-containing types) at all bit depths; the rest uses the (correct, bit-exact) scalar path. A perf gap only, tracked in `docs/backlog.md`. |
+| Intra prediction and the WHT (lossless) inverse transform stay scalar | AVX2 covers all inter prediction (including reference-edge clamping), both loop-filter directions, and every non-lossless inverse transform at all bit depths. Measurements kept the remaining paths scalar: intra prediction was at most 1.7% on representative inter content and 3.1% on the short intra-only vector; the WHT-containing stage was 1.6 ms on a two-frame lossless vector. Revisit for a measured workload where either is material. |
+| No aarch64 NEON kernels | Non-x86 targets use the bit-exact scalar fallback. A NEON mirror is intentionally conditional on a concrete aarch64 deployment and workload; there is no such target in scope today. |
 | 19 corpus clips ship no upstream `.md5` | The 7 `vp90-2-bbb_*` and 12 `vp90-2-tos_*`/`vp90-2-sintel_*` movie clips ship only a `.webm` upstream (libvpx uses them for its own perf tests, not md5 conformance), so the sweep cannot MD5-check them; the fetch scripts still download/remux them, and they are excluded from the sweep's 315. They are instead cross-checked against ffmpeg's `libvpx-vp9`: the 12 tos/sintel clips (full-length movies, up to 1920x800) in full (all 268,832 displayed frames byte-identical), and the 7 bbb clips as a spot-check (first 1000 frames each, `tests/bbb_cross_check.rs`). |
 
 ## Tests & verification
@@ -108,6 +116,9 @@ RUST_MIN_STACK=16777216 cargo test --release --test sweep_test official_vector_s
 cargo test                 # unit + integration tests
 cargo clippy --all-targets
 cargo fmt --check
+
+# Optional bounded structure-aware fuzz campaign (release recommended).
+VP9DEC_FUZZ_LONG_ITERS=10000 cargo test --release --test structured_fuzz_test -- --nocapture
 ```
 
 `cargo test` runs the library's unit tests plus the integration tests under `tests/`. Anything
@@ -148,7 +159,7 @@ BT.601 RGB PNG to `target/dump/` (with its own from-scratch, dependency-free PNG
 ## History
 
 [docs/history.md](docs/history.md) is a concise milestone-by-milestone record of how the
-decoder was built (M1 through profiles 1-3). Still-relevant design rationale, landmines, and
+decoder was built (M1 through M7). Still-relevant design rationale, landmines, and
 known gaps are in [docs/implementation-notes.md](docs/implementation-notes.md); the detailed,
 change-by-change history is in the git log.
 
