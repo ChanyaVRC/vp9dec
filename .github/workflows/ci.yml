@@ -49,6 +49,30 @@ jobs:
         env:
           VP9DEC_NO_SIMD: "1"
 
+  test-release:
+    name: test-release / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Guard opt-level=3 codegen (rustc/LLVM regressions and SIMD miscompilations under
+      # release optimizations) across both SIMD configurations without adding serial runtime
+      # to the debug test matrix.
+      - name: Build (release)
+        run: cargo build --release --all-targets
+      - name: Test (release, SIMD auto-detected)
+        run: cargo test --release
+      - name: Test (release, forced scalar)
+        run: cargo test --release
+        env:
+          VP9DEC_NO_SIMD: "1"
+
   test-aarch64:
     name: test / ubuntu-24.04-arm (native aarch64)
     runs-on: ubuntu-24.04-arm
@@ -67,3 +91,7 @@ jobs:
       # is x86-specific coverage and would exercise the same path again on this runner.
       - name: Test
         run: cargo test
+      - name: Build (release)
+        run: cargo build --release --all-targets
+      - name: Test (release)
+        run: cargo test --release
