@@ -1,6 +1,6 @@
 [package]
 name = "vp9dec"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A from-scratch, clean-room VP9 video decoder (Rust, zero dependency crates)"
 license = "MIT"
