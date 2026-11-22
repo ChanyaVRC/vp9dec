@@ -1,6 +1,6 @@
 use super::transform::{
     b_op_simd, b_op_simd_hbd, iadst_i64, iadst_simd, idct_i64, idct_permute_simd, idct_simd,
-    sb_op_simd, sh_op_simd,
+    iwht4_simd, sb_op_simd, sh_op_simd,
 };
 use super::*;
 use crate::predict::MAX_INTERMEDIATE_HEIGHT;
@@ -981,6 +981,501 @@ fn inverse_transform_adst_reconstruct_simd_matches_scalar() {
                          {plane_width}: fused ADST SIMD != scalar"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// The vector 1D inverse WHT (`iwht4_simd::<true>` for row `shift == 2` and
+/// `iwht4_simd::<false>` for column `shift == 0`) must exactly reproduce scalar
+/// `transform::iwht4` on all 4 lanes, across negative/positive arithmetic-shift corners
+/// (`-4..=4`), full 12-bit spec §8.7.1.1 signed bounds (`±2^19`), and randomized draws.
+#[test]
+fn iwht4_simd_1d_matches_scalar() {
+    if !avx2_enabled() {
+        return;
+    }
+    let mut seed = 0x7047_1D04u32;
+    let half = 1i64 << 19;
+    let mask = (1u32 << 20) - 1;
+    let corner_rows: [[i64; 4]; 8] = [
+        [0, 0, 0, 0],
+        [-1, -1, -1, -1],
+        [-3, -2, -1, 1],
+        [1, -3, 2, -4],
+        [-half, -half, -half, -half],
+        [half - 1, half - 1, half - 1, half - 1],
+        [-half, half - 1, -half, half - 1],
+        [half - 1, -half, half - 1, -half],
+    ];
+
+    for &row_shift in &[true, false] {
+        let shift = if row_shift { 2u32 } else { 0u32 };
+        for trial in 0..502 {
+            let mut rows = [[0i64; 4]; 4];
+            if trial < 2 {
+                rows.copy_from_slice(&corner_rows[trial * 4..trial * 4 + 4]);
+            } else {
+                for row in rows.iter_mut() {
+                    for v in row.iter_mut() {
+                        *v = if trial < 52 {
+                            // Small signed values to hammer odd/even negative shift rounding.
+                            (xorshift32(&mut seed) & 0x1F) as i64 - 16
+                        } else {
+                            (xorshift32(&mut seed) & mask) as i64 - half
+                        };
+                    }
+                }
+            }
+
+            let mut scalar = rows;
+            for row in scalar.iter_mut() {
+                crate::transform::iwht4(row, shift);
+            }
+
+            let mut t = [unsafe { _mm_setzero_si128() }; 4];
+            for (k, tk) in t.iter_mut().enumerate() {
+                let lanes: [i32; 4] = std::array::from_fn(|r| rows[r][k] as i32);
+                *tk = unsafe { _mm_loadu_si128(lanes.as_ptr() as *const __m128i) };
+            }
+            unsafe {
+                if row_shift {
+                    iwht4_simd::<true>(&mut t);
+                } else {
+                    iwht4_simd::<false>(&mut t);
+                }
+            }
+            for (k, &tk) in t.iter().enumerate() {
+                let mut lanes = [0i32; 4];
+                unsafe { _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, tk) };
+                for (r, &lane) in lanes.iter().enumerate() {
+                    assert_eq!(
+                        lane as i64, scalar[r][k],
+                        "shift={shift} trial={trial}: row {r}, elem {k}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The fused `inverse_transform_wht_reconstruct_avx2` (2D 4x4 lossless WHT + residual add +
+/// `(1 << bit_depth) - 1` clip) must exactly reproduce scalar
+/// `inverse_transform_block(..., n=2, DctDct, lossless=true)` + scalar reconstruction across
+/// all bit depths (8/10/12), both tight and nonzero-origin/wider-stride placements, corner
+/// extremes, and randomized inputs. Whole-plane equality proves zero out-of-block writes.
+#[test]
+fn inverse_transform_wht_reconstruct_simd_matches_scalar() {
+    if !avx2_enabled() {
+        return;
+    }
+    let mut seed = 0x7047_2D16u32;
+    for &bit_depth in &[8u8, 10, 12] {
+        let max_val = (1i64 << bit_depth) - 1;
+        let mask = (1u32 << (bit_depth as u32 + 8)) - 1;
+        let half = 1i64 << (bit_depth as u32 + 7);
+
+        for trial in 0..206 {
+            let mut dq = [0i64; 16];
+            for (i, v) in dq.iter_mut().enumerate() {
+                *v = match trial {
+                    0 => 0,
+                    1 => -half,
+                    2 => half - 1,
+                    3 => {
+                        if i % 2 == 0 {
+                            -half
+                        } else {
+                            half - 1
+                        }
+                    }
+                    4 => {
+                        if i % 2 == 0 {
+                            -1
+                        } else {
+                            1
+                        }
+                    }
+                    5 => (i as i64) - 8,
+                    _ => (xorshift32(&mut seed) & mask) as i64 - half,
+                };
+            }
+
+            let mut dq_s = dq;
+            crate::transform::inverse_transform_block(
+                &mut dq_s,
+                2,
+                crate::transform::TxType::DctDct,
+                true,
+            );
+
+            for &(start_x, start_y, plane_width) in &[(0usize, 0usize, 4usize), (4, 2, 12)] {
+                let pred: Vec<u16> = (0..plane_width * (start_y + 4))
+                    .map(|idx| match trial {
+                        1 => 0,
+                        2 => max_val as u16,
+                        3 => {
+                            if idx % 2 == 0 {
+                                0
+                            } else {
+                                max_val as u16
+                            }
+                        }
+                        _ => (xorshift32(&mut seed) & (max_val as u32)) as u16,
+                    })
+                    .collect();
+
+                let mut plane_scalar = pred.clone();
+                for i in 0..4 {
+                    for j in 0..4 {
+                        let idx = (start_y + i) * plane_width + start_x + j;
+                        let old = plane_scalar[idx] as i64;
+                        plane_scalar[idx] = (old + dq_s[i * 4 + j]).clamp(0, max_val) as u16;
+                    }
+                }
+
+                let mut plane_simd = pred.clone();
+                // SAFETY: avx2_enabled() confirmed; dq has len 16; block lies within plane_simd.
+                unsafe {
+                    inverse_transform_wht_reconstruct_avx2(
+                        &mut plane_simd,
+                        plane_width,
+                        start_x,
+                        start_y,
+                        &dq,
+                        bit_depth,
+                    );
+                }
+
+                assert_eq!(
+                    plane_scalar, plane_simd,
+                    "bit_depth={bit_depth} trial={trial} at ({start_x},{start_y}) stride \
+                     {plane_width}: fused WHT SIMD != scalar"
+                );
+            }
+        }
+    }
+}
+
+/// End-to-end differential test pinning `predict::predict_intra` (AVX2 dispatch) against
+/// `predict::predict_intra_scalar` across all four SIMD intra modes (`V_PRED`, `H_PRED`,
+/// `DC_PRED`, `TM_PRED`), all four block sizes (`4x4`..`32x32`), all four neighbor-availability
+/// combinations, all three bit depths (`8/10/12`), interior + right/bottom edge-clamped +
+/// tile-column-strip (`Plane::new_strip` with `x0 > 0`) placements, and extreme + random
+/// sample patterns. Whole-plane equality proves both bit-exactness and zero out-of-block writes.
+#[test]
+fn intra_predict_avx2_matches_scalar_all_modes_sizes_depths() {
+    if !avx2_enabled() {
+        return;
+    }
+    use crate::framebuffer::Plane;
+    use crate::prob_tables::{
+        DC_PRED, H_PRED, TM_PRED, TX_16X16, TX_32X32, TX_4X4, TX_8X8, V_PRED,
+    };
+
+    let modes = [V_PRED, H_PRED, DC_PRED, TM_PRED];
+    let tx_sizes = [TX_4X4, TX_8X8, TX_16X16, TX_32X32];
+    let mut seed = 0x1A7A_51ADu32;
+
+    for &bit_depth in &[8u8, 10, 12] {
+        let max_val = ((1u32 << bit_depth) - 1) as u16;
+
+        for &tx_size in &tx_sizes {
+            let size = 1usize << (tx_size as u32 + 2);
+            // Plane big enough for interior, clamped-edge, and nonzero-origin placements.
+            let pw = size * 2 + 8;
+            let ph = size * 2 + 8;
+
+            // (x_offset_from_x0, y, plane_x0, max_x_offset_from_x0, max_y)
+            let placements: &[(usize, usize, usize, usize, usize)] = &[
+                // Interior whole-frame block (no edge clamp).
+                (size, size, 0, pw - 1, ph - 1),
+                // Right-edge clamp (above reads clamp to max_x).
+                (size, size, 0, size + size / 2 - 1, ph - 1),
+                // Bottom-edge clamp (left reads clamp to max_y).
+                (size, size, 0, pw - 1, size + size / 2 - 1),
+                // Simultaneous right + bottom clamp, with tight max_x == x and max_y == y.
+                (size, size, 0, size, size),
+                // Tile-parallel column strip (`x0 = 64`): pins absolute-to-local translation.
+                (size, size, 64, pw - 1, ph - 1),
+                // Column strip with right-edge clamp.
+                (size, size, 64, size + 1, ph - 1),
+            ];
+
+            for &(local_x, y, x0, local_max_x, max_y) in placements {
+                let x = x0 + local_x;
+                let max_x = x0 + local_max_x;
+
+                for &have_left in &[false, true] {
+                    for &have_above in &[false, true] {
+                        for pattern in 0..5usize {
+                            let mut base_plane = Plane::new_strip(pw, ph, x0);
+                            for py in 0..ph {
+                                for px in 0..pw {
+                                    let v = match pattern {
+                                        0 => 0,
+                                        1 => max_val,
+                                        2 => {
+                                            if (px + py) % 2 == 0 {
+                                                0
+                                            } else {
+                                                max_val
+                                            }
+                                        }
+                                        3 => {
+                                            // Adversarial TM_PRED extremes: above=max, left=max,
+                                            // top-left=0 (and vice versa on odd indices).
+                                            if px == local_x - 1 && py == y - 1 {
+                                                0
+                                            } else if py == y - 1 || px == local_x - 1 {
+                                                max_val
+                                            } else {
+                                                (xorshift32(&mut seed) & max_val as u32) as u16
+                                            }
+                                        }
+                                        _ => (xorshift32(&mut seed) & max_val as u32) as u16,
+                                    };
+                                    base_plane.set(x0 + px, py, v);
+                                }
+                            }
+
+                            for &mode in &modes {
+                                let mut p_scalar = base_plane.clone();
+                                let mut p_simd = base_plane.clone();
+
+                                crate::predict::predict_intra_scalar(
+                                    &mut p_scalar,
+                                    x,
+                                    y,
+                                    have_left,
+                                    have_above,
+                                    false,
+                                    tx_size,
+                                    mode,
+                                    max_x,
+                                    max_y,
+                                    bit_depth,
+                                );
+                                crate::predict::predict_intra(
+                                    &mut p_simd,
+                                    x,
+                                    y,
+                                    have_left,
+                                    have_above,
+                                    false,
+                                    tx_size,
+                                    mode,
+                                    max_x,
+                                    max_y,
+                                    bit_depth,
+                                );
+
+                                assert_eq!(
+                                    p_scalar.as_slice(),
+                                    p_simd.as_slice(),
+                                    "bd={bit_depth} size={size} mode={mode} \
+                                     avail=({have_left},{have_above}) x={x} y={y} x0={x0} \
+                                     max=({max_x},{max_y}) pat={pattern}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Origin (0, 0) with neither neighbor available (no y - 1 / x - 1 access).
+            for &mode in &modes {
+                let mut p_scalar = Plane::new(pw, ph);
+                let mut p_simd = Plane::new(pw, ph);
+                crate::predict::predict_intra_scalar(
+                    &mut p_scalar,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    tx_size,
+                    mode,
+                    pw - 1,
+                    ph - 1,
+                    bit_depth,
+                );
+                crate::predict::predict_intra(
+                    &mut p_simd,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    tx_size,
+                    mode,
+                    pw - 1,
+                    ph - 1,
+                    bit_depth,
+                );
+                assert_eq!(
+                    p_scalar.as_slice(),
+                    p_simd.as_slice(),
+                    "origin (0,0): bd={bit_depth} size={size} mode={mode}"
+                );
+            }
+        }
+    }
+}
+
+/// Direct unit test of the low-level `src/simd/intra.rs` kernels (`intra_pred_v_avx2`,
+/// `intra_pred_h_avx2`, `intra_pred_dc_avx2`, `intra_pred_tm_avx2`, `intra_pred_fill_avx2`)
+/// targeting exact `DC_PRED` rounding thresholds and `TM_PRED` clip-at-0 / clip-at-max_val
+/// corners across all sizes (`4/8/16/32`) and bit depths (`8/10/12`).
+#[test]
+fn intra_pred_direct_kernels_match_reference_on_corners_and_random() {
+    if !avx2_enabled() {
+        return;
+    }
+    let mut seed = 0xD1EC_710Au32;
+    for &bit_depth in &[8u8, 10, 12] {
+        let max_val = ((1i32 << bit_depth) - 1) as u16;
+        for log2_size in 2..=5u32 {
+            let size = 1usize << log2_size;
+            let pw = size + 6;
+            let start_x = 3usize;
+            let start_y = 2usize;
+            let total = pw * (start_y + size + 2);
+
+            for trial in 0..24 {
+                let mut above = [0u16; 32];
+                let mut left = [0u16; 32];
+                let top_left: u16 = match trial {
+                    // All zeros / all max / saturation extremes for TM_PRED.
+                    0 => {
+                        above[..size].fill(0);
+                        left[..size].fill(0);
+                        max_val
+                    }
+                    1 => {
+                        above[..size].fill(max_val);
+                        left[..size].fill(max_val);
+                        0
+                    }
+                    // Exact DC rounding boundary: sum = size / 2 - 1 (rounds down to 0) vs
+                    // sum = size / 2 (rounds up to 1).
+                    2 => {
+                        above[..size].fill(0);
+                        left[..size].fill(0);
+                        above[0] = (size / 2 - 1) as u16;
+                        left[0] = (size / 2) as u16;
+                        0
+                    }
+                    3 => {
+                        for k in 0..size {
+                            above[k] = if k % 2 == 0 { 0 } else { max_val };
+                            left[k] = if k % 2 == 0 { max_val } else { 0 };
+                        }
+                        max_val / 2
+                    }
+                    _ => {
+                        for k in 0..size {
+                            above[k] = (xorshift32(&mut seed) & max_val as u32) as u16;
+                            left[k] = (xorshift32(&mut seed) & max_val as u32) as u16;
+                        }
+                        (xorshift32(&mut seed) & max_val as u32) as u16
+                    }
+                };
+
+                let sentinel: Vec<u16> = (0..total)
+                    .map(|_| (xorshift32(&mut seed) & max_val as u32) as u16)
+                    .collect();
+
+                // V_PRED
+                let mut got = sentinel.clone();
+                let mut exp = sentinel.clone();
+                for i in 0..size {
+                    for j in 0..size {
+                        exp[(start_y + i) * pw + start_x + j] = above[j];
+                    }
+                }
+                unsafe { intra_pred_v_avx2(&mut got, pw, start_x, start_y, &above[..size], size) };
+                assert_eq!(got, exp, "V_PRED bd={bit_depth} size={size} trial={trial}");
+
+                // H_PRED
+                let mut got = sentinel.clone();
+                let mut exp = sentinel.clone();
+                for i in 0..size {
+                    for j in 0..size {
+                        exp[(start_y + i) * pw + start_x + j] = left[i];
+                    }
+                }
+                unsafe { intra_pred_h_avx2(&mut got, pw, start_x, start_y, &left[..size], size) };
+                assert_eq!(got, exp, "H_PRED bd={bit_depth} size={size} trial={trial}");
+
+                // DC_PRED (all 4 variants)
+                for &(use_a, use_l) in &[(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let dc = match (use_a, use_l) {
+                        (true, true) => {
+                            let s: i32 = above[..size].iter().map(|&v| v as i32).sum::<i32>()
+                                + left[..size].iter().map(|&v| v as i32).sum::<i32>();
+                            ((s + size as i32) >> (log2_size + 1)) as u16
+                        }
+                        (true, false) => {
+                            let s: i32 = above[..size].iter().map(|&v| v as i32).sum();
+                            ((s + (1 << (log2_size - 1))) >> log2_size) as u16
+                        }
+                        (false, true) => {
+                            let s: i32 = left[..size].iter().map(|&v| v as i32).sum();
+                            ((s + (1 << (log2_size - 1))) >> log2_size) as u16
+                        }
+                        (false, false) => 1u16 << (bit_depth - 1),
+                    };
+                    let mut got = sentinel.clone();
+                    let mut exp = sentinel.clone();
+                    for i in 0..size {
+                        for j in 0..size {
+                            exp[(start_y + i) * pw + start_x + j] = dc;
+                        }
+                    }
+                    unsafe {
+                        intra_pred_dc_avx2(
+                            &mut got,
+                            pw,
+                            start_x,
+                            start_y,
+                            use_a.then_some(&above[..size]),
+                            use_l.then_some(&left[..size]),
+                            log2_size,
+                            bit_depth,
+                        );
+                    }
+                    assert_eq!(
+                        got, exp,
+                        "DC_PRED({use_a},{use_l}) bd={bit_depth} size={size} trial={trial}"
+                    );
+                }
+
+                // TM_PRED
+                let mut got = sentinel.clone();
+                let mut exp = sentinel.clone();
+                for i in 0..size {
+                    for j in 0..size {
+                        let v = (above[j] as i32 + left[i] as i32 - top_left as i32)
+                            .clamp(0, max_val as i32) as u16;
+                        exp[(start_y + i) * pw + start_x + j] = v;
+                    }
+                }
+                unsafe {
+                    intra_pred_tm_avx2(
+                        &mut got,
+                        pw,
+                        start_x,
+                        start_y,
+                        &above[..size],
+                        &left[..size],
+                        top_left,
+                        size,
+                        bit_depth,
+                    );
+                }
+                assert_eq!(got, exp, "TM_PRED bd={bit_depth} size={size} trial={trial}");
             }
         }
     }

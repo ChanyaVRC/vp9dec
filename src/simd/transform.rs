@@ -1,7 +1,8 @@
-//! AVX2 SIMD inverse transforms (DCT and ADST networks, spec §8.7) fused with the
-//! reconstruction add+clip; `tile/residual.rs` owns the dispatch and the scalar fallback.
-//! The section comments below carry the load-bearing overflow-safety arguments (i32 lane
-//! storage vs. product width per bit depth) -- read them before touching any kernel.
+//! AVX2 SIMD inverse transforms (DCT, ADST, and lossless 4x4 WHT networks, spec §8.7)
+//! fused with the reconstruction add+clip; `tile/residual.rs` owns the dispatch and the
+//! scalar fallback. The section comments below carry the load-bearing overflow-safety
+//! arguments (i32 lane storage vs. product width per bit depth) -- read them before
+//! touching any kernel.
 
 use crate::transform::TxType;
 use std::arch::x86_64::*;
@@ -19,7 +20,8 @@ use std::arch::x86_64::*;
 // widening multiplies and rounds in i64 (`b_op_simd_hbd`). DCT_DCT (both axes DCT) is
 // vectorized at every depth; the ADST-containing types (ADST_DCT / DCT_ADST / ADST_ADST, sizes
 // 4/8/16 -- 32x32 is DCT-only) take these i32-lane networks at 8-bit and the i64-lane networks
-// (see the i64 section below) at 10/12-bit. Only WHT (lossless) stays scalar.
+// (see the i64 section below) at 10/12-bit. Lossless 4x4 WHT has its own register-only i32
+// kernel at the bottom of this file (exact at all bit depths).
 // ===========================================================================================
 
 /// `round2(x, 14)` (`transform.rs::round2`) lane-wise; the b_op products fit i32 (see the module
@@ -510,8 +512,9 @@ pub(super) unsafe fn iadst_simd(t: &mut [__m256i], n: u32) {
 // unrounded S values to `24 + BitDepth` <= 36 bits, so products |T * cos64| < 2^19 * 2^14 =
 // 2^33 and every sum < 2^37; even the unit tests' adversarial full-range inputs (+/-2^19 at
 // every array position, unreachable from a conformant stream) compound to < ~2^46 (per-stage
-// L-inf gain <= ~2.83 for SB+SH / B, x2 for H). WHT (lossless) stays scalar; TX_32X32 is
-// DCT-only (spec §8.7.2) and takes the HBD DCT kernel above, so this path only sees n <= 4.
+// L-inf gain <= ~2.83 for SB+SH / B, x2 for H). Lossless 4x4 WHT has its own i32 kernel below;
+// TX_32X32 is DCT-only (spec §8.7.2) and takes the HBD DCT kernel above, so this path only sees
+// n <= 4.
 // -------------------------------------------------------------------------------------------
 
 /// Exact `lane * c` on 4 i64 lanes (low 64 bits). AVX2 has no 64-bit multiply, so decompose:
@@ -1104,8 +1107,8 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_avx2(
 /// `iadst_simd`, the DCT axis (of the mixed types) the proven `idct_simd`, and the residual is
 /// added with the 8-bit clip. ADST exists only for 4x4/8x8/16x16 (`n <= 4`; 32x32 is DCT-only,
 /// spec §8.7.2). 8-bit only -- see the inverse-ADST section comment; the dispatch routes
-/// 10/12-bit ADST to [`inverse_transform_adst_reconstruct_hbd_avx2`] and keeps lossless WHT
-/// scalar.
+/// 10/12-bit ADST to [`inverse_transform_adst_reconstruct_hbd_avx2`] and lossless 4x4 WHT to
+/// [`inverse_transform_wht_reconstruct_avx2`].
 ///
 /// # Safety
 /// Same contract as [`inverse_transform_dct_dct_reconstruct_avx2`], with `2 <= n <= 4`;
@@ -1276,5 +1279,117 @@ unsafe fn reconstruct_add_clip(
             _mm_storeu_si128(row as *mut __m128i, packed);
             j += 8;
         }
+    }
+}
+
+// ===========================================================================================
+// SIMD inverse Walsh-Hadamard transform (lossless, 4x4 only, spec §8.7.1.10).
+//
+// Operates entirely in four 128-bit `i32` vectors (`__m128i`, 4 lanes = 4 parallel 1D WHTs)
+// with zero stack scratch: load/narrow 4x4 i64 -> transpose -> row WHT (`shift = 2`) ->
+// transpose -> column WHT (`shift = 0`, landing directly back in row-major order!) -> fused
+// add+clip reconstruction into the plane.
+//
+// Overflow safety at ALL bit depths (8/10/12): WHT has no multiplies — only arithmetic right
+// shifts (`>> 2`, `>> 1`), adds, and subtracts. For any input bounded by `|t[k]| <= M`,
+// `iwht4` intermediates stay within `4 * M` (row pass divides by 4 first, column pass peaks
+// at `<= 2 * M`). Spec §8.7.1.1 bounds stored values to signed `8 + BitDepth <= 20` bits
+// (`M <= 2^19`, and lossless dequantized coefficients are even smaller), so `4 * M <= 2^21`
+// fits `i32` with >10 bits of headroom across all three bit depths. `_mm_srai_epi32` is an
+// arithmetic shift (rounding toward `-infinity`), matching Rust's signed `>>` bit-for-bit.
+// ===========================================================================================
+
+/// Vector 1D inverse Walsh-Hadamard transform (`transform.rs::iwht4`, spec §8.7.1.10) on 4
+/// rows/columns in parallel (`t[k]` holds element `k` across 4 lanes). `ROW_SHIFT == true`
+/// applies the row pass's `>> 2`; `false` applies the column pass's `shift == 0`.
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn iwht4_simd<const ROW_SHIFT: bool>(t: &mut [__m128i; 4]) {
+    let (mut a, mut c, mut d, mut b) = if ROW_SHIFT {
+        (
+            _mm_srai_epi32(t[0], 2),
+            _mm_srai_epi32(t[1], 2),
+            _mm_srai_epi32(t[2], 2),
+            _mm_srai_epi32(t[3], 2),
+        )
+    } else {
+        (t[0], t[1], t[2], t[3])
+    };
+    a = _mm_add_epi32(a, c);
+    d = _mm_sub_epi32(d, b);
+    let e = _mm_srai_epi32(_mm_sub_epi32(a, d), 1);
+    b = _mm_sub_epi32(e, b);
+    c = _mm_sub_epi32(e, c);
+    a = _mm_sub_epi32(a, b);
+    d = _mm_add_epi32(d, c);
+    t[0] = a;
+    t[1] = b;
+    t[2] = c;
+    t[3] = d;
+}
+
+/// Loads 4 `i64` coefficients and narrows their low 32 bits into a single `__m128i` of 4
+/// `i32` lanes. Exact whenever each `i64` fits in `i32` (guaranteed for all conformant VP9
+/// streams at every bit depth; see the WHT section comment).
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn load_4_i64_as_i32(ptr: *const i64) -> __m128i {
+    let v = _mm256_loadu_si256(ptr as *const __m256i);
+    let lo_dwords = _mm256_shuffle_epi32(v, 0b10_00_10_00);
+    let packed = _mm256_permute4x64_epi64(lo_dwords, 0b11_01_10_00);
+    _mm256_castsi256_si128(packed)
+}
+
+/// AVX2 lossless 4x4 inverse Walsh-Hadamard transform + fused reconstruction (spec §8.7.1.10
+/// and §8.7.2): transforms `dequant` (16 row-major `i64` coefficients) in registers and adds
+/// the 4x4 residual directly into `plane_data` at `(start_x, start_y)` with
+/// `clip(pred + residual, 0, (1 << bit_depth) - 1)`. Works for all VP9 bit depths
+/// (`8/10/12`, bit-exact against scalar `inverse_transform_block(..., lossless = true)` plus
+/// reconstruction).
+///
+/// # Safety
+/// `avx2_enabled()` must hold; `dequant.len()` must be 16; `bit_depth` must be 8, 10, or 12;
+/// and the 4x4 block at `(start_x, start_y)` (`start_y..start_y + 4` x
+/// `start_x..start_x + 4`, stride `plane_width`) must be in bounds for `plane_data`.
+#[target_feature(enable = "avx2")]
+pub unsafe fn inverse_transform_wht_reconstruct_avx2(
+    plane_data: &mut [u16],
+    plane_width: usize,
+    start_x: usize,
+    start_y: usize,
+    dequant: &[i64],
+    bit_depth: u8,
+) {
+    debug_assert_eq!(dequant.len(), 16);
+    debug_assert!(start_x + 4 <= plane_width);
+    debug_assert!((start_y + 3) * plane_width + start_x + 4 <= plane_data.len());
+
+    let dq_ptr = dequant.as_ptr();
+    let rows = [
+        load_4_i64_as_i32(dq_ptr),
+        load_4_i64_as_i32(dq_ptr.add(4)),
+        load_4_i64_as_i32(dq_ptr.add(8)),
+        load_4_i64_as_i32(dq_ptr.add(12)),
+    ];
+
+    // Transpose rows -> columns so lane r of t[c] holds dequant[r][c], run row WHT (shift=2).
+    let mut t = transpose4x4_i32(&rows);
+    iwht4_simd::<true>(&mut t);
+
+    // Transpose back so lane c of col_t[r] holds R[r][c], run column WHT (shift=0).
+    // Output col_t[r] is immediately row r of the 2D WHT result (no final round2 shift in
+    // lossless mode, spec §8.7.2).
+    let mut col_t = transpose4x4_i32(&t);
+    iwht4_simd::<false>(&mut col_t);
+
+    let base = plane_data.as_mut_ptr();
+    let zero = _mm_setzero_si128();
+    let max = _mm_set1_epi32((1i32 << bit_depth) - 1);
+    for (i, &resid) in col_t.iter().enumerate() {
+        let row = base.add((start_y + i) * plane_width + start_x);
+        let pred = _mm_cvtepu16_epi32(_mm_loadl_epi64(row as *const __m128i));
+        let sum = _mm_add_epi32(pred, resid);
+        let clipped = _mm_min_epi32(_mm_max_epi32(sum, zero), max);
+        _mm_storel_epi64(row as *mut __m128i, _mm_packus_epi32(clipped, clipped));
     }
 }

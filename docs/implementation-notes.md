@@ -47,8 +47,11 @@ overview. A resolved bug needs no entry.
   same fused reconstruction), 10/12-bit on i64-lane networks
   (`inverse_transform_adst_reconstruct_hbd_avx2`, 4 i64 lanes per vector -- the ADST's unrounded
   `S` array needs `24 + BitDepth` bits of lane storage, and both axes of a mixed block run in
-  one self-contained i64 driver; see the landmine below). Among the transforms only WHT
-  (lossless) stays scalar.
+  one self-contained i64 driver; see the landmine below); the **lossless 4x4 WHT inverse
+  transform + reconstruction** (`inverse_transform_wht_reconstruct_avx2`, register-only 128-bit
+  i32 lanes across all bit depths); and the high-frequency **intra prediction** modes (`V_PRED`,
+  `H_PRED`, `DC_PRED` all 4 variants, `TM_PRED` across 4/8/16/32 and all bit depths in
+  `src/simd/intra.rs`; the six directional modes `D45`..`D207` stay scalar).
   Runtime-detected and cached; `VP9DEC_NO_SIMD=1` forces scalar. Output must equal the scalar
   path — the sweep passes 315/315 in both configs. Routing unscaled reference-edge blocks
   through the general kernel cut their measured stage time by 2.66-2.90x and improved whole-
@@ -152,10 +155,11 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   `b_op_simd_hbd` computes the products with 32x32->64-bit widening multiplies
   (`_mm256_mul_epi32`) and rounds in i64 (its `>> 14` is a LOGICAL 64-bit shift -- exact because
   only the low 32 bits are kept and logical/arithmetic shifts agree there). Do not route 10/12-bit
-  to the 8-bit kernel or reuse the i32 `mullo` butterfly in depth-general code. WHT (lossless)
-  stays scalar. On NON-conformant streams (coefficients past spec §8.7.1.1's
-  stored-value bounds) the SIMD i32 lanes may wrap where the scalar i64 arithmetic does not
-  (likewise the i64-lane ADST driver's final i32 narrowing), so
+  to the 8-bit kernel or reuse the i32 `mullo` butterfly in depth-general code. Lossless 4x4 WHT
+  uses its own register-only 128-bit i32 kernel (`inverse_transform_wht_reconstruct_avx2`, exact
+  across all bit depths for conformant inputs). On NON-conformant streams (coefficients past spec
+  §8.7.1.1's stored-value bounds) the SIMD i32 lanes may wrap where the scalar i64 arithmetic does
+  not (likewise the i64-lane ADST driver's final i32 narrowing), so
   SIMD-on vs `VP9DEC_NO_SIMD=1` outputs can legitimately diverge on garbage input -- a
   differential fuzzer comparing the two configs on a malformed corpus would misread that as a
   SIMD bug; only conformant streams are comparable. The generated differential test above
@@ -216,14 +220,12 @@ skill; change-navigation is the `vp9dec-architecture` skill.
 
 ## Known gaps
 
-- **Deliberately scalar / target-conditional SIMD paths.** Intra prediction and the lossless
-  4x4 WHT remain scalar; aarch64 uses the same scalar fallback and has no NEON mirror. The x86
-  measurement gate found intra prediction at 0.3-1.7% on representative inter content and 3.1%
-  (0.9 ms total) on the short intra-only vector. The WHT-containing inverse-transform stage was
-  7.9% (1.6 ms total) on a two-frame lossless vector, but is absent from ordinary lossy content.
-  These do not justify more architecture-specific code for the current workload. Revisit only
-  for a measured intra/lossless workload or a concrete aarch64 deployment target; neither is
-  open work today.
+- **Deliberately scalar / target-conditional SIMD paths.** The six directional intra modes
+  (`D45`..`D207`) remain scalar, and aarch64 uses the scalar fallback with no NEON mirror
+  (inter-prediction — direct-load unscaled and general edge-clamping — high-frequency intra modes
+  `V_PRED`/`H_PRED`/`DC_PRED`/`TM_PRED`, the loop filter, and every inverse transform — DCT_DCT,
+  ADST-containing types, and lossless 4x4 WHT — are AVX2-vectorized at all bit depths). The scalar
+  paths are correct and bit-exact.
 - **`SEG_LVL_ALT_L` / `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` have no official test vector.** They
   are proven instead by synthetic round-trip vectors (`tests/synthetic_seg_test.rs`)
   cross-decoded byte-identically by ffmpeg's `libvpx-vp9` and native `vp9` decoders.

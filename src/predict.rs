@@ -34,8 +34,249 @@ use crate::tile::Mv;
 /// `x`/`y` are absolute pixel coordinates within `plane`; `max_x`/`max_y` are
 /// the spec's `maxX`/`maxY` (= the maximum coordinates that may be
 /// referenced within the plane).
+///
+/// Dispatches the high-frequency modes (`V_PRED`, `H_PRED`, `DC_PRED`, `TM_PRED`, all sizes
+/// 4/8/16/32 and all bit depths 8/10/12) to the AVX2 kernels in `src/simd/intra.rs` when
+/// available; falls back to [`predict_intra_scalar`] for the six directional modes,
+/// `VP9DEC_NO_SIMD=1`, and non-x86_64 targets.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_intra(
+    plane: &mut Plane,
+    x: usize,
+    y: usize,
+    have_left: bool,
+    have_above: bool,
+    not_on_right: bool,
+    tx_size: u8,
+    mode: u8,
+    max_x: usize,
+    max_y: usize,
+    bit_depth: u8,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(mode, V_PRED | H_PRED | DC_PRED | TM_PRED) && crate::simd::avx2_enabled() {
+        let log2_size = (tx_size as u32) + 2;
+        let size = 1usize << log2_size;
+        let pw = plane.width;
+        debug_assert!(
+            x >= plane.x0 && x - plane.x0 + size <= pw && y + size <= plane.height,
+            "predict_intra block outside its plane bounds"
+        );
+        let local_x = x - plane.x0;
+        let base = 1u16 << (bit_depth - 1);
+
+        match mode {
+            V_PRED => {
+                if !have_above {
+                    // SAFETY: avx2_enabled() confirmed; block bounds checked above.
+                    unsafe {
+                        crate::simd::intra_pred_fill_avx2(
+                            plane.as_mut_slice(),
+                            pw,
+                            local_x,
+                            y,
+                            base - 1,
+                            size,
+                        );
+                    }
+                } else if x + size - 1 <= max_x {
+                    let (above_rows, dst_rows) = plane.as_mut_slice().split_at_mut(y * pw);
+                    let above_start = (y - 1) * pw + local_x;
+                    let above = &above_rows[above_start..above_start + size];
+                    // SAFETY: avx2_enabled() confirmed; `above` is length `size` from row
+                    // `y - 1` and `dst_rows` starts at row `y` (stride `pw`) with `>= size`
+                    // rows remaining.
+                    unsafe {
+                        crate::simd::intra_pred_v_avx2(dst_rows, pw, local_x, 0, above, size);
+                    }
+                } else {
+                    let mut above_buf = [0u16; 32];
+                    for (i, slot) in above_buf[..size].iter_mut().enumerate() {
+                        *slot = plane.get((x + i).min(max_x), y - 1);
+                    }
+                    // SAFETY: avx2_enabled() confirmed; above_buf[..size] and block bounds hold.
+                    unsafe {
+                        crate::simd::intra_pred_v_avx2(
+                            plane.as_mut_slice(),
+                            pw,
+                            local_x,
+                            y,
+                            &above_buf[..size],
+                            size,
+                        );
+                    }
+                }
+            }
+            H_PRED => {
+                if !have_left {
+                    // SAFETY: avx2_enabled() confirmed; block bounds checked above.
+                    unsafe {
+                        crate::simd::intra_pred_fill_avx2(
+                            plane.as_mut_slice(),
+                            pw,
+                            local_x,
+                            y,
+                            base + 1,
+                            size,
+                        );
+                    }
+                } else {
+                    let mut left_buf = [0u16; 32];
+                    for (i, slot) in left_buf[..size].iter_mut().enumerate() {
+                        *slot = plane.get(x - 1, (y + i).min(max_y));
+                    }
+                    // SAFETY: avx2_enabled() confirmed; left_buf[..size] and block bounds hold.
+                    unsafe {
+                        crate::simd::intra_pred_h_avx2(
+                            plane.as_mut_slice(),
+                            pw,
+                            local_x,
+                            y,
+                            &left_buf[..size],
+                            size,
+                        );
+                    }
+                }
+            }
+            DC_PRED => {
+                let mut left_buf = [0u16; 32];
+                let left_opt = if have_left {
+                    for (i, slot) in left_buf[..size].iter_mut().enumerate() {
+                        *slot = plane.get(x - 1, (y + i).min(max_y));
+                    }
+                    Some(&left_buf[..size])
+                } else {
+                    None
+                };
+
+                if have_above && x + size - 1 <= max_x {
+                    let (above_rows, dst_rows) = plane.as_mut_slice().split_at_mut(y * pw);
+                    let above_start = (y - 1) * pw + local_x;
+                    let above = &above_rows[above_start..above_start + size];
+                    // SAFETY: avx2_enabled() confirmed; neighbor slices have length `size`,
+                    // samples are valid VP9 samples (<= 4095), and dst_rows has `>= size` rows.
+                    unsafe {
+                        crate::simd::intra_pred_dc_avx2(
+                            dst_rows,
+                            pw,
+                            local_x,
+                            0,
+                            Some(above),
+                            left_opt,
+                            log2_size,
+                            bit_depth,
+                        );
+                    }
+                } else {
+                    let mut above_buf = [0u16; 32];
+                    let above_opt = if have_above {
+                        for (i, slot) in above_buf[..size].iter_mut().enumerate() {
+                            *slot = plane.get((x + i).min(max_x), y - 1);
+                        }
+                        Some(&above_buf[..size])
+                    } else {
+                        None
+                    };
+                    // SAFETY: avx2_enabled() confirmed; neighbor slices have length `size`
+                    // (when `Some`) and block bounds hold.
+                    unsafe {
+                        crate::simd::intra_pred_dc_avx2(
+                            plane.as_mut_slice(),
+                            pw,
+                            local_x,
+                            y,
+                            above_opt,
+                            left_opt,
+                            log2_size,
+                            bit_depth,
+                        );
+                    }
+                }
+            }
+            TM_PRED => {
+                let top_left = if have_above && have_left {
+                    let sx = x.saturating_sub(1).min(max_x);
+                    plane.get(sx, y - 1)
+                } else if have_above {
+                    base + 1
+                } else {
+                    base - 1
+                };
+                let mut left_buf = [base + 1; 32];
+                if have_left {
+                    for (i, slot) in left_buf[..size].iter_mut().enumerate() {
+                        *slot = plane.get(x - 1, (y + i).min(max_y));
+                    }
+                }
+
+                if have_above && x + size - 1 <= max_x {
+                    let (above_rows, dst_rows) = plane.as_mut_slice().split_at_mut(y * pw);
+                    let above_start = (y - 1) * pw + local_x;
+                    let above = &above_rows[above_start..above_start + size];
+                    // SAFETY: avx2_enabled() confirmed; neighbor slices have length `size`,
+                    // samples are <= 4095, and dst_rows has `>= size` rows.
+                    unsafe {
+                        crate::simd::intra_pred_tm_avx2(
+                            dst_rows,
+                            pw,
+                            local_x,
+                            0,
+                            above,
+                            &left_buf[..size],
+                            top_left,
+                            size,
+                            bit_depth,
+                        );
+                    }
+                } else {
+                    let mut above_buf = [base - 1; 32];
+                    if have_above {
+                        for (i, slot) in above_buf[..size].iter_mut().enumerate() {
+                            *slot = plane.get((x + i).min(max_x), y - 1);
+                        }
+                    }
+                    // SAFETY: avx2_enabled() confirmed; neighbor buffers have length `>= size`
+                    // and block bounds hold.
+                    unsafe {
+                        crate::simd::intra_pred_tm_avx2(
+                            plane.as_mut_slice(),
+                            pw,
+                            local_x,
+                            y,
+                            &above_buf[..size],
+                            &left_buf[..size],
+                            top_left,
+                            size,
+                            bit_depth,
+                        );
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        return;
+    }
+
+    predict_intra_scalar(
+        plane,
+        x,
+        y,
+        have_left,
+        have_above,
+        not_on_right,
+        tx_size,
+        mode,
+        max_x,
+        max_y,
+        bit_depth,
+    );
+}
+
+/// Scalar body of [`predict_intra`] (spec §8.5.1 verbatim): the always-kept fallback for
+/// directional modes, `VP9DEC_NO_SIMD=1`, and non-x86_64, and the bit-exactness oracle
+/// `tests/unit/simd.rs` pins the intra AVX2 kernels against (hence `pub(crate)`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_intra_scalar(
     plane: &mut Plane,
     x: usize,
     y: usize,

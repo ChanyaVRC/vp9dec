@@ -7,17 +7,20 @@
 //! - `inter`: the inter-prediction two-pass 8-tap subpel convolution (spec §8.5.2.4),
 //!   direct-load unscaled kernels (widths 8+ and 4) plus a general edge-clamping kernel
 //!   for scaled references and unscaled reference-edge blocks; `predict.rs` dispatches.
+//! - `intra`: the high-frequency intra-prediction modes (`V_PRED`, `H_PRED`, `DC_PRED`,
+//!   `TM_PRED`, spec §8.5.1) across sizes 4/8/16/32 and all bit depths; `predict.rs`
+//!   dispatches.
 //! - `loop_filter`: the deblocking edge filters (spec §8.8.5, narrow / wide8 / wide16) for
 //!   both edge orientations; `loop_filter.rs` dispatches.
-//! - `transform`: the inverse DCT/ADST transforms fused with reconstruction (spec §8.7);
-//!   `tile/residual.rs` dispatches (DCT_DCT and the ADST-containing types at all bit
-//!   depths; only lossless WHT stays scalar -- see the landmines in
-//!   docs/implementation-notes.md).
+//! - `transform`: the inverse DCT/ADST/WHT transforms fused with reconstruction (spec §8.7);
+//!   `tile/residual.rs` dispatches (DCT_DCT, the ADST-containing types, and lossless 4x4 WHT
+//!   at all bit depths -- see the landmines in docs/implementation-notes.md).
 //!
 //! A NEON mirror for aarch64 would be sibling `#[cfg(target_arch = "aarch64")]` modules
 //! behind the same dispatch points -- not implemented.
 
 mod inter;
+mod intra;
 mod loop_filter;
 mod transform;
 
@@ -28,10 +31,15 @@ mod tests;
 pub use inter::{
     block_inter_predict_avx2, block_inter_predict_avx2_w4, block_inter_predict_scaled_avx2,
 };
+pub use intra::{
+    intra_pred_dc_avx2, intra_pred_fill_avx2, intra_pred_h_avx2, intra_pred_tm_avx2,
+    intra_pred_v_avx2,
+};
 pub use loop_filter::{loop_filter_horiz8_avx2, loop_filter_vert8_avx2};
 pub use transform::{
     inverse_transform_adst_reconstruct_avx2, inverse_transform_adst_reconstruct_hbd_avx2,
     inverse_transform_dct_dct_reconstruct_avx2, inverse_transform_dct_dct_reconstruct_hbd_avx2,
+    inverse_transform_wht_reconstruct_avx2,
 };
 
 use std::sync::OnceLock;
