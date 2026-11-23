@@ -2,9 +2,13 @@
 
 A fully from-scratch VP9 video decoder (Rust, zero dependency crates).
 
+Current release: **v0.1.2** — [crates.io](https://crates.io/crates/vp9dec) · [GitHub](https://github.com/ChanyaVRC/vp9dec) · [API docs (rustdoc)](https://chanyavrc.github.io/vp9dec/)
+
 ## Purpose
 
-vp9dec is a clean-room decoder for VP9 (a royalty-free video codec). The decoder itself -- everything under
+vp9dec is a clean-room decoder for VP9 (a royalty-free video codec), used by
+[Noiria](https://github.com/ChanyaVRC/noiria) ([website / Wiki](https://chanyavrc.github.io/noiria-site/)).
+The decoder itself -- everything under
 `src/` -- depends on no external crates: Rust standard library only, no runtime dependencies.
 (Test tooling may use `[dev-dependencies]`; in practice the only one is a self-referential
 dev-dep on this crate for test-only encoder helpers, with no effect on a normal `cargo build`.)
@@ -58,7 +62,17 @@ exact spec sections it implements.
   other tilings decode sequentially.
 - **`predict` / `transform` / `quant` / `scan`** -- intra prediction and inter motion
   compensation; the inverse DCT/ADST/WHT transforms; dequantization; coefficient scan orders.
-- **`loop_filter`** -- the deblocking filter, applied once per frame after tile decode.
+- **`loop_filter`** -- the deblocking filter, applied once per frame after tile decode, with
+  wavefront parallelization across superblock rows (`wavefront_filter_planes`).
+- **`simd` + `simd/{inter, intra, loop_filter, transform}`** (`x86_64`-only, runtime-detected
+  and force-disabled with `VP9DEC_NO_SIMD=1`) -- zero-dependency AVX2 kernels across all bit
+  depths (8/10/12-bit):
+  - `src/simd/inter.rs`: unscaled and reference-scaled (and edge-clamping) inter prediction.
+  - `src/simd/intra.rs`: `DC_PRED` (all 4 availability variants), `V_PRED`, `H_PRED`, `TM_PRED`,
+    and constant fill across 4/8/16/32 block sizes.
+  - `src/simd/loop_filter.rs`: both horizontal and vertical deblocking edges.
+  - `src/simd/transform.rs`: `DCT_DCT`, ADST combinations, and lossless 4x4 WHT (`iwht4x4`)
+    inverse transforms with fused reconstruction.
 - **`dpb` / `superframe`** -- the 8-slot reference-frame buffer (also serves
   `show_existing_frame`) and superframe splitting.
 - **`common` / `subpel` / `mv_ref_tables` / `prob_tables`** -- shared constant tables (default
@@ -106,7 +120,7 @@ the arbitrary-corruption fuzz.
 
 | Limit | Detail |
 | --- | --- |
-| Intra prediction and the WHT (lossless) inverse transform stay scalar | AVX2 covers all inter prediction (including reference-edge clamping), both loop-filter directions, and every non-lossless inverse transform at all bit depths. Measurements kept the remaining paths scalar: intra prediction was at most 1.7% on representative inter content and 3.1% on the short intra-only vector; the WHT-containing stage was 1.6 ms on a two-frame lossless vector. Revisit for a measured workload where either is material. |
+| Only the 6 directional intra modes (`D45`..`D207`) stay scalar | On `x86_64`, AVX2 covers inter prediction (unscaled and reference-scaled / reference-edge clamping), both loop-filter directions (paired with wavefront parallelization), every inverse transform (`DCT_DCT`, ADST combinations, and lossless 4x4 WHT `iwht4x4` with fused reconstruction), and the high-frequency intra modes (`DC_PRED` all 4 variants, `V_PRED`, `H_PRED`, `TM_PRED`, and constant fill across 4/8/16/32 and 8/10/12-bit). Only the 6 directional intra modes (`D45`..`D207`) remain on the bit-exact scalar fallback. |
 | No aarch64 NEON kernels | Non-x86 targets use the bit-exact scalar fallback. A NEON mirror is intentionally conditional on a concrete aarch64 deployment and workload; there is no such target in scope today. |
 | 19 corpus clips ship no upstream `.md5` | The 7 `vp90-2-bbb_*` and 12 `vp90-2-tos_*`/`vp90-2-sintel_*` movie clips ship only a `.webm` upstream (libvpx uses them for its own perf tests, not md5 conformance), so the sweep cannot MD5-check them; the fetch scripts still download/remux them, and they are excluded from the sweep's 315. They are instead cross-checked against ffmpeg's `libvpx-vp9`: the 12 tos/sintel clips (full-length movies, up to 1920x800) in full (all 268,832 displayed frames byte-identical), and the 7 bbb clips as a spot-check (first 1000 frames each, `tests/bbb_cross_check.rs`). |
 
@@ -125,6 +139,14 @@ VP9DEC_FUZZ_LONG_ITERS=10000 cargo test --release --test structured_fuzz_test --
 that needs the conformance corpus (`conformance_test`, `sweep_test`) or ffmpeg
 (`synthetic_seg_test`'s cross-decode) skips cleanly when those aren't present, so the default run
 stays green without any downloads.
+
+### CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs `cargo fmt --all --check` and
+`cargo clippy --all-targets`, plus both debug and `--release` (`opt-level=3`) builds and tests
+across Linux (`ubuntu-latest`) and Windows (`windows-latest`) in both SIMD auto-detected and
+forced-scalar (`VP9DEC_NO_SIMD=1`) configurations, as well as native Arm64
+(`ubuntu-24.04-arm`, debug and `--release`).
 
 ### Getting the test vectors
 
@@ -159,7 +181,7 @@ BT.601 RGB PNG to `target/dump/` (with its own from-scratch, dependency-free PNG
 ## History
 
 [docs/history.md](docs/history.md) is a concise milestone-by-milestone record of how the
-decoder was built (M1 through M7). Still-relevant design rationale, landmines, and
+decoder was built (M1 through v0.1.2). Still-relevant design rationale, landmines, and
 known gaps are in [docs/implementation-notes.md](docs/implementation-notes.md); the detailed,
 change-by-change history is in the git log.
 

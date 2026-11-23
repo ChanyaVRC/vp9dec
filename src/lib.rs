@@ -42,8 +42,8 @@ pub mod prob_tables;
 pub mod quant;
 #[doc(hidden)]
 pub mod scan;
-/// AVX2 SIMD kernels (inter prediction, loop filter, inverse transforms); x86_64-only, see
-/// the hub `src/simd.rs` and its submodules.
+/// AVX2 SIMD kernels (inter prediction, intra prediction, loop filter, inverse transforms);
+/// x86_64-only, see the hub `src/simd.rs` and its submodules.
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub mod simd;
