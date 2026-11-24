@@ -216,12 +216,26 @@ impl MiGrid {
         self.rows
     }
 
+    #[inline]
     pub fn get(&self, row: u32, col: u32) -> &MiInfo {
         &self.data[row as usize * self.cols + (col - self.col0) as usize]
     }
 
+    #[cfg(test)]
     fn get_mut(&mut self, row: u32, col: u32) -> &mut MiInfo {
         &mut self.data[row as usize * self.cols + (col - self.col0) as usize]
+    }
+
+    #[inline]
+    fn fill_rect(&mut self, row: u32, col: u32, bw: u32, bh: u32, info: MiInfo) {
+        let c = (col - self.col0) as usize;
+        let bw = bw as usize;
+        let stride = self.cols;
+        let mut base = row as usize * stride + c;
+        for _ in 0..bh {
+            self.data[base..base + bw].fill(info);
+            base += stride;
+        }
     }
 }
 
@@ -726,9 +740,10 @@ impl TileDecoder {
         if bsize == BLOCK_8X8 || partition != PARTITION_SPLIT {
             let above_val = 15u8 >> B_WIDTH_LOG2_LOOKUP[subsize as usize];
             let left_val = 15u8 >> B_HEIGHT_LOG2_LOOKUP[subsize as usize];
+            let c0 = col as usize;
+            self.above_partition_context[c0..c0 + num8x8 as usize].fill(above_val);
             for i in 0..num8x8 {
-                self.above_partition_context[(col + i) as usize] = above_val;
-                self.left_partition_context[((row + i) % 8) as usize] = left_val;
+                self.left_partition_context[((row + i) & 7) as usize] = left_val;
             }
         }
         Ok(())
@@ -794,7 +809,7 @@ impl TileDecoder {
         } else {
             PARTITION_SPLIT
         };
-        if !self.frame_is_intra {
+        if self.collect_counts && !self.frame_is_intra {
             self.counts.partition[ctx][partition as usize] += 1;
         }
         partition
@@ -862,11 +877,7 @@ impl TileDecoder {
 
         let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize] as u32;
         let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[subsize as usize] as u32;
-        for y in 0..bh {
-            for x in 0..bw {
-                *self.mi_grid.get_mut(row + y, col + x) = info;
-            }
-        }
+        self.mi_grid.fill_rect(row, col, bw, bh, info);
         Ok(())
     }
 }

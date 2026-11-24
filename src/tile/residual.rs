@@ -106,6 +106,18 @@ impl TileDecoder {
                 self.predict_inter_for_plane(
                     plane, row, col, info, base_x, base_y, num4x4w, num4x4h,
                 );
+                if info.skip {
+                    // Skipped inter block: no intra prediction and no residual tokens; just clear
+                    // the block's nonzero contexts in bulk.
+                    let bx = (base_x >> 2) as usize;
+                    self.above_nonzero_context[plane][bx..bx + num4x4w as usize].fill(0);
+                    let by = (base_y >> 2) as usize;
+                    let left = &mut self.left_nonzero_context[plane];
+                    for i in 0..num4x4h as usize {
+                        left[(by + i) & 15] = 0;
+                    }
+                    continue;
+                }
             }
 
             let mut block_idx = 0u32;

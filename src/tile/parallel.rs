@@ -415,12 +415,21 @@ impl TileDecoder {
                 // column range `[mi_col_start, mi_col_end)` is disjoint from all other tasks.
                 unsafe {
                     let w = &mut *workers_ptr.add(i);
-                    crate::bench_timing::reset();
+                    // Task 0 runs on the calling thread, which already accumulates directly into
+                    // the caller's `bench_timing` counters; only worker threads reset/snapshot.
+                    if i != 0 {
+                        crate::bench_timing::reset();
+                    }
                     let res = w.decode_tile_bytes(tile_slice[i]);
                     if res.is_ok() {
                         dst_view.copy_worker_strip(w);
                     }
-                    *results_ptr.add(i) = (res, crate::bench_timing::snapshot());
+                    let snap = if i != 0 {
+                        crate::bench_timing::snapshot()
+                    } else {
+                        [0u64; crate::bench_timing::STAGE_COUNT]
+                    };
+                    *results_ptr.add(i) = (res, snap);
                 }
             };
 
