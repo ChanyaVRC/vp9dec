@@ -197,8 +197,9 @@ unsafe fn idct_2d_dct<const HBD: bool>(dequant: &[i64], n: u32, max_row: usize, 
 /// AVX2 8-bit DCT_DCT inverse transform + reconstruction with known `max_row`.
 ///
 /// # Safety
-/// Same contract as [`inverse_transform_dct_dct_reconstruct_avx2`]; every row strictly below
-/// `max_row` in `dequant` must be all-zero.
+/// `avx2_enabled()` must hold; `dequant.len()` must be `n0*n0` (`2 <= n <= 5`); the block's
+/// rows `start_y..start_y+n0` x columns `start_x..start_x+n0` must be in bounds for `plane_data`;
+/// and every row strictly below `max_row` in `dequant` must be all-zero.
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_dct_dct_reconstruct_eob_avx2(
     plane_data: &mut [u16],
@@ -224,8 +225,8 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_eob_avx2(
 /// High-bit-depth (10/12-bit) companion to [`inverse_transform_dct_dct_reconstruct_eob_avx2`].
 ///
 /// # Safety
-/// Same contract as [`inverse_transform_dct_dct_reconstruct_hbd_avx2`]; every row strictly below
-/// `max_row` in `dequant` must be all-zero.
+/// Same contract as [`inverse_transform_dct_dct_reconstruct_eob_avx2`], with `bit_depth` set to
+/// the stream's bit depth (10 or 12).
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_eob_avx2(
@@ -256,6 +257,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_eob_avx2(
 /// # Safety
 /// `avx2_enabled()` must hold; `dequant.len()` must be `n0*n0` (`2 <= n <= 5`); and the block's
 /// rows `start_y..start_y+n0` x columns `start_x..start_x+n0` must be in bounds for `plane_data`.
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_dct_dct_reconstruct_avx2(
     plane_data: &mut [u16],
@@ -283,6 +285,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_avx2(
 /// # Safety
 /// Same contract as [`inverse_transform_dct_dct_reconstruct_avx2`]; `bit_depth` must be the
 /// stream's bit depth (10 or 12).
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_avx2(
     plane_data: &mut [u16],
@@ -311,7 +314,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_avx2(
 /// (`AdstDct` / `DctAdst` / `AdstAdst`, spec §8.7.1.4-§8.7.1.9 + §8.7.2).
 ///
 /// # Safety
-/// Same contract as [`inverse_transform_dct_dct_reconstruct_avx2`], with `2 <= n <= 4`;
+/// Same contract as [`inverse_transform_dct_dct_reconstruct_eob_avx2`] (with `2 <= n <= 4`);
 /// `tx_type` must not be `DctDct` and the stream must be 8-bit.
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_adst_reconstruct_avx2(

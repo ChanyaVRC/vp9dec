@@ -10,16 +10,14 @@
 
 pub mod ivf;
 
-// Every module below is internal; public only so the pure-std integration tests in
-// tests/ can reach it -- not a stable API.
+// Modules below are crate-internal; a subset remain `#[doc(hidden)] pub mod` only so the
+// pure-std integration tests in tests/ and examples/ can reach them -- not a stable API.
 #[doc(hidden)]
 pub mod bench_timing;
-#[doc(hidden)]
-pub mod bit_reader;
+pub(crate) mod bit_reader;
 #[doc(hidden)]
 pub mod bool_coder;
-#[doc(hidden)]
-pub mod common;
+pub(crate) mod common;
 #[doc(hidden)]
 pub mod compressed_header;
 #[doc(hidden)]
@@ -32,23 +30,19 @@ pub mod framebuffer;
 pub mod header;
 #[doc(hidden)]
 pub mod loop_filter;
-#[doc(hidden)]
-pub mod mv_ref_tables;
+pub(crate) mod mv_ref_tables;
 #[doc(hidden)]
 pub mod predict;
 #[doc(hidden)]
 pub mod prob_tables;
-#[doc(hidden)]
-pub mod quant;
-#[doc(hidden)]
-pub mod scan;
+pub(crate) mod quant;
+pub(crate) mod scan;
 /// AVX2 SIMD kernels (inter prediction, intra prediction, loop filter, inverse transforms);
 /// x86_64-only, see the hub `src/simd.rs` and its submodules.
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub mod simd;
-#[doc(hidden)]
-pub mod subpel;
+pub(crate) mod subpel;
 #[doc(hidden)]
 pub mod superframe;
 #[cfg(any(test, feature = "test-support"))]

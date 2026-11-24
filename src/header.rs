@@ -1,7 +1,7 @@
 //! Parsing of the uncompressed frame header (`uncompressed_header`) (spec §6.2, §7.2).
 //!
 //! The uncompressed frame header is not parsed by the bool decoder but by
-//! [`crate::bit_reader::BitReader`]'s plain MSB-first bit reading (`f(n)` /
+//! `BitReader`'s plain MSB-first bit reading (`f(n)` /
 //! `s(n)` descriptors, spec §9.1).
 //!
 //! M1/M2 only supported key frames, but M3 added support for parsing inter

@@ -1,7 +1,7 @@
 //! AVX2 SIMD mirror of `predict::block_inter_predict`'s scalar two-pass 8-tap subpel
 //! convolution (spec §8.5.2.4): specialized kernels for the common UNSCALED case
 //! (`x_step == y_step == 16`, i.e. reference frame same size as the current frame) plus a
-//! general edge-clamping kernel ([`block_inter_predict_scaled_avx2`]). The direct-to-plane
+//! general edge-clamping kernel ([`block_inter_predict_scaled_u16_avx2`]). The direct-to-plane
 //! `*_u16_avx2` entries write `u16` samples straight into the destination plane (with optional
 //! compound averaging via `VPAVGW` / `PAVGW`, matching `round2(a + b, 1)`), dispatch full-pel
 //! copy and 1D horizontal/vertical fast paths when `fx == 0` or `fy == 0`, use `_mm256_madd_epi16`
@@ -721,8 +721,11 @@ unsafe fn block_inter_predict_u16_ptr_avx2<const COMPOUND: bool>(
 /// `dst_data` when `COMPOUND == true`), without zero-initializing the intermediate scratch.
 ///
 /// # Safety
-/// Same contract as [`block_inter_predict_scaled_avx2`], plus `dst_data` must hold rows
-/// `dst_y..dst_y + h` x cols `dst_x..dst_x + w` (stride `dst_width`).
+/// The caller must have confirmed `avx2_enabled()`, and must guarantee:
+/// `ref_stride >= ref_width`; `ref_data.len() >= ref_stride * ref_height`;
+/// `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`; horizontal source span
+/// `<= MAX_INTERMEDIATE_HEIGHT`; and `dst_data` holds rows `dst_y..dst_y + h` x cols
+/// `dst_x..dst_x + w` (stride `dst_width`).
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
@@ -907,6 +910,7 @@ pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
 /// Same contract as before: caller confirms `avx2_enabled()` and that rows
 /// `src_row0..src_row0 + intermediate_height` and cols `src_col0..src_col0 + w + 7` lie in
 /// `ref_data` (stride `ref_width`).
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn block_inter_predict_avx2(
@@ -954,6 +958,7 @@ pub unsafe fn block_inter_predict_avx2(
 ///
 /// # Safety
 /// Same contract as [`block_inter_predict_avx2`] with `w == 4`.
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn block_inter_predict_avx2_w4(
@@ -1003,6 +1008,7 @@ pub unsafe fn block_inter_predict_avx2_w4(
 /// The caller must have confirmed `avx2_enabled()`, and must guarantee:
 /// `ref_data.len() >= ref_width * ref_height`; `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`;
 /// horizontal source span `<= MAX_INTERMEDIATE_HEIGHT`; and `pred.len() == w * h`.
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn block_inter_predict_scaled_avx2(
@@ -1039,13 +1045,14 @@ pub unsafe fn block_inter_predict_scaled_avx2(
     );
 }
 
-/// Stride-aware implementation of [`block_inter_predict_scaled_avx2`] (`ref_stride >= ref_width`),
+/// Stride-aware general edge-clamping AVX2 inter-prediction core (`ref_stride >= ref_width`),
 /// writing all `w * h` output samples to `pred_ptr` (allowing uninitialized stack scratch).
 ///
 /// # Safety
-/// Same contract as [`block_inter_predict_scaled_avx2`] with `ref_stride >= ref_width`,
-/// `ref_data.len() >= ref_stride * ref_height`, and `pred_ptr` valid for writes of `w * h`
-/// contiguous `i32` elements.
+/// Caller must confirm `avx2_enabled()`, `ref_stride >= ref_width`,
+/// `ref_data.len() >= ref_stride * ref_height`, `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`,
+/// horizontal source span `<= MAX_INTERMEDIATE_HEIGHT`, and `pred_ptr` valid for writes of
+/// `w * h` contiguous `i32` elements.
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn block_inter_predict_scaled_strided_avx2(

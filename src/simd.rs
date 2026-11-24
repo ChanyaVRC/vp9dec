@@ -28,24 +28,27 @@ mod transform;
 #[path = "../tests/unit/simd.rs"]
 mod tests;
 
-pub use inter::{
+#[cfg(test)]
+pub(crate) use inter::{
     block_inter_predict_avx2, block_inter_predict_avx2_w4, block_inter_predict_scaled_avx2,
-    block_inter_predict_scaled_u16_avx2, block_inter_predict_u16_avx2,
 };
-pub use intra::{
+pub(crate) use inter::{block_inter_predict_scaled_u16_avx2, block_inter_predict_u16_avx2};
+pub(crate) use intra::{
     intra_pred_dc_avx2, intra_pred_fill_avx2, intra_pred_h_avx2, intra_pred_tm_avx2,
     intra_pred_v_avx2,
 };
-pub use loop_filter::{
-    loop_filter_horiz8_avx2, loop_filter_horiz8_uniform_avx2, loop_filter_vert8_avx2,
-    loop_filter_vert8_uniform_avx2,
-};
-pub use transform::{
+#[cfg(test)]
+pub(crate) use loop_filter::{loop_filter_horiz8_avx2, loop_filter_vert8_avx2};
+pub(crate) use loop_filter::{loop_filter_horiz8_uniform_avx2, loop_filter_vert8_uniform_avx2};
+pub(crate) use transform::{
     inverse_transform_adst_reconstruct_avx2, inverse_transform_adst_reconstruct_hbd_avx2,
-    inverse_transform_dct_dct_reconstruct_avx2, inverse_transform_dct_dct_reconstruct_eob_avx2,
-    inverse_transform_dct_dct_reconstruct_hbd_avx2,
+    inverse_transform_dct_dct_reconstruct_eob_avx2,
     inverse_transform_dct_dct_reconstruct_hbd_eob_avx2, inverse_transform_wht_reconstruct_avx2,
     reconstruct_add_const_avx2,
+};
+#[cfg(test)]
+pub(crate) use transform::{
+    inverse_transform_dct_dct_reconstruct_avx2, inverse_transform_dct_dct_reconstruct_hbd_avx2,
 };
 
 use std::sync::OnceLock;
@@ -72,7 +75,7 @@ pub fn avx2_enabled() -> bool {
 /// # Safety
 /// Caller must confirm `avx2_enabled()` and `dst.len() >= src.len()`.
 #[target_feature(enable = "avx2")]
-pub unsafe fn narrow_u16_to_u8_avx2(src: &[u16], dst: *mut u8) {
+pub(crate) unsafe fn narrow_u16_to_u8_avx2(src: &[u16], dst: *mut u8) {
     use std::arch::x86_64::*;
     let len = src.len();
     let sp = src.as_ptr();

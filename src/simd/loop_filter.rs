@@ -10,7 +10,7 @@
 
 use std::arch::x86_64::*;
 
-/// Result of running the horizontal kernel on an 8-lane batch, telling [`loop_filter_vert8_inner`]
+/// Result of running the horizontal kernel on an 8-lane batch, telling [`loop_filter_vert8_core`]
 /// how much of the transposed tap window (if any) needs to be transposed back to the plane.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FilterWriteScope {
@@ -313,6 +313,7 @@ unsafe fn loop_filter_horiz8_core(
 /// Caller must confirm `avx2_enabled()` and that columns `x0..x0+8` over rows `y0-4..=y0+3`
 /// (and `y0-8..=y0+7` whenever any lane has `is_tx16 != 0`) lie within `plane_base` (stride
 /// `plane_width`).
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn loop_filter_horiz8_avx2(
@@ -373,8 +374,9 @@ unsafe fn uniform_lane_masks(active_lanes: u32, filter_size: u8) -> (__m256i, __
 /// limit, blimit, thresh)` derived from a single MI lookup — no 6 stack `[i32; 8]` arrays.
 ///
 /// # Safety
-/// Same bounds contract as [`loop_filter_horiz8_avx2`] (`active_lanes` is 4 or 8; `filter_size`
-/// is `TX_4X4` (0), `TX_8X8` (1), or `TX_16X16` (2)).
+/// Caller must confirm `avx2_enabled()`, `active_lanes` is 4 or 8, `filter_size` is `TX_4X4` (0),
+/// `TX_8X8` (1), or `TX_16X16` (2), and columns `x0..x0+8` over rows `y0-4..=y0+3` (and
+/// `y0-8..=y0+7` when `filter_size == 2`) lie within `plane_base` (stride `plane_width`).
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn loop_filter_horiz8_uniform_avx2(
@@ -544,6 +546,7 @@ unsafe fn loop_filter_vert8_core(
 /// # Safety
 /// Same contract as before: `avx2_enabled()`, columns `x0-4..=x0+3` (or `x0-8..=x0+7` if any
 /// `is_tx16` lane is set) across rows `y0..=y0+7` are in bounds.
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn loop_filter_vert8_avx2(
@@ -586,7 +589,9 @@ pub unsafe fn loop_filter_vert8_avx2(
 /// (`active_lanes` is 4 or 8).
 ///
 /// # Safety
-/// Same bounds contract as [`loop_filter_vert8_avx2`].
+/// Caller must confirm `avx2_enabled()`, `active_lanes` is 4 or 8, `filter_size` is `TX_4X4` (0),
+/// `TX_8X8` (1), or `TX_16X16` (2), and columns `x0-4..=x0+3` (or `x0-8..=x0+7` when
+/// `filter_size == 2`) across rows `y0..=y0+7` lie within `plane_base` (stride `plane_width`).
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn loop_filter_vert8_uniform_avx2(

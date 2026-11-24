@@ -258,6 +258,7 @@ pub fn get_scan_and_nb(tx_size: TxSize, tx_type: TxType) -> (&'static [u16], &'s
 /// prediction mode) is handled separately, together with the M2 intra
 /// prediction implementation; here we only handle "which scan table to use,
 /// given a known `TxSize` and `TxType`".
+#[cfg(test)]
 pub fn get_scan(tx_size: TxSize, tx_type: TxType) -> &'static [u16] {
     get_scan_and_nb(tx_size, tx_type).0
 }
