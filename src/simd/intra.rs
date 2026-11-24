@@ -184,6 +184,10 @@ pub unsafe fn intra_pred_h_avx2(
 /// Horizontal sum of `size` (`4, 8, 16, 32`) `u16` VP9 samples (each `<= 4095 < 32768`, so
 /// non-negative as `i16`) via pairwise `madd_epi16(., 1)` -> `i32` reduction. Exact for
 /// every 8/10/12-bit VP9 sample (max sum `32 * 4095 = 131_040`, far below `i32::MAX`).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `size` is one of `4, 8, 16, 32`, and
+/// `samples.len() >= size`.
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn sum_u16_avx2(samples: &[u16], size: usize) -> i32 {

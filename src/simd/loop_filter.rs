@@ -22,9 +22,13 @@ enum FilterWriteScope {
     Wide16,
 }
 
-/// Core 8-lane horizontal deblocking kernel parameterized by `UNIFORM` (when true, all active
-/// lanes share `uniform_filter_size`, avoiding redundant mask checks). Returns which tap window
-/// was modified so the vertical transpose wrapper can skip unchanged write-backs.
+/// Core 8-lane horizontal deblocking kernel. Returns which tap window was modified so the
+/// vertical transpose wrapper can skip unchanged write-backs.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and that columns `x0..x0+8` over rows `y0-4..=y0+3`
+/// (and `y0-8..=y0+7` whenever any eligible lane has `is_tx16_v` set) lie within `plane_base`
+/// (stride `plane_width`).
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn loop_filter_horiz8_core(
@@ -403,6 +407,9 @@ pub unsafe fn loop_filter_horiz8_uniform_avx2(
 
 /// Transposes an 8x8 matrix of `u16` (`r[i]` = input row `i`, 8 lanes) so the returned
 /// `out[j]` holds input column `j` across all 8 rows.
+///
+/// # Safety
+/// Pure SSE2 register shuffle; caller must be on x86_64 (SSE2 is baseline).
 #[inline]
 unsafe fn transpose8x8_u16(r: &[__m128i; 8]) -> [__m128i; 8] {
     let a0 = _mm_unpacklo_epi16(r[0], r[1]);
@@ -436,6 +443,10 @@ unsafe fn transpose8x8_u16(r: &[__m128i; 8]) -> [__m128i; 8] {
 /// Shared vertical-edge transpose driver: transposes the needed tap window (`p3..q3` or
 /// `p7..q7`), calls [`loop_filter_horiz8_core`], and skips transposing/storing back when
 /// nothing was modified (or stores only the inner `p3..q3` 8 columns when `wide16` did not fire).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and that columns `x0-4..=x0+3` (or `x0-8..=x0+7` when
+/// `wide == true`) across rows `y0..=y0+7` lie within `plane_base` (stride `plane_width`).
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn loop_filter_vert8_core(

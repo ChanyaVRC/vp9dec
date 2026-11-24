@@ -138,6 +138,8 @@ impl Plane {
     /// `BitDepth == 8`, where every sample is already known to fit in `0..=255`).
     pub fn crop_u8(&self, crop_width: usize, crop_height: usize) -> Vec<u8> {
         debug_assert_eq!(self.x0, 0, "crop is only meaningful on a whole-frame plane");
+        debug_assert!(crop_width <= self.stride);
+        debug_assert!(crop_height * self.stride <= self.data.len());
         let total = crop_width * crop_height;
         let mut out = Vec::with_capacity(total);
 

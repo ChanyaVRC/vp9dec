@@ -29,6 +29,9 @@ use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
 /// Transposes a 4x4 `i32` matrix (`r[i]` = row i) so `out[j]` = column j.
+///
+/// # Safety
+/// Pure SSE2 register shuffle; caller must be on x86_64 (SSE2 is baseline).
 #[inline]
 unsafe fn transpose4x4_i32(r: &[__m128i; 4]) -> [__m128i; 4] {
     let a0 = _mm_unpacklo_epi32(r[0], r[1]);
@@ -44,6 +47,9 @@ unsafe fn transpose4x4_i32(r: &[__m128i; 4]) -> [__m128i; 4] {
 }
 
 /// Transposes an 8x8 `i32` matrix (`r[i]` = row i) so `out[j]` = column j.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`.
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn transpose8x8_i32(r: &[__m256i; 8]) -> [__m256i; 8] {
@@ -76,6 +82,9 @@ unsafe fn transpose8x8_i32(r: &[__m256i; 8]) -> [__m256i; 8] {
 }
 
 /// `round2(x, shift)` with a runtime shift (the 2D column pass's `min(n+2, 6)`), lane-wise.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `shift >= 1`.
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn round2_var(x: __m256i, shift: u32) -> __m256i {
@@ -88,6 +97,11 @@ unsafe fn round2_var(x: __m256i, shift: u32) -> __m256i {
 /// writes the result TRANSPOSED into `output`, so running this twice (row then column) lands
 /// the 2D result back in row-major. `max_row` is the highest row index in `input` that may be
 /// non-zero (`n0 - 1` when unknown): any 8-row chunk with `cs > max_row` is skipped.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `2 <= n <= 5` (`<= 4` when `ADST`), `input` valid for
+/// `n0 * n0` initialized `i32` reads, and `output` valid for `n0 * n0` non-overlapping `i32`
+/// writes.
 #[target_feature(enable = "avx2")]
 unsafe fn xform_pass<const HBD: bool, const ADST: bool>(
     input: *const i32,
@@ -161,6 +175,10 @@ unsafe fn xform_pass<const HBD: bool, const ADST: bool>(
 }
 
 /// The two separable passes of the AVX2 DCT_DCT 2D inverse transform (spec §8.7.2).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `2 <= n <= 5`, `dequant.len() >= n0 * n0`, and `out`
+/// valid for `n0 * n0` `i32` writes.
 #[target_feature(enable = "avx2")]
 unsafe fn idct_2d_dct<const HBD: bool>(dequant: &[i64], n: u32, max_row: usize, out: *mut i32) {
     let n0 = 1usize << n;
@@ -387,6 +405,10 @@ pub unsafe fn inverse_transform_adst_reconstruct_hbd_avx2(
 }
 
 /// Shared body of the fused DCT_DCT entries above.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `2 <= n <= 5`, `dequant.len() >= n0 * n0`, and the
+/// `n0 x n0` block at `(start_x, start_y)` is in bounds for `plane_data` (stride `plane_width`).
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 unsafe fn idct_dct_reconstruct<const HBD: bool>(
@@ -492,6 +514,11 @@ pub unsafe fn reconstruct_add_const_avx2(
 
 /// Per-pixel `clip(pred + residual, 0, max_val)` of the n0 x n0 residual block `o` (row-major)
 /// straight into the u16 plane.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `n0` is `4, 8, 16, or 32`, `o` is valid for `n0 * n0`
+/// initialized `i32` reads, and `(start_x..start_x + n0, start_y..start_y + n0)` lies in
+/// `plane_data` (stride `plane_width`).
 #[target_feature(enable = "avx2")]
 unsafe fn reconstruct_add_clip(
     plane_data: &mut [u16],
@@ -541,6 +568,9 @@ unsafe fn reconstruct_add_clip(
 
 /// Vector 1D inverse Walsh-Hadamard transform (`transform.rs::iwht4`, spec §8.7.1.10) on 4
 /// rows/columns in parallel (`t[k]` holds element `k` across 4 lanes).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn iwht4_simd<const ROW_SHIFT: bool>(t: &mut [__m128i; 4]) {
@@ -568,6 +598,9 @@ pub(super) unsafe fn iwht4_simd<const ROW_SHIFT: bool>(t: &mut [__m128i; 4]) {
 }
 
 /// Loads 4 `i64` coefficients and narrows their low 32 bits into a single `__m128i` of 4 `i32`s.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and that `ptr` is valid for reading 4 contiguous `i64`s.
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn load_4_i64_as_i32(ptr: *const i64) -> __m128i {

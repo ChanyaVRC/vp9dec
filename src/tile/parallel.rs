@@ -60,17 +60,36 @@ pub(super) fn available_tile_workers() -> usize {
 /// Raw pointer wrapper allowing each `parallel_for` worker `i` to access its own unique element
 /// `ptr.add(i)` without creating overlapping `&mut` slices.
 #[derive(Clone, Copy)]
-struct DisjointSlicePtr<T>(*mut T);
+struct DisjointSlicePtr<T> {
+    ptr: *mut T,
+    len: usize,
+}
 // SAFETY: Used exclusively inside `parallel_for(len, |i| ...)` where each task index `i` is
-// invoked once, so every worker touches a strictly disjoint element of the backing slice.
+// invoked once on a backing slice of length `len` that outlives the synchronous dispatch.
 unsafe impl<T: Send> Send for DisjointSlicePtr<T> {}
+// SAFETY: Concurrent tasks only ever access strictly disjoint indices `i` (`0..len`), so
+// sharing `&DisjointSlicePtr<T>` across workers produces no aliased `&mut T` references.
 unsafe impl<T: Send> Sync for DisjointSlicePtr<T> {}
 
 impl<T> DisjointSlicePtr<T> {
     #[inline]
+    fn from_slice(slice: &mut [T]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    /// Returns a mutable pointer to element `i`.
+    ///
+    /// # Safety
+    /// Caller must ensure `i < self.len`, the backing slice is still alive, and no other thread
+    /// accesses element `i` concurrently.
+    #[inline]
     unsafe fn add(&self, i: usize) -> *mut T {
-        // SAFETY: caller ensures `i` is in bounds and unique to this task.
-        unsafe { self.0.add(i) }
+        debug_assert!(i < self.len, "DisjointSlicePtr index out of bounds");
+        // SAFETY: caller guarantees `i < self.len` and exclusive access to slot `i`.
+        unsafe { self.ptr.add(i) }
     }
 }
 
@@ -90,6 +109,8 @@ struct DstFrameView {
 // synchronous parallel dispatch; each worker writes only its own non-overlapping column range
 // `[mi_col_start, mi_col_end)` (and corresponding `[px0, px1)` per plane).
 unsafe impl Send for DstFrameView {}
+// SAFETY: Sharing `&DstFrameView` across tile-column workers is sound because every worker's
+// column range `[mi_col_start, mi_col_end)` is strictly disjoint.
 unsafe impl Sync for DstFrameView {}
 
 impl DstFrameView {
@@ -435,8 +456,8 @@ impl TileDecoder {
 
             let tile_slice = &tiles[c0 as usize..c1 as usize];
             let dst_view = DstFrameView::new(self);
-            let workers_ptr = DisjointSlicePtr(workers.as_mut_ptr());
-            let results_ptr = DisjointSlicePtr(results.as_mut_ptr());
+            let workers_ptr = DisjointSlicePtr::from_slice(&mut workers);
+            let results_ptr = DisjointSlicePtr::from_slice(&mut results);
 
             let run_task = |i: usize| {
                 // SAFETY: each `i in 0..n_chunk` runs once, so `workers_ptr.add(i)` and

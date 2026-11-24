@@ -39,7 +39,7 @@
 
 mod edge_filter;
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::common::{get_uv_tx_size, INTRA_FRAME};
 use crate::framebuffer::Plane;
@@ -101,11 +101,12 @@ struct PlaneView {
 
 // SAFETY: `PlaneView` is a bare pointer into a `Plane`'s `Vec<u16>`. It is only created from a
 // `&mut Plane` that outlives the synchronous parallel dispatch owning the workers (so the buffer
-// stays alive and is never moved/reallocated for the view's lifetime), and shared with workers
-// that -- by the wavefront ordering in `wavefront_filter_planes` -- never write the same pixel
-// concurrently and always establish happens-before (the `Release`/`Acquire` progress counter)
-// before reading a pixel another worker wrote. Hence there is no data race.
+// stays alive and is never moved/reallocated for the view's lifetime), and workers synchronize
+// via `Release`/`Acquire` progress counters so no two threads ever access the same pixel
+// concurrently. Hence sending a `PlaneView` across threads is sound.
 unsafe impl Send for PlaneView {}
+// SAFETY: Sharing `&PlaneView` across wavefront worker threads is sound under the same
+// happens-before and disjoint-write invariants documented above for `Send`.
 unsafe impl Sync for PlaneView {}
 
 impl PlaneView {
@@ -501,13 +502,33 @@ fn wavefront_filter_planes(
     let progress: [Vec<AtomicU32>; 3] =
         std::array::from_fn(|_| (0..n_sb_rows).map(|_| AtomicU32::new(0)).collect());
     let progress = &progress;
+    // Set if any worker unwinds so sibling workers break out of the spin-wait instead of
+    // deadlocking on a row that will never advance.
+    let aborted = AtomicBool::new(false);
+    let aborted = &aborted;
     let [p0, p1, p2] = planes;
     let views = [PlaneView::new(p0), PlaneView::new(p1), PlaneView::new(p2)];
 
+    struct AbortOnUnwind<'a> {
+        aborted: &'a AtomicBool,
+        completed: bool,
+    }
+    impl Drop for AbortOnUnwind<'_> {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.aborted.store(true, Ordering::Release);
+            }
+        }
+    }
+
     let run_worker = |t: usize| {
+        let mut guard = AbortOnUnwind {
+            aborted,
+            completed: false,
+        };
         // Advance through the planes in order; each is an independent wavefront, so a worker
         // that runs out of its rows in plane `p` flows straight into `p + 1` (no barrier).
-        for plane_idx in 0..3usize {
+        'planes: for plane_idx in 0..3usize {
             // Private `Copy` of this plane's shared raw view; writes go to the one
             // underlying buffer, kept disjoint-in-time by the gate below.
             let mut view = views[plane_idx];
@@ -523,6 +544,9 @@ fn wavefront_filter_planes(
                         let need = (sb_col as u32 + 2).min(n_sb_cols as u32);
                         let mut spins = 0u32;
                         while prog[sb_row - 1].load(Ordering::Acquire) < need {
+                            if aborted.load(Ordering::Acquire) {
+                                break 'planes;
+                            }
                             if spins < 256 {
                                 std::hint::spin_loop();
                                 spins += 1;
@@ -542,6 +566,7 @@ fn wavefront_filter_planes(
                 sb_row += n_threads;
             }
         }
+        guard.completed = true;
     };
 
     if let Some(pool) = pool {

@@ -19,6 +19,9 @@ use super::dct::{b_op_simd, h_op_simd, round2_14};
 
 /// Vector `SB(a, b, angle, flip)` (`transform.rs::sb_op`, spec §8.7.1.1) on 8 rows: the
 /// butterfly rotation into the high-precision `S` array, unrounded. 8-bit only.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `a, b < t.len().min(s.len())`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn sb_op_simd(
@@ -46,6 +49,9 @@ pub(in crate::simd) unsafe fn sb_op_simd(
 
 /// Vector `SH(a, b)` (`transform.rs::sh_op`, spec §8.7.1.1) on 8 rows: Hadamard + `round2(14)`
 /// from `S` back into `T`. 8-bit only.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `a, b < t.len().min(s.len())`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn sh_op_simd(t: &mut [__m256i], s: &[__m256i], a: usize, b: usize) {
@@ -55,6 +61,9 @@ pub(in crate::simd) unsafe fn sh_op_simd(t: &mut [__m256i], s: &[__m256i], a: us
 
 /// Vector `adst_input_permute` (`transform.rs`, spec §8.7.1.4): pure reorder, no arithmetic
 /// (lane-agnostic; shared with `adst_hbd`).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `n` is 3 or 4, and `t.len() >= (1 << n)`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn adst_input_permute_simd(t: &mut [__m256i], n: u32) {
@@ -70,6 +79,9 @@ pub(super) unsafe fn adst_input_permute_simd(t: &mut [__m256i], n: u32) {
 
 /// Vector `adst_output_permute` (`transform.rs`, spec §8.7.1.5): pure reorder, no arithmetic
 /// (`n` is 3 or 4; lane-agnostic, shared with `adst_hbd`).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `n` is 3 or 4, and `t.len() >= (1 << n)`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn adst_output_permute_simd(t: &mut [__m256i], n: u32) {
@@ -104,6 +116,9 @@ pub(super) unsafe fn adst_output_permute_simd(t: &mut [__m256i], n: u32) {
 }
 
 /// Vector inverse ADST4 (`transform.rs::iadst4_impl`, spec §8.7.1.6) on 8 rows.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `t.len() >= 4`.
 #[target_feature(enable = "avx2")]
 unsafe fn iadst4_simd(t: &mut [__m256i]) {
     use crate::transform::{SINPI_1_9, SINPI_2_9, SINPI_3_9, SINPI_4_9};
@@ -132,6 +147,9 @@ unsafe fn iadst4_simd(t: &mut [__m256i]) {
 }
 
 /// Vector inverse ADST8 (`transform.rs::iadst8_impl`, spec §8.7.1.7) on 8 rows.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `t.len() >= 8`.
 #[target_feature(enable = "avx2")]
 unsafe fn iadst8_simd(t: &mut [__m256i]) {
     adst_input_permute_simd(t, 3);
@@ -165,6 +183,9 @@ unsafe fn iadst8_simd(t: &mut [__m256i]) {
 }
 
 /// Vector inverse ADST16 (`transform.rs::iadst16_impl`, spec §8.7.1.8) on 8 rows.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `t.len() >= 16`.
 #[target_feature(enable = "avx2")]
 unsafe fn iadst16_simd(t: &mut [__m256i]) {
     adst_input_permute_simd(t, 4);
@@ -225,6 +246,9 @@ unsafe fn iadst16_simd(t: &mut [__m256i]) {
 }
 
 /// Vector `iadst(t, n)` (`transform.rs::iadst`, spec §8.7.1.9): ADST4/8/16 by size.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `2 <= n <= 4`, and `t.len() >= (1 << n)`.
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn iadst_simd(t: &mut [__m256i], n: u32) {
     match n {
