@@ -321,7 +321,7 @@ pub struct Decoder {
     /// filter's `ref_deltas`/`mode_deltas`, and the segmentation feature state -- see
     /// [`PersistentState`].
     persist: PersistentState,
-    frame_contexts: FrameContextStore,
+    frame_contexts: Box<FrameContextStore>,
     /// Used for computing `UsePrevFrameMvs` (spec §7.2.6). Not updated on
     /// `show_existing_frame` (because `compute_image_size` isn't called).
     prev_frame_dims: Option<(u32, u32)>,
@@ -346,11 +346,17 @@ pub struct Decoder {
     prev_segment_ids: Arc<Vec<u8>>,
     /// `LastFrameType` (spec §7.2). Not updated on `show_existing_frame` frames.
     last_frame_type: Option<FrameType>,
-    /// Recycled whole-frame `[Plane; 3]` buffers returned from unrefreshed frames and evicted
-    /// DPB slots, avoiding per-frame 6+ MB allocation/free cycles on 1080p video.
+    /// Recycled whole-frame `[Plane; 3]` buffers (at most one per active resolution geometry),
+    /// avoiding both per-frame 6+ MB alloc/free cycles and redundant identical-size pooling.
     plane_pool: Vec<[framebuffer::Plane; 3]>,
-    /// Recycled `MiGrid` allocation from the replaced `prev_mi_grid` (3+ MB at 1080p).
+    /// Recycled `MiGrid` allocation from the replaced `prev_mi_grid`.
     mi_grid_pool: Option<MiGrid>,
+    /// Recycled frame-width above contexts for `TileDecoder`.
+    above_ctx_pool: Option<tile::AboveContexts>,
+    /// Recycled heap-boxed per-block scratch for `TileDecoder`.
+    tile_scratch_pool: Option<Box<tile::TileScratch>>,
+    /// Recycled syntax counter table for frames with backward adaptation enabled.
+    counts_pool: Option<Box<counts::Counts>>,
     /// Persistent pure-`std` worker pool shared between tile-parallel decode and wavefront loop
     /// filtering (lazily spawned on first parallel frame, joined cleanly on drop).
     thread_pool: thread_pool::ThreadPool,
@@ -359,9 +365,16 @@ pub struct Decoder {
     tile_worker_pool: Vec<TileDecoder>,
 }
 
-/// Cap on pooled frame-buffer sets held by [`Decoder`] so resolution changes never retain stale
-/// allocations unboundedly.
+/// Cap on pooled frame-buffer sets held by [`Decoder`] (at most one per active geometry,
+/// covering up to 3-layer spatial SVC without retaining stale resolutions).
 const MAX_POOLED_PLANE_SETS: usize = 3;
+
+type PlaneGeom = ((usize, usize), (usize, usize));
+
+#[inline]
+fn plane_set_geom(planes: &[framebuffer::Plane; 3]) -> PlaneGeom {
+    (planes[0].backing_dims(), planes[1].backing_dims())
+}
 
 impl Default for Decoder {
     fn default() -> Self {
@@ -373,7 +386,7 @@ impl Decoder {
     pub fn new() -> Self {
         Self {
             persist: PersistentState::default(),
-            frame_contexts: FrameContextStore::new(),
+            frame_contexts: Box::new(FrameContextStore::new()),
             prev_frame_dims: None,
             prev_show_frame: None,
             prev_mi_grid: None,
@@ -383,8 +396,45 @@ impl Decoder {
             last_frame_type: None,
             plane_pool: Vec::new(),
             mi_grid_pool: None,
+            above_ctx_pool: None,
+            tile_scratch_pool: None,
+            counts_pool: None,
             thread_pool: thread_pool::ThreadPool::new(),
             tile_worker_pool: Vec::new(),
+        }
+    }
+
+    /// Finds and removes a pooled `[Plane; 3]` whose backing dimensions match `(y_w, y_h, uv_w, uv_h)`.
+    fn take_matching_planes(
+        &mut self,
+        y_w: usize,
+        y_h: usize,
+        uv_w: usize,
+        uv_h: usize,
+    ) -> Option<[framebuffer::Plane; 3]> {
+        let want: PlaneGeom = ((y_w, y_w * y_h), (uv_w, uv_w * uv_h));
+        let idx = self
+            .plane_pool
+            .iter()
+            .position(|p| plane_set_geom(p) == want)?;
+        Some(self.plane_pool.swap_remove(idx))
+    }
+
+    /// Recycles `planes` into `self.plane_pool`, keeping at most one cached buffer set per active
+    /// resolution (current frame or any live DPB slot) and pruning stale resolutions.
+    fn recycle_planes(&mut self, planes: [framebuffer::Plane; 3], active_geom: PlaneGeom) {
+        let geom = plane_set_geom(&planes);
+        let dpb = &self.dpb;
+        self.plane_pool.retain(|p| {
+            let g = plane_set_geom(p);
+            g == active_geom || dpb.has_plane_geometry(g)
+        });
+        let relevant = geom == active_geom || dpb.has_plane_geometry(geom);
+        if relevant
+            && self.plane_pool.len() < MAX_POOLED_PLANE_SETS
+            && !self.plane_pool.iter().any(|p| plane_set_geom(p) == geom)
+        {
+            self.plane_pool.push(planes);
         }
     }
 
@@ -425,7 +475,7 @@ impl Decoder {
             for row in 0..image_size.mi_rows {
                 for col in 0..image_size.mi_cols {
                     new_map[(row * image_size.mi_cols + col) as usize] =
-                        grid.get(row, col).segment_id;
+                        grid.get(row, col).segment_id();
                 }
             }
             self.prev_segment_ids = Arc::new(new_map);
@@ -441,10 +491,9 @@ impl Decoder {
         color_config: &ColorConfig,
         planes: [framebuffer::Plane; 3],
     ) {
+        let active_geom = plane_set_geom(&planes);
         if header.refresh_frame_flags == 0 {
-            if self.plane_pool.len() < MAX_POOLED_PLANE_SETS {
-                self.plane_pool.push(planes);
-            }
+            self.recycle_planes(planes, active_geom);
             return;
         }
 
@@ -456,12 +505,19 @@ impl Decoder {
             header.height,
             color_config,
         ));
-        self.dpb.update_and_recycle(
-            header.refresh_frame_flags,
-            &ref_data,
-            &mut self.plane_pool,
-            MAX_POOLED_PLANE_SETS,
-        );
+        let mut evicted = Vec::new();
+        self.dpb
+            .update_and_recycle(header.refresh_frame_flags, &ref_data, |p| evicted.push(p));
+        for p in evicted {
+            self.recycle_planes(p, active_geom);
+        }
+        // Also prune any stale cached geometries after the DPB update (e.g. a keyframe resize
+        // that replaced all 8 DPB slots at a new resolution).
+        let dpb = &self.dpb;
+        self.plane_pool.retain(|p| {
+            let g = plane_set_geom(p);
+            g == active_geom || dpb.has_plane_geometry(g)
+        });
         for (slot, size) in self.persist.ref_frame_sizes.iter_mut().enumerate() {
             if (header.refresh_frame_flags >> slot) & 1 == 1 {
                 *size = (header.width, header.height);
@@ -591,7 +647,8 @@ impl Decoder {
     }
 
     /// Stores `mi_grid` as `prev_mi_grid` and recycles the replaced allocation when unshared.
-    fn store_and_recycle_mi_grid(&mut self, mi_grid: MiGrid) {
+    fn store_and_recycle_mi_grid(&mut self, mut mi_grid: MiGrid) {
+        mi_grid.clear_sub_mvs();
         if let Some(old_grid) = self.prev_mi_grid.replace(Arc::new(mi_grid)) {
             if let Ok(owned) = Arc::try_unwrap(old_grid) {
                 self.mi_grid_pool = Some(owned);
@@ -677,8 +734,18 @@ impl Decoder {
         } else {
             None
         };
-        let recycled_planes = self.plane_pool.pop();
+        let y_w = (image_size.sb64_cols * 64) as usize;
+        let y_h = (image_size.sb64_rows * 64) as usize;
+        let uv_w = y_w >> color_config.subsampling_x;
+        let uv_h = y_h >> color_config.subsampling_y;
+        let recycled_planes = self.take_matching_planes(y_w, y_h, uv_w, uv_h);
         let recycled_mi_grid = self.mi_grid_pool.take();
+        let recycled_above_ctx = self.above_ctx_pool.take();
+        let recycled_scratch = self.tile_scratch_pool.take();
+        let recycled_counts = self.counts_pool.take();
+        let backward_adapt = header.refresh_frame_context
+            && !header.error_resilient_mode
+            && !header.frame_parallel_decoding_mode;
         let mut tile_decoder = TileDecoder::new_with_buffers(
             &header,
             color_config,
@@ -687,13 +754,12 @@ impl Decoder {
             prev_grid,
             resolved_refs,
             self.prev_segment_ids.clone(),
+            backward_adapt,
             recycled_planes,
             recycled_mi_grid,
-        );
-        tile_decoder.set_collect_counts(
-            header.refresh_frame_context
-                && !header.error_resilient_mode
-                && !header.frame_parallel_decoding_mode,
+            recycled_above_ctx,
+            recycled_scratch,
+            recycled_counts,
         );
         {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::TileDecode);
@@ -719,9 +785,6 @@ impl Decoder {
         // Backward adaptation (spec §6.1.2) needs `tile_decoder.counts()` before `tile_decoder`
         // is consumed; FPM / error-resilient refresh saves `compressed.probs` directly after
         // `tile_decoder.into_parts()` drops its `Arc` so `Arc::unwrap_or_clone` avoids cloning.
-        let backward_adapt = header.refresh_frame_context
-            && !header.error_resilient_mode
-            && !header.frame_parallel_decoding_mode;
         if backward_adapt {
             let starting_probs = self.frame_contexts.load(ctx_idx);
             let final_probs = refresh_probs(
@@ -751,7 +814,12 @@ impl Decoder {
         // `prev_mi_grid`, and `compressed.probs` BEFORE refreshing DPB / saving probs /
         // replacing `self.prev_mi_grid`, so evicted buffers have strong count 1 and recycle
         // cleanly into our pools with zero copy.
-        let (planes, mi_grid) = tile_decoder.into_parts();
+        let (planes, mi_grid, above_ctx, scratch, counts) = tile_decoder.into_parts();
+        self.above_ctx_pool = Some(above_ctx);
+        self.tile_scratch_pool = Some(scratch);
+        if let Some(c) = counts {
+            self.counts_pool = Some(c);
+        }
         if header.refresh_frame_context && !backward_adapt {
             self.frame_contexts
                 .save(ctx_idx, Arc::unwrap_or_clone(compressed.probs));

@@ -12,7 +12,7 @@ use crate::counts::Counts;
 use crate::framebuffer::Plane;
 use crate::thread_pool::ThreadPool;
 
-use super::{get_tile_offset, MiGrid, MiInfo, TileDecoder, TileError};
+use super::{get_tile_offset, AboveContexts, MiGrid, MiInfo, TileDecoder, TileError, TileScratch};
 
 /// Shared empty `prev_segment_ids` sentinel used when parking a worker `TileDecoder`, avoiding a
 /// fresh heap allocation of an `Arc<Vec<u8>>` control block on every worker per frame.
@@ -187,7 +187,6 @@ impl DstFrameView {
 struct ColumnStripGeometry {
     grid_cols: usize,
     grid_rows: usize,
-    above_nz_len: usize,
     strip_mi_cols: usize,
     plane_strips: [(usize, usize, usize); 3], // (x0, width, height)
 }
@@ -211,7 +210,6 @@ impl ColumnStripGeometry {
         Self {
             grid_cols,
             grid_rows,
-            above_nz_len: grid_cols * 2,
             strip_mi_cols: grid_col_end - mi_col_start as usize,
             plane_strips,
         }
@@ -253,7 +251,6 @@ impl TileDecoder {
         self.frame_width = parent.frame_width;
         self.frame_height = parent.frame_height;
         self.resolved_refs = parent.resolved_refs.clone();
-        self.collect_counts = parent.collect_counts;
     }
 
     /// Builds a fresh worker `TileDecoder` that shares this frame's read-only / config state
@@ -276,9 +273,8 @@ impl TileDecoder {
             tile_cols_log2: self.tile_cols_log2,
             tile_rows_log2: self.tile_rows_log2,
             mi_grid: MiGrid::new_strip(geom.strip_mi_cols, geom.grid_rows, mi_col_start),
-            above_partition_context: vec![0u8; geom.grid_cols],
+            above_ctx: AboveContexts::new(geom.grid_cols),
             left_partition_context: [0u8; 8],
-            above_seg_pred_context: vec![0u8; geom.grid_cols],
             left_seg_pred_context: [0u8; 8],
             prev_segment_ids: self.prev_segment_ids.clone(),
             mi_col_start,
@@ -291,11 +287,6 @@ impl TileDecoder {
             lossless: self.lossless,
             dequant_table: self.dequant_table,
             planes,
-            above_nonzero_context: [
-                vec![0u8; geom.above_nz_len],
-                vec![0u8; geom.above_nz_len],
-                vec![0u8; geom.above_nz_len],
-            ],
             left_nonzero_context: [[0u8; 16]; 3],
             frame_is_intra: self.frame_is_intra,
             ref_frame_sign_bias: self.ref_frame_sign_bias,
@@ -309,10 +300,8 @@ impl TileDecoder {
             frame_width: self.frame_width,
             frame_height: self.frame_height,
             resolved_refs: self.resolved_refs.clone(),
-            counts: Counts::new(),
-            collect_counts: self.collect_counts,
-            dequant_buf: [0i64; 1024],
-            token_cache_buf: [0u8; 1024],
+            counts: self.counts.as_ref().map(|_| Box::new(Counts::new())),
+            scratch: TileScratch::new(),
         };
         worker.sync_frame_config_from(self, mi_col_start, mi_col_end);
         worker
@@ -343,19 +332,16 @@ impl TileDecoder {
             }
         }
 
-        w.above_partition_context.resize(geom.grid_cols, 0);
-        w.above_partition_context.fill(0);
-        w.above_seg_pred_context.resize(geom.grid_cols, 0);
-        w.above_seg_pred_context.fill(0);
-        for ctx in &mut w.above_nonzero_context {
-            ctx.resize(geom.above_nz_len, 0);
-            ctx.fill(0);
-        }
+        w.above_ctx.reset_for(geom.grid_cols);
         w.clear_left_context();
-
         w.sync_frame_config_from(self, mi_col_start, mi_col_end);
-        if self.collect_counts {
-            w.counts = Counts::new();
+        if self.counts.is_some() {
+            match w.counts.as_deref_mut() {
+                Some(c) => c.reset(),
+                None => w.counts = Some(Box::new(Counts::new())),
+            }
+        } else {
+            w.counts = None;
         }
         w
     }
@@ -375,8 +361,10 @@ impl TileDecoder {
     /// of `mi_grid`, and sums the worker's probability-adaptation counts. Kept for unit tests.
     #[cfg(test)]
     pub(super) fn merge_column_worker(&mut self, w: &TileDecoder) {
-        if self.collect_counts {
-            self.counts.add_assign(&w.counts);
+        if let (Some(dst_counts), Some(src_counts)) =
+            (self.counts.as_deref_mut(), w.counts.as_deref())
+        {
+            dst_counts.add_assign(src_counts);
         }
         let dst_view = DstFrameView::new(self);
         // SAFETY: sole writer to `self`; `[w.mi_col_start, w.mi_col_end)` is in bounds.
@@ -504,9 +492,13 @@ impl TileDecoder {
                     }
                 }
             }
-            if first_err.is_none() && self.collect_counts {
-                for w in &workers {
-                    self.counts.add_assign(&w.counts);
+            if first_err.is_none() {
+                if let Some(dst_counts) = self.counts.as_deref_mut() {
+                    for w in &workers {
+                        if let Some(src_counts) = w.counts.as_deref() {
+                            dst_counts.add_assign(src_counts);
+                        }
+                    }
                 }
             }
             for w in &mut workers {

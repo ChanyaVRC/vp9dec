@@ -36,6 +36,8 @@ mod ref_ctx;
 mod residual;
 
 pub use mv_pred::Mv;
+/// Per-ref-list 4 sub-block MVs for a sub-8x8 inter block (`[ref_list][sub_idx]`).
+pub(super) type BlockMvs = [[Mv; 4]; 2];
 #[cfg(feature = "test-support")]
 pub use parallel::{FORCE_SEQUENTIAL_TILES, FORCE_TILE_WORKERS};
 
@@ -149,57 +151,174 @@ fn check_tile_read_bounds(r: &BoolDecoder, tile_bytes: &[u8]) -> Result<(), Tile
     Ok(())
 }
 
-/// Information held by a single 8x8 mode info unit (spec §2.37 "Mode info").
+/// Sentinel in [`MiInfo::extra`] indicating an inter block has no distinct sub-8x8 MVs
+/// (all 4 sub-blocks share [`MiInfo::mv`]).
+pub(super) const NO_SUB_MVS: u32 = u32::MAX;
+
+/// Information held by a single 8x8 mode info unit (spec §2.37 "Mode info"), packed into 24 bytes.
+///
+/// Bit packing preserves exact value ranges:
+/// - `size_mode`: `mi_size` (0..=12, bits 0..4) | `y_mode` (0..=13, bits 4..8)
+/// - `ref_tx_interp`: `ref_frame[0]` (0..=3, bits 0..2) | `ref_frame[1]` (0..=3, bits 2..4)
+///   | `tx_size` (0..=3, bits 4..6) | `interp_filter` (0..=3, bits 6..8)
+/// - `seg_skip_uv`: `segment_id` (0..=7, bits 0..3) | `skip` (bit 3) | `uv_mode` (0..=9, bits 4..8)
+/// - `extra`: for intra blocks (`ref_frame0() == INTRA_FRAME`), 4 packed `sub_modes` bytes;
+///   for inter blocks, an index into `MiGrid::sub_mvs` when `mi_size() < BLOCK_8X8` else `NO_SUB_MVS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MiInfo {
-    pub skip: bool,
-    pub tx_size: u8,
-    pub mi_size: u8,
-    /// `y_mode` (same value as all of `sub_modes` when `MiSize >= BLOCK_8X8`). For intra
-    /// blocks this is `DC_PRED`..`TM_PRED` (0..9); for inter blocks it is `NEARESTMV`..`NEWMV` (10..13).
-    pub y_mode: u8,
-    /// Only meaningful for intra blocks (unused, 0, for inter blocks).
-    pub uv_mode: u8,
-    /// Intra modes for the 4 4x4 sub-blocks within an 8x8 unit (can take multiple distinct
-    /// values only when `MiSize < BLOCK_8X8`). Unused for inter blocks (`[DC_PRED; 4]`).
-    pub sub_modes: [u8; 4],
-    pub segment_id: u8,
-    /// `ref_frame[ 0..2 ]` (spec §7.4.12). For intra blocks this is `[INTRA_FRAME, REF_NONE]`.
-    /// `ref_frame[0] != INTRA_FRAME` is itself the condition for "this is an inter block"
-    /// (`is_inter`).
-    pub ref_frame: [u8; 2],
-    /// `Mvs[ refList ]` (representative MV, same as `BlockMvs[ refList ][ 3 ]`, spec §6.4.4).
+    /// `Mvs[ refList ]` (representative MV == `BlockMvs[ refList ][ 3 ]`, spec §6.4.4).
     /// Units are 1/8 pel. `[[0, 0]; 2]` for intra blocks.
     pub mv: [[i32; 2]; 2],
-    /// `SubMvs[ refList ][ block 0..4 ]` (spec §6.4.4). Used by `get_sub_block_mv` in
-    /// `find_mv_refs` when referencing the sub MVs of neighboring blocks.
-    pub sub_mvs: [[[i32; 2]; 4]; 2],
-    /// `interp_filter` (spec §6.4.16). Unused for intra blocks (0).
-    pub interp_filter: u8,
+    extra: u32,
+    size_mode: u8,
+    ref_tx_interp: u8,
+    seg_skip_uv: u8,
+    _pad: u8,
+}
+
+impl MiInfo {
+    #[inline]
+    pub(super) fn new_intra(
+        skip: bool,
+        tx_size: u8,
+        mi_size: u8,
+        y_mode: u8,
+        uv_mode: u8,
+        sub_modes: [u8; 4],
+        segment_id: u8,
+    ) -> Self {
+        debug_assert!(mi_size < 16 && y_mode < 16 && tx_size < 4 && segment_id < 8 && uv_mode < 16);
+        Self {
+            mv: [[0, 0]; 2],
+            extra: u32::from_ne_bytes(sub_modes),
+            size_mode: mi_size | (y_mode << 4),
+            ref_tx_interp: INTRA_FRAME | (REF_NONE << 2) | (tx_size << 4),
+            seg_skip_uv: segment_id | ((skip as u8) << 3) | (uv_mode << 4),
+            _pad: 0,
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_inter(
+        skip: bool,
+        tx_size: u8,
+        mi_size: u8,
+        y_mode: u8,
+        segment_id: u8,
+        ref_frame: [u8; 2],
+        mv: [[i32; 2]; 2],
+        interp_filter: u8,
+    ) -> Self {
+        debug_assert!(
+            mi_size < 16
+                && y_mode < 16
+                && ref_frame[0] < 4
+                && ref_frame[1] < 4
+                && tx_size < 4
+                && interp_filter < 4
+                && segment_id < 8
+        );
+        Self {
+            mv,
+            extra: NO_SUB_MVS,
+            size_mode: mi_size | (y_mode << 4),
+            ref_tx_interp: ref_frame[0]
+                | (ref_frame[1] << 2)
+                | (tx_size << 4)
+                | (interp_filter << 6),
+            seg_skip_uv: segment_id | ((skip as u8) << 3),
+            _pad: 0,
+        }
+    }
+
+    #[inline]
+    pub fn skip(&self) -> bool {
+        (self.seg_skip_uv & 0x08) != 0
+    }
+
+    #[inline]
+    pub(super) fn set_skip(&mut self, skip: bool) {
+        if skip {
+            self.seg_skip_uv |= 0x08;
+        } else {
+            self.seg_skip_uv &= !0x08;
+        }
+    }
+
+    #[inline]
+    pub fn tx_size(&self) -> u8 {
+        (self.ref_tx_interp >> 4) & 0x03
+    }
+
+    #[inline]
+    pub fn mi_size(&self) -> u8 {
+        self.size_mode & 0x0F
+    }
+
+    #[inline]
+    pub fn y_mode(&self) -> u8 {
+        self.size_mode >> 4
+    }
+
+    #[inline]
+    pub fn uv_mode(&self) -> u8 {
+        self.seg_skip_uv >> 4
+    }
+
+    #[inline]
+    pub fn segment_id(&self) -> u8 {
+        self.seg_skip_uv & 0x07
+    }
+
+    #[inline]
+    pub fn ref_frame0(&self) -> u8 {
+        self.ref_tx_interp & 0x03
+    }
+
+    #[inline]
+    pub fn ref_frame(&self) -> [u8; 2] {
+        [self.ref_tx_interp & 0x03, (self.ref_tx_interp >> 2) & 0x03]
+    }
+
+    #[inline]
+    pub fn interp_filter(&self) -> u8 {
+        self.ref_tx_interp >> 6
+    }
+
+    #[inline]
+    pub fn sub_modes(&self) -> [u8; 4] {
+        if self.ref_frame0() == INTRA_FRAME {
+            self.extra.to_ne_bytes()
+        } else {
+            [DC_PRED; 4]
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_y_mode(&mut self, mode: u8) {
+        self.size_mode = (self.size_mode & 0x0F) | (mode << 4);
+    }
 }
 
 impl Default for MiInfo {
     fn default() -> Self {
-        Self {
-            skip: false,
-            tx_size: TX_4X4,
-            mi_size: crate::prob_tables::BLOCK_4X4,
-            y_mode: DC_PRED,
-            uv_mode: DC_PRED,
-            sub_modes: [DC_PRED; 4],
-            segment_id: 0,
-            ref_frame: [INTRA_FRAME, REF_NONE],
-            mv: [[0, 0]; 2],
-            sub_mvs: [[[0, 0]; 4]; 2],
-            interp_filter: 0,
-        }
+        Self::new_intra(
+            false,
+            TX_4X4,
+            crate::prob_tables::BLOCK_4X4,
+            DC_PRED,
+            DC_PRED,
+            [DC_PRED; 4],
+            0,
+        )
     }
 }
 
 /// A grid holding mode info for the whole frame, in 8x8 units.
 ///
 /// This bundles the spec's `Skips`/`TxSizes`/`MiSizes`/`YModes`/`SegmentIds`/`SubModes`
-/// arrays into a single struct. Its size is `Sb64Cols*8 x Sb64Rows*8`
+/// arrays into a single compact struct. Its size is `Sb64Cols*8 x Sb64Rows*8`
 /// (allocated to also cover the portion of edge superblocks that extends past the frame).
 ///
 /// A tile-parallel worker instead holds a *column strip* (`MiGrid::new_strip`) covering only
@@ -215,6 +334,10 @@ pub struct MiGrid {
     /// Absolute MI column of this grid's first column (0 for a whole-frame grid).
     col0: u32,
     data: Vec<MiInfo>,
+    /// Sparse storage of sub-block MVs `0..3` (sub-block `3` is [`MiInfo::mv`]) for inter blocks
+    /// with `mi_size < BLOCK_8X8`. Only populated during tile decode; cleared before storing as
+    /// `prev_mi_grid` (which only reads `mv` and `ref_frame`).
+    sub_mvs: Vec<[[Mv; 3]; 2]>,
 }
 
 impl MiGrid {
@@ -230,21 +353,54 @@ impl MiGrid {
             rows,
             col0,
             data: vec![MiInfo::default(); cols * rows],
+            sub_mvs: Vec::new(),
         }
     }
 
-    /// Reuses a pooled whole-frame `MiGrid` for `(cols, rows)` if its allocation matches.
+    /// Reuses a pooled whole-frame `MiGrid` for `(cols, rows)` if its capacity suffices (without
+    /// retaining grossly oversized buffers after a large down-resize).
     fn try_reuse(&mut self, cols: usize, rows: usize) -> bool {
         self.try_reuse_as_strip(cols, rows, 0)
     }
 
-    /// Reuses a pooled column-strip `MiGrid` for `(cols, rows, col0)` if its allocation matches.
+    /// Reuses a pooled column-strip `MiGrid` for `(cols, rows, col0)` if its capacity suffices.
     pub(super) fn try_reuse_as_strip(&mut self, cols: usize, rows: usize, col0: u32) -> bool {
-        if self.cols == cols && self.rows == rows && self.data.len() == cols * rows {
+        let need = cols * rows;
+        if self.data.capacity() >= need && self.data.capacity() <= need.saturating_mul(4).max(1024)
+        {
+            self.cols = cols;
+            self.rows = rows;
             self.col0 = col0;
+            self.data.resize(need, MiInfo::default());
+            self.sub_mvs.clear();
             true
         } else {
             false
+        }
+    }
+
+    /// Releases the transient sub-8x8 MV side table before archiving this grid as `prev_mi_grid`
+    /// (temporal MV prediction only reads representative `MiInfo::mv` and `ref_frame`).
+    pub(crate) fn clear_sub_mvs(&mut self) {
+        self.sub_mvs = Vec::new();
+    }
+
+    #[inline]
+    pub(super) fn push_sub_mvs(&mut self, block_mvs: &[[Mv; 4]; 2]) -> u32 {
+        let idx = self.sub_mvs.len() as u32;
+        self.sub_mvs.push([
+            [block_mvs[0][0], block_mvs[0][1], block_mvs[0][2]],
+            [block_mvs[1][0], block_mvs[1][1], block_mvs[1][2]],
+        ]);
+        idx
+    }
+
+    #[inline]
+    pub(super) fn get_sub_mv(&self, info: &MiInfo, ref_list: usize, idx: usize) -> Mv {
+        if idx == 3 || info.extra == NO_SUB_MVS {
+            info.mv[ref_list]
+        } else {
+            self.sub_mvs[info.extra as usize][ref_list][idx]
         }
     }
 
@@ -279,6 +435,61 @@ impl MiGrid {
     }
 }
 
+/// Reusable per-block token/dequant scratch (heap-boxed once and pooled across frames to keep
+/// `TileDecoder` tiny on the stack and avoid 9 KB moves).
+pub(crate) struct TileScratch {
+    pub(super) dequant_buf: [i64; 1024],
+    pub(super) token_cache_buf: [u8; 1024],
+}
+
+impl TileScratch {
+    pub(crate) fn new() -> Box<Self> {
+        Box::new(Self {
+            dequant_buf: [0i64; 1024],
+            token_cache_buf: [0u8; 1024],
+        })
+    }
+}
+
+/// Reusable frame-width above-context rows (`AbovePartitionContext`, `AboveSegPredContext`,
+/// `AboveNonzeroContext`), pooled across frames in `Decoder` to avoid 5 heap allocations/frame.
+pub(crate) struct AboveContexts {
+    pub(super) partition: Vec<u8>,
+    pub(super) seg_pred: Vec<u8>,
+    pub(super) nonzero: [Vec<u8>; 3],
+}
+
+impl AboveContexts {
+    pub(crate) fn new(grid_cols: usize) -> Self {
+        let nz_len = grid_cols * 2;
+        Self {
+            partition: vec![0u8; grid_cols],
+            seg_pred: vec![0u8; grid_cols],
+            nonzero: [vec![0u8; nz_len], vec![0u8; nz_len], vec![0u8; nz_len]],
+        }
+    }
+
+    pub(crate) fn reset_for(&mut self, grid_cols: usize) {
+        let nz_len = grid_cols * 2;
+        self.partition.resize(grid_cols, 0);
+        self.partition.fill(0);
+        self.seg_pred.resize(grid_cols, 0);
+        self.seg_pred.fill(0);
+        for ctx in &mut self.nonzero {
+            ctx.resize(nz_len, 0);
+            ctx.fill(0);
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.partition.fill(0);
+        self.seg_pred.fill(0);
+        for ctx in &mut self.nonzero {
+            ctx.fill(0);
+        }
+    }
+}
+
 /// `get_tile_offset( tileNum, mis, tileSzLog2 )` (spec §6.4.1).
 fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32 {
     let sbs = (mis + 7) >> 3;
@@ -299,18 +510,12 @@ pub struct TileDecoder {
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mi_grid: MiGrid,
-    /// `AbovePartitionContext`. Persists across the whole frame width (`Sb64Cols*8`) and is
-    /// cleared only once per frame (at the start of `decode_tiles`) (spec §7.4.1).
-    above_partition_context: Vec<u8>,
-    /// `LeftPartitionContext`. Conceptually an array spanning the full frame height, but it
-    /// is cleared per superblock row and only ever accessed at the relative position within
-    /// that superblock row (absolute mi row number mod 8), so it is kept as an 8-element array.
+    /// Frame-width above contexts (`AbovePartitionContext`, `AboveSegPredContext`,
+    /// `AboveNonzeroContext`), pooled across frames.
+    above_ctx: AboveContexts,
+    /// `LeftPartitionContext` (per-SB row, indexed mod 8).
     left_partition_context: [u8; 8],
-    /// `AboveSegPredContext` (spec §6.4.12). Same persistence/sizing rationale as
-    /// `above_partition_context`.
-    above_seg_pred_context: Vec<u8>,
-    /// `LeftSegPredContext` (spec §6.4.12). Same persistence/sizing rationale as
-    /// `left_partition_context`.
+    /// `LeftSegPredContext` (per-SB row, indexed mod 8).
     left_seg_pred_context: [u8; 8],
     /// `PrevSegmentIds[ MiRow ][ MiCol ]` (spec §6.4.14 `get_segment_id`), in
     /// row-major `MiRows x MiCols` layout (unpadded, unlike `mi_grid`). Supplied
@@ -334,9 +539,6 @@ pub struct TileDecoder {
     dequant_table: [[[i64; 2]; 2]; MAX_SEGMENTS],
     /// `CurrFrame[ plane ]`. Index 0=Y, 1=U, 2=V.
     planes: [Plane; 3],
-    /// `AboveNonzeroContext[ plane ]`. Persists across the whole frame width in 4x4 units
-    /// (cleared only once per frame).
-    above_nonzero_context: [Vec<u8>; 3],
     /// `LeftNonzeroContext[ plane ]`. Cleared per superblock row and only ever accessed at
     /// the relative position within that superblock row (absolute 4x4 row number mod 16),
     /// so it is kept as a 16-element array (64 pixels / 4 = 16).
@@ -374,16 +576,10 @@ pub struct TileDecoder {
     /// rather than deep-cloned per reference.
     resolved_refs: [Option<Arc<RefFrameData>>; 3],
 
-    // --- Counter collection for probability adaptation (spec §8.4, spec §9.3.4). ---
-    counts: Counts,
-    /// Whether this frame will actually use `counts` for backward adaptation. Defaults to `true`
-    /// for standalone `TileDecoder` callers/tests; `Decoder` disables it when
-    /// `!refresh_frame_context || error_resilient_mode || frame_parallel_decoding_mode`.
-    collect_counts: bool,
-
-    // --- Reusable per-block scratch for `tokens_and_reconstruct` (avoids 9 KB stack zeroing). ---
-    dequant_buf: [i64; 1024],
-    token_cache_buf: [u8; 1024],
+    // --- Lazy syntax-element counters (spec §8.4, §9.3.4): `None` when backward adaptation is off. ---
+    counts: Option<Box<Counts>>,
+    // --- Reusable heap-boxed per-block scratch for `tokens_and_reconstruct`. ---
+    scratch: Box<TileScratch>,
 }
 
 impl TileDecoder {
@@ -442,14 +638,17 @@ impl TileDecoder {
             prev_mi_grid,
             resolved_refs,
             prev_segment_ids,
+            true,
+            None,
+            None,
+            None,
             None,
             None,
         )
     }
 
-    /// Like [`TileDecoder::new_with_prev`], reusing caller-supplied pooled `planes` and/or
-    /// `mi_grid` allocations when their geometry matches this frame (avoiding ~9 MB/frame of
-    /// allocation + zeroing at 1080p).
+    /// Like [`TileDecoder::new_with_prev`], reusing caller-supplied pooled `planes`, `mi_grid`,
+    /// `above_ctx`, `scratch`, and `counts` allocations to avoid per-frame heap traffic.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_buffers(
         header: &NewFrameHeader,
@@ -459,8 +658,12 @@ impl TileDecoder {
         prev_mi_grid: Option<Arc<MiGrid>>,
         resolved_refs: [Option<Arc<RefFrameData>>; 3],
         prev_segment_ids: Arc<Vec<u8>>,
+        collect_counts: bool,
         recycled_planes: Option<[Plane; 3]>,
         recycled_mi_grid: Option<MiGrid>,
+        recycled_above_ctx: Option<AboveContexts>,
+        recycled_scratch: Option<Box<TileScratch>>,
+        recycled_counts: Option<Box<Counts>>,
     ) -> Self {
         let image_size = header::compute_image_size(header.width, header.height);
         let grid_cols = (image_size.sb64_cols * 8) as usize;
@@ -468,8 +671,6 @@ impl TileDecoder {
         let subsampling_x = color_config.subsampling_x as u32;
         let subsampling_y = color_config.subsampling_y as u32;
 
-        // Frame buffers are allocated rounded up to the superblock boundary
-        // (Sb64Cols*64 / Sb64Rows*64) (see the docs in src/framebuffer.rs).
         let y_w = (image_size.sb64_cols * 64) as usize;
         let y_h = (image_size.sb64_rows * 64) as usize;
         let uv_w = y_w >> subsampling_x;
@@ -491,13 +692,25 @@ impl TileDecoder {
         let mi_grid = recycled_mi_grid
             .and_then(|mut g| g.try_reuse(grid_cols, grid_rows).then_some(g))
             .unwrap_or_else(|| MiGrid::new(grid_cols, grid_rows));
-        // AboveNonzeroContext persists across the whole frame width in 4x4 units (2x the 8x8 mi unit).
-        let above_nz_len = grid_cols * 2;
-        let above_nonzero_context = [
-            vec![0u8; above_nz_len],
-            vec![0u8; above_nz_len],
-            vec![0u8; above_nz_len],
-        ];
+        let above_ctx = match recycled_above_ctx {
+            Some(mut ctx) => {
+                ctx.reset_for(grid_cols);
+                ctx
+            }
+            None => AboveContexts::new(grid_cols),
+        };
+        let scratch = recycled_scratch.unwrap_or_else(TileScratch::new);
+        let counts = if collect_counts {
+            Some(match recycled_counts {
+                Some(mut c) => {
+                    c.reset();
+                    c
+                }
+                None => Box::new(Counts::new()),
+            })
+        } else {
+            None
+        };
 
         Self {
             tx_mode: compressed.tx_mode,
@@ -508,9 +721,8 @@ impl TileDecoder {
             tile_cols_log2: header.tile_cols_log2,
             tile_rows_log2: header.tile_rows_log2,
             mi_grid,
-            above_partition_context: vec![0u8; grid_cols],
+            above_ctx,
             left_partition_context: [0u8; 8],
-            above_seg_pred_context: vec![0u8; grid_cols],
             left_seg_pred_context: [0u8; 8],
             prev_segment_ids,
             mi_col_start: 0,
@@ -530,7 +742,6 @@ impl TileDecoder {
                 header.quantization.delta_q_uv_ac,
             ),
             planes,
-            above_nonzero_context,
             left_nonzero_context: [[0u8; 16]; 3],
             frame_is_intra: header.frame_is_intra,
             ref_frame_sign_bias: header.ref_frame_sign_bias,
@@ -544,28 +755,37 @@ impl TileDecoder {
             frame_width: header.width,
             frame_height: header.height,
             resolved_refs,
-            counts: Counts::new(),
-            collect_counts: true,
-            dequant_buf: [0i64; 1024],
-            token_cache_buf: [0u8; 1024],
+            counts,
+            scratch,
         }
     }
 
-    /// Configures whether syntax-element counters are accumulated during tile decode.
-    pub(crate) fn set_collect_counts(&mut self, collect: bool) {
-        self.collect_counts = collect;
-    }
-
     /// Consumes `self`, dropping its read-only reference-frame and previous-grid `Arc` handles
-    /// and handing back its decoded `(planes, mi_grid)` by value for zero-copy DPB storage and
-    /// buffer pooling.
-    pub(crate) fn into_parts(self) -> ([Plane; 3], MiGrid) {
-        (self.planes, self.mi_grid)
+    /// and handing back its reusable buffers for zero-copy DPB storage and cross-frame pooling.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        [Plane; 3],
+        MiGrid,
+        AboveContexts,
+        Box<TileScratch>,
+        Option<Box<Counts>>,
+    ) {
+        (
+            self.planes,
+            self.mi_grid,
+            self.above_ctx,
+            self.scratch,
+            self.counts,
+        )
     }
 
     /// The collected syntax element counters (used for probability adaptation, spec §8.4).
+    /// Panics if count collection was disabled for this frame.
     pub fn counts(&self) -> &Counts {
-        &self.counts
+        self.counts
+            .as_deref()
+            .expect("counts() called with count collection disabled")
     }
 
     pub fn mi_grid(&self) -> &MiGrid {
@@ -628,11 +848,7 @@ impl TileDecoder {
 
     /// `clear_above_context( )` (spec §7.4.1): also clears `AboveSegPredContext`.
     fn clear_above_context(&mut self) {
-        self.above_partition_context.fill(0);
-        self.above_seg_pred_context.fill(0);
-        for plane_ctx in &mut self.above_nonzero_context {
-            plane_ctx.fill(0);
-        }
+        self.above_ctx.clear();
     }
 
     /// `clear_left_context( )` (spec §7.4.2): also clears `LeftSegPredContext`.
@@ -774,7 +990,7 @@ impl TileDecoder {
             let above_val = 15u8 >> B_WIDTH_LOG2_LOOKUP[subsize as usize];
             let left_val = 15u8 >> B_HEIGHT_LOG2_LOOKUP[subsize as usize];
             let c0 = col as usize;
-            self.above_partition_context[c0..c0 + num8x8 as usize].fill(above_val);
+            self.above_ctx.partition[c0..c0 + num8x8 as usize].fill(above_val);
             for i in 0..num8x8 {
                 self.left_partition_context[((row + i) & 7) as usize] = left_val;
             }
@@ -808,7 +1024,7 @@ impl TileDecoder {
         let mut above = 0u32;
         let mut left = 0u32;
         for i in 0..num8x8 {
-            above |= self.above_partition_context[(col + i) as usize] as u32;
+            above |= self.above_ctx.partition[(col + i) as usize] as u32;
             left |= self.left_partition_context[((row + i) % 8) as usize] as u32;
         }
         let above_bit = (above & (1 << boffset)) > 0;
@@ -842,8 +1058,10 @@ impl TileDecoder {
         } else {
             PARTITION_SPLIT
         };
-        if self.collect_counts && !self.frame_is_intra {
-            self.counts.partition[ctx][partition as usize] += 1;
+        if !self.frame_is_intra {
+            if let Some(counts) = self.counts.as_deref_mut() {
+                counts.partition[ctx][partition as usize] += 1;
+            }
         }
         partition
     }
@@ -859,12 +1077,15 @@ impl TileDecoder {
         let avail_u = row > 0;
         let avail_l = col > self.mi_col_start;
 
-        let mut info = if self.frame_is_intra {
-            self.intra_frame_mode_info(r, row, col, subsize, avail_u, avail_l)?
+        let (mut info, block_mvs) = if self.frame_is_intra {
+            (
+                self.intra_frame_mode_info(r, row, col, subsize, avail_u, avail_l)?,
+                None,
+            )
         } else {
             self.inter_frame_mode_info(r, row, col, subsize, avail_u, avail_l)?
         };
-        let is_inter = info.ref_frame[0] != INTRA_FRAME;
+        let is_inter = info.ref_frame0() != INTRA_FRAME;
 
         // Guard the residual/predict path against malformed bitstreams before entering it: it
         // indexes fixed size/tx tables and unwraps reference views without re-validating, so a
@@ -873,14 +1094,14 @@ impl TileDecoder {
         // produce), so this changes no valid-input output. The first two were found by
         // tests/robustness_test; the reference-size bound by review (pinned red->green in
         // tests/synthetic_scaled_ref_test.rs).
-        let bsize = info.mi_size.max(BLOCK_8X8);
+        let bsize = info.mi_size().max(BLOCK_8X8);
         if SS_SIZE_LOOKUP[bsize as usize][self.subsampling_x as usize][self.subsampling_y as usize]
             == BLOCK_INVALID
         {
             return Err(TileError::InvalidPartition);
         }
         if is_inter {
-            for &rf in &info.ref_frame {
+            for rf in info.ref_frame() {
                 if rf > INTRA_FRAME {
                     match self.resolved_refs[(rf - LAST_FRAME) as usize].as_deref() {
                         None => return Err(TileError::MissingReference),
@@ -901,11 +1122,25 @@ impl TileDecoder {
             }
         }
 
-        let eob_total = self.residual(r, row, col, &info, avail_u, avail_l, is_inter);
+        let eob_total = self.residual(
+            r,
+            row,
+            col,
+            &info,
+            block_mvs.as_ref(),
+            avail_u,
+            avail_l,
+            is_inter,
+        );
         // Spec §6.4.4: when is_inter && subsize >= BLOCK_8X8 && EobTotal == 0, retroactively
         // set skip to 1 (since it turns out there was actually no residual at all).
         if is_inter && subsize >= BLOCK_8X8 && eob_total == 0 {
-            info.skip = true;
+            info.set_skip(true);
+        }
+        if is_inter && subsize < BLOCK_8X8 {
+            if let Some(mvs) = block_mvs.as_ref() {
+                info.extra = self.mi_grid.push_sub_mvs(mvs);
+            }
         }
 
         let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize] as u32;

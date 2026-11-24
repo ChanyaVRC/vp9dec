@@ -75,22 +75,27 @@ impl Dpb {
         }
     }
 
-    /// Same as [`Dpb::update`], additionally recycling the backing `[Plane; 3]` of any evicted
-    /// slot whose `Arc` refcount drops to 0 into `recycle_pool` (up to `max_pool` entries).
+    /// Returns `true` if any live DPB slot has matching luma/chroma backing buffer geometry.
+    pub(crate) fn has_plane_geometry(&self, key: ((usize, usize), (usize, usize))) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|slot| (slot.y.backing_dims(), slot.u.backing_dims()) == key)
+    }
+
+    /// Same as [`Dpb::update`], additionally passing the backing `[Plane; 3]` of any evicted
+    /// slot whose `Arc` refcount drops to 0 into `on_evict` for caller-managed pooling.
     pub(crate) fn update_and_recycle(
         &mut self,
         refresh_frame_flags: u8,
         data: &Arc<RefFrameData>,
-        recycle_pool: &mut Vec<[Plane; 3]>,
-        max_pool: usize,
+        mut on_evict: impl FnMut([Plane; 3]),
     ) {
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             if (refresh_frame_flags >> slot) & 1 == 1 {
                 if let Some(old) = entry.replace(data.clone()) {
-                    if recycle_pool.len() < max_pool {
-                        if let Ok(owned) = Arc::try_unwrap(old) {
-                            recycle_pool.push([owned.y, owned.u, owned.v]);
-                        }
+                    if let Ok(owned) = Arc::try_unwrap(old) {
+                        on_evict([owned.y, owned.u, owned.v]);
                     }
                 }
             }

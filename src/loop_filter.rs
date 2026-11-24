@@ -244,8 +244,8 @@ fn edge_group_params(
     let loop_row = ((y >> 3) >> sub_y) << sub_y;
     let mi = ctx.mi_grid.get(loop_row, loop_col);
 
-    let mi_size = mi.mi_size;
-    let tx_size = mi.tx_size;
+    let mi_size = mi.mi_size();
+    let tx_size = mi.tx_size();
     let tx_sz = if plane_idx > 0 {
         get_uv_tx_size(mi_size, tx_size, ctx.subsampling_x, ctx.subsampling_y)
     } else {
@@ -256,8 +256,8 @@ fn edge_group_params(
     } else {
         mi_size.max(BLOCK_16X16)
     };
-    let skip = mi.skip;
-    let ref_frame = mi.ref_frame[0];
+    let skip = mi.skip();
+    let ref_frame = mi.ref_frame0();
     let is_intra = ref_frame == INTRA_FRAME;
 
     // Block widths/heights in pixels (`8 * NUM_8X8_BLOCKS_*`) are powers of 2 -> bitmask test.
@@ -294,8 +294,8 @@ fn edge_group_params(
         };
     }
 
-    let mode_type = matches!(mi.y_mode, NEARESTMV | NEARMV | NEWMV) as usize;
-    let lvl = ctx.lvl_lookup[mi.segment_id as usize][ref_frame as usize][mode_type];
+    let mode_type = matches!(mi.y_mode(), NEARESTMV | NEARMV | NEWMV) as usize;
+    let lvl = ctx.lvl_lookup[mi.segment_id() as usize][ref_frame as usize][mode_type];
     if lvl <= 0 {
         return EdgeGroup {
             x,
@@ -499,9 +499,20 @@ fn wavefront_filter_planes(
     let n_sb_cols = ctx.mi_cols.div_ceil(8) as usize;
     // One `progress` array per plane: `progress[p][r]` = superblock columns fully filtered (both
     // passes) in row `r` of plane `p`. Published with `Release`, awaited with `Acquire`.
-    let progress: [Vec<AtomicU32>; 3] =
-        std::array::from_fn(|_| (0..n_sb_rows).map(|_| AtomicU32::new(0)).collect());
-    let progress = &progress;
+    // Stack-backed for up to 4096px height (64 SB rows) to avoid 3 heap allocations per frame.
+    const STACK_SB_ROWS: usize = 64;
+    let stack_progress: [[AtomicU32; STACK_SB_ROWS]; 3] =
+        std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0)));
+    let heap_progress: Option<[Vec<AtomicU32>; 3]> = (n_sb_rows > STACK_SB_ROWS)
+        .then(|| std::array::from_fn(|_| (0..n_sb_rows).map(|_| AtomicU32::new(0)).collect()));
+    let progress: [&[AtomicU32]; 3] = match &heap_progress {
+        Some(h) => [&h[0], &h[1], &h[2]],
+        None => [
+            &stack_progress[0][..n_sb_rows],
+            &stack_progress[1][..n_sb_rows],
+            &stack_progress[2][..n_sb_rows],
+        ],
+    };
     // Set if any worker unwinds so sibling workers break out of the spin-wait instead of
     // deadlocking on a row that will never advance.
     let aborted = AtomicBool::new(false);

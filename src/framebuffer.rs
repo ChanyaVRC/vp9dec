@@ -60,6 +60,12 @@ impl Plane {
         self.stride
     }
 
+    /// Backing allocation geometry `(stride, len)` for pool lookup and deduplication.
+    #[inline]
+    pub(crate) fn backing_dims(&self) -> (usize, usize) {
+        (self.stride, self.data.len())
+    }
+
     /// Crops this plane's logical `(width, height)` in-place without reallocating or copying
     /// the backing buffer (for zero-copy DPB storage in `RefFrameData`).
     pub(crate) fn crop_in_place(&mut self, crop_width: usize, crop_height: usize) {

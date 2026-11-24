@@ -117,6 +117,11 @@ impl Counts {
         Self::default()
     }
 
+    /// Resets every counter back to zero in place for cross-frame `Box<Counts>` reuse.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     /// Adds every counter in `other` into `self`, element-wise. Used to merge the per-tile-column
     /// `Counts` that tile-parallel decode accumulates on separate threads back into one frame
     /// total before backward probability adaptation. Order-independent (integer addition is

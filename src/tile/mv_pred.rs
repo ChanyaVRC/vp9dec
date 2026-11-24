@@ -118,9 +118,10 @@ impl TileDecoder {
         ref_list_mv: &mut [Mv; 2],
         ref_mv_count: &mut usize,
     ) {
-        if info.ref_frame[0] == ref_frame {
+        let rf = info.ref_frame();
+        if rf[0] == ref_frame {
             add_mv_ref_list(ref_list_mv, ref_mv_count, info.mv[0]);
-        } else if info.ref_frame[1] == ref_frame {
+        } else if rf[1] == ref_frame {
             add_mv_ref_list(ref_list_mv, ref_mv_count, info.mv[1]);
         }
     }
@@ -134,8 +135,7 @@ impl TileDecoder {
         ref_list_mv: &mut [Mv; 2],
         ref_mv_count: &mut usize,
     ) {
-        let frame0 = info.ref_frame[0];
-        let frame1 = info.ref_frame[1];
+        let [frame0, frame1] = info.ref_frame();
         let mv0 = info.mv[0];
         let mv1 = info.mv[1];
         let mvs_same = mv0 == mv1;
@@ -171,15 +171,17 @@ impl TileDecoder {
             if self.is_inside(cr, cc) {
                 different_ref_found = true;
                 let cand = self.mi_grid.get(cr as u32, cc as u32);
-                context_counter += MODE_2_COUNTER[cand.y_mode as usize] as u32;
-                for j in 0..2 {
-                    if cand.ref_frame[j] == ref_frame {
+                context_counter += MODE_2_COUNTER[cand.y_mode() as usize] as u32;
+                let cand_rf = cand.ref_frame();
+                for (j, &rf) in cand_rf.iter().enumerate() {
+                    if rf == ref_frame {
                         let idx = if block >= 0 {
                             IDX_N_COLUMN_TO_SUBBLOCK[block as usize][(dc == 0) as usize] as usize
                         } else {
                             3
                         };
-                        add_mv_ref_list(&mut ref_list_mv, &mut ref_mv_count, cand.sub_mvs[j][idx]);
+                        let cand_mv = self.mi_grid.get_sub_mv(cand, j, idx);
+                        add_mv_ref_list(&mut ref_list_mv, &mut ref_mv_count, cand_mv);
                         break;
                     }
                 }
