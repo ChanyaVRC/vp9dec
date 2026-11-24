@@ -198,6 +198,16 @@ impl MiGrid {
         }
     }
 
+    /// Reuses a pooled column-strip `MiGrid` for `(cols, rows, col0)` if its allocation matches.
+    pub(super) fn try_reuse_as_strip(&mut self, cols: usize, rows: usize, col0: u32) -> bool {
+        if self.cols == cols && self.rows == rows && self.data.len() == cols * rows {
+            self.col0 = col0;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn cols(&self) -> usize {
         self.cols
     }
@@ -549,6 +559,26 @@ impl TileDecoder {
         );
     }
 
+    /// Like [`Self::apply_loop_filter`], reusing `pool`'s persistent worker threads.
+    pub(crate) fn apply_loop_filter_with_pool(
+        &mut self,
+        lf: &header::LoopFilterParams,
+        pool: &mut crate::thread_pool::ThreadPool,
+    ) {
+        crate::loop_filter::loop_filter_frame_with_pool(
+            &mut self.planes,
+            &self.mi_grid,
+            self.mi_cols,
+            self.mi_rows,
+            self.subsampling_x,
+            self.subsampling_y,
+            lf,
+            &self.segmentation,
+            self.bit_depth,
+            Some(pool),
+        );
+    }
+
     /// `clear_above_context( )` (spec §7.4.1): also clears `AboveSegPredContext`.
     fn clear_above_context(&mut self) {
         self.above_partition_context.iter_mut().for_each(|v| *v = 0);
@@ -568,6 +598,26 @@ impl TileDecoder {
     /// `decode_tiles( sz )` (spec §6.4). `data` is the entire tile data following the
     /// uncompressed header, excluding the compressed header (the rest of the frame data).
     pub fn decode_tiles(&mut self, data: &[u8]) -> Result<(), TileError> {
+        self.decode_tiles_inner(data, None, None)
+    }
+
+    /// Like [`Self::decode_tiles`], reusing persistent worker threads and pooled column-worker
+    /// `TileDecoder` strip buffers across frames.
+    pub(crate) fn decode_tiles_with_pool(
+        &mut self,
+        data: &[u8],
+        pool: &mut crate::thread_pool::ThreadPool,
+        worker_pool: &mut Vec<TileDecoder>,
+    ) -> Result<(), TileError> {
+        self.decode_tiles_inner(data, Some(pool), Some(worker_pool))
+    }
+
+    fn decode_tiles_inner(
+        &mut self,
+        data: &[u8],
+        pool: Option<&mut crate::thread_pool::ThreadPool>,
+        worker_pool: Option<&mut Vec<TileDecoder>>,
+    ) -> Result<(), TileError> {
         let tile_cols = 1u32 << self.tile_cols_log2;
         let tile_rows = 1u32 << self.tile_rows_log2;
 
@@ -583,7 +633,7 @@ impl TileDecoder {
         if use_parallel {
             let max_workers = parallel::available_tile_workers();
             if max_workers > 1 {
-                return self.decode_tiles_parallel(data, tile_cols, max_workers);
+                return self.decode_tiles_parallel(data, tile_cols, max_workers, pool, worker_pool);
             }
         }
 

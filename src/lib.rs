@@ -53,6 +53,7 @@ pub mod subpel;
 pub mod superframe;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub(crate) mod thread_pool;
 #[doc(hidden)]
 pub mod tile;
 #[doc(hidden)]
@@ -330,6 +331,12 @@ pub struct Decoder {
     plane_pool: Vec<[framebuffer::Plane; 3]>,
     /// Recycled `MiGrid` allocation from the replaced `prev_mi_grid` (3+ MB at 1080p).
     mi_grid_pool: Option<MiGrid>,
+    /// Persistent pure-`std` worker pool shared between tile-parallel decode and wavefront loop
+    /// filtering (lazily spawned on first parallel frame, joined cleanly on drop).
+    thread_pool: thread_pool::ThreadPool,
+    /// Pooled per-tile-column worker `TileDecoder`s (reusing their column-strip `Plane`/`MiGrid`
+    /// allocations across multi-tile frames).
+    tile_worker_pool: Vec<TileDecoder>,
 }
 
 /// Cap on pooled frame-buffer sets held by [`Decoder`] so resolution changes never retain stale
@@ -356,6 +363,8 @@ impl Decoder {
             last_frame_type: None,
             plane_pool: Vec::new(),
             mi_grid_pool: None,
+            thread_pool: thread_pool::ThreadPool::new(),
+            tile_worker_pool: Vec::new(),
         }
     }
 
@@ -642,7 +651,11 @@ impl Decoder {
         );
         {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::TileDecode);
-            tile_decoder.decode_tiles(tile_data)?;
+            tile_decoder.decode_tiles_with_pool(
+                tile_data,
+                &mut self.thread_pool,
+                &mut self.tile_worker_pool,
+            )?;
         }
         // Spec §8.1 step 2: "If loop_filter_level is not equal to 0, the loop filter
         // process ... is invoked" -- the whole process (including §8.8.1's frame init,
@@ -651,7 +664,7 @@ impl Decoder {
         // just the per-edge computed level.
         if header.loop_filter.level != 0 {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::LoopFilter);
-            tile_decoder.apply_loop_filter(&header.loop_filter);
+            tile_decoder.apply_loop_filter_with_pool(&header.loop_filter, &mut self.thread_pool);
         }
         // Remainder of decode_one_frame (PrevSegmentIds refresh, probability adaptation,
         // DPB update, output Frame construction) is timed as one "DpbOutput" bucket; this

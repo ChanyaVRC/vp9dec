@@ -804,23 +804,17 @@ fn loop_filter_plane(
     }
 }
 
-/// Filters all three planes using the intra-plane WAVEFRONT in a SINGLE `thread::scope`: each of
-/// `n_threads` workers processes a round-robin subset of superblock rows, in the spec's per-plane
-/// order (vertical then horizontal pass per superblock), advancing through plane 0, then 1, then 2.
+/// Upper bound on loop-filter wavefront threads. Because the 2-superblock-column lag limits
+/// useful wavefront width and Windows scheduler contention escalates when spawning more spinning
+/// threads than needed, capping at 8 keeps all cores productive without starvation stalls.
+const MAX_LF_WAVEFRONT_THREADS: usize = 8;
+
+/// Filters all three planes using the intra-plane WAVEFRONT: each of `n_threads` workers
+/// processes a round-robin subset of superblock rows, in the spec's per-plane order (vertical
+/// then horizontal pass per superblock), advancing through plane 0, then 1, then 2.
 ///
-/// A worker may filter superblock `(r, c)` of a plane only once that plane's row `r-1` has finished
-/// column `c+2` -- a **2-superblock-column lag**. One column would not be enough: `(r, c)`'s
-/// horizontal (top-edge) pass and `(r-1, c+1)`'s vertical (left-edge) pass both write a shared
-/// 8-sample corner where the superblocks meet, so with only a 1-column lead the row above could
-/// still be writing that corner. Each plane has its own `progress` counter array (superblock
-/// columns fully filtered per row); the `Release` store / `Acquire` load also publishes the pixels
-/// a worker wrote before the dependent worker reads them.
-///
-/// Bit-identical to the sequential per-plane raster order: every read/write dependency (left
-/// neighbour via same-thread ordering, above neighbour via the gate) is preserved. The three planes
-/// are independent, so fusing them into one scope (rather than three) changes only timing -- a
-/// worker that runs out of work in one plane flows straight into the next instead of idling at a
-/// per-plane barrier, and the per-frame thread spawns are paid once, not once per plane.
+/// Uses `pool` (persistent worker threads owned by [`crate::Decoder`]) when supplied, falling
+/// back to `std::thread::scope` for standalone callers/tests.
 #[allow(clippy::too_many_arguments)]
 fn wavefront_filter_planes(
     planes: &mut [Plane; 3],
@@ -833,6 +827,7 @@ fn wavefront_filter_planes(
     strength_table: &StrengthTable,
     bit_depth: u8,
     n_threads: usize,
+    pool: Option<&mut crate::thread_pool::ThreadPool>,
 ) {
     #[cfg(feature = "test-support")]
     WAVEFRONT_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
@@ -847,55 +842,70 @@ fn wavefront_filter_planes(
     let [p0, p1, p2] = planes;
     let views = [PlaneView::new(p0), PlaneView::new(p1), PlaneView::new(p2)];
 
-    std::thread::scope(|s| {
-        for t in 0..n_threads {
-            s.spawn(move || {
-                // Advance through the planes in order; each is an independent wavefront, so a worker
-                // that runs out of its rows in plane `p` flows straight into `p + 1` (no barrier).
-                for plane_idx in 0..3usize {
-                    // Private `Copy` of this plane's shared raw view; writes go to the one
-                    // underlying buffer, kept disjoint-in-time by the gate below.
-                    let mut view = views[plane_idx];
-                    let prog = &progress[plane_idx];
-                    let mut sb_row = t;
-                    while sb_row < n_sb_rows {
-                        let row = (sb_row * 8) as u32;
-                        for sb_col in 0..n_sb_cols {
-                            // Wavefront gate: wait until this plane's row above has finished column
-                            // `sb_col + 1` (the 2-superblock lag). Row 0 has no row above.
-                            if sb_row > 0 {
-                                let need = (sb_col as u32 + 2).min(n_sb_cols as u32);
-                                while prog[sb_row - 1].load(Ordering::Acquire) < need {
-                                    std::hint::spin_loop();
-                                }
+    let run_worker = |t: usize| {
+        // Advance through the planes in order; each is an independent wavefront, so a worker
+        // that runs out of its rows in plane `p` flows straight into `p + 1` (no barrier).
+        for plane_idx in 0..3usize {
+            // Private `Copy` of this plane's shared raw view; writes go to the one
+            // underlying buffer, kept disjoint-in-time by the gate below.
+            let mut view = views[plane_idx];
+            let prog = &progress[plane_idx];
+            let mut sb_row = t;
+            while sb_row < n_sb_rows {
+                let row = (sb_row * 8) as u32;
+                for sb_col in 0..n_sb_cols {
+                    // Wavefront gate: wait until this plane's row above has finished column
+                    // `sb_col + 1` (the 2-superblock lag). Row 0 has no row above.
+                    // Spin briefly then yield if preempted, preventing scheduler starvation.
+                    if sb_row > 0 {
+                        let need = (sb_col as u32 + 2).min(n_sb_cols as u32);
+                        let mut spins = 0u32;
+                        while prog[sb_row - 1].load(Ordering::Acquire) < need {
+                            if spins < 256 {
+                                std::hint::spin_loop();
+                                spins += 1;
+                            } else {
+                                std::thread::yield_now();
+                                spins = 0;
                             }
-                            let col = (sb_col * 8) as u32;
-                            for pass in 0..2u32 {
-                                superblock_loop_filter(
-                                    &mut view,
-                                    mi_grid,
-                                    mi_cols,
-                                    mi_rows,
-                                    subsampling_x,
-                                    subsampling_y,
-                                    lvl_lookup,
-                                    strength_table,
-                                    plane_idx,
-                                    pass,
-                                    row,
-                                    col,
-                                    bit_depth,
-                                );
-                            }
-                            // Publish: this superblock (both passes) is done; unblock the row below.
-                            prog[sb_row].store(sb_col as u32 + 1, Ordering::Release);
                         }
-                        sb_row += n_threads;
                     }
+                    let col = (sb_col * 8) as u32;
+                    for pass in 0..2u32 {
+                        superblock_loop_filter(
+                            &mut view,
+                            mi_grid,
+                            mi_cols,
+                            mi_rows,
+                            subsampling_x,
+                            subsampling_y,
+                            lvl_lookup,
+                            strength_table,
+                            plane_idx,
+                            pass,
+                            row,
+                            col,
+                            bit_depth,
+                        );
+                    }
+                    // Publish: this superblock (both passes) is done; unblock the row below.
+                    prog[sb_row].store(sb_col as u32 + 1, Ordering::Release);
                 }
-            });
+                sb_row += n_threads;
+            }
         }
-    });
+    };
+
+    if let Some(pool) = pool {
+        pool.parallel_for(n_threads, run_worker);
+    } else {
+        std::thread::scope(|s| {
+            for t in 1..n_threads {
+                s.spawn(move || run_worker(t));
+            }
+            run_worker(0);
+        });
+    }
 }
 
 /// Frame-wide entry point for spec §8.8 "Loop filter process".
@@ -915,6 +925,33 @@ pub fn loop_filter_frame(
     lf: &LoopFilterParams,
     seg: &SegmentationParams,
     bit_depth: u8,
+) {
+    loop_filter_frame_with_pool(
+        planes,
+        mi_grid,
+        mi_cols,
+        mi_rows,
+        subsampling_x,
+        subsampling_y,
+        lf,
+        seg,
+        bit_depth,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loop_filter_frame_with_pool(
+    planes: &mut [Plane; 3],
+    mi_grid: &MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    lf: &LoopFilterParams,
+    seg: &SegmentationParams,
+    bit_depth: u8,
+    pool: Option<&mut crate::thread_pool::ThreadPool>,
 ) {
     let lvl_lookup = build_lvl_lookup(lf, seg);
     let strength_table = build_strength_table(lf.sharpness, bit_depth);
@@ -936,15 +973,21 @@ pub fn loop_filter_frame(
         1
     } else {
         let n_sb_rows = mi_rows.div_ceil(8) as usize;
+        let n_sb_cols = mi_cols.div_ceil(8) as usize;
         let available = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let available = if force_parallel {
-            available.max(2)
-        } else {
+        if force_parallel {
             available
-        };
-        available.min(n_sb_rows.max(1))
+                .max(2)
+                .min(n_sb_rows.max(1))
+                .min(MAX_LF_WAVEFRONT_THREADS)
+        } else {
+            let wavefront_cap = n_sb_rows
+                .min(n_sb_cols.div_ceil(2))
+                .min(MAX_LF_WAVEFRONT_THREADS);
+            available.min(wavefront_cap.max(1))
+        }
     };
 
     if n_threads <= 1 {
@@ -976,6 +1019,7 @@ pub fn loop_filter_frame(
         &strength_table,
         bit_depth,
         n_threads,
+        pool,
     );
 }
 

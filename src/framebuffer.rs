@@ -74,10 +74,16 @@ impl Plane {
     /// allocation matches `(stride == width && data.len() == width * height)`. Returns `true`
     /// on match so the caller can reuse it without allocating.
     pub(crate) fn try_reuse_as(&mut self, width: usize, height: usize) -> bool {
+        self.try_reuse_as_strip(width, height, 0)
+    }
+
+    /// Reuses a pooled column-strip plane for `(width, height, x0)` if its backing allocation
+    /// matches `(stride == width && data.len() == width * height)` (zero allocation/zeroing).
+    pub(crate) fn try_reuse_as_strip(&mut self, width: usize, height: usize, x0: usize) -> bool {
         if self.stride == width && self.data.len() == width * height {
             self.width = width;
             self.height = height;
-            self.x0 = 0;
+            self.x0 = x0;
             true
         } else {
             false
