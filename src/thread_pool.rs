@@ -8,8 +8,49 @@
 use std::any::Any;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
+
+#[inline]
+fn lock_unpoisoned<T>(mu: &Mutex<T>) -> MutexGuard<'_, T> {
+    mu.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[inline]
+fn wait_unpoisoned<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    cv.wait(guard).unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII soundness guard ensuring [`ThreadPool::parallel_for`] always waits until every
+/// dispatched worker finishes (`remaining == 0`) before returning or unwinding, so the
+/// stack-local closure `&F` can never be dropped while a worker still holds a pointer to it.
+struct DispatchGuard<'a> {
+    shared: &'a PoolShared,
+}
+
+impl DispatchGuard<'_> {
+    fn wait_all(&self) {
+        let mut spins = 0u32;
+        while self.shared.remaining.load(Ordering::Acquire) > 0 {
+            if spins < 64 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                let mut guard = lock_unpoisoned(&self.shared.done_mu);
+                while self.shared.remaining.load(Ordering::Acquire) > 0 {
+                    guard = wait_unpoisoned(&self.shared.wake_caller, guard);
+                }
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.wait_all();
+    }
+}
 
 struct DispatchState {
     /// Monotonically incremented on every `parallel_for` dispatch.
@@ -103,7 +144,7 @@ impl ThreadPool {
 
         let needed_workers = n_tasks - 1;
         if self.workers.len() < needed_workers {
-            let initial_gen = self.shared.state.lock().unwrap().generation;
+            let initial_gen = lock_unpoisoned(&self.shared.state).generation;
             while self.workers.len() < needed_workers {
                 let worker_id = self.workers.len() + 1;
                 let shared = Arc::clone(&self.shared);
@@ -117,7 +158,7 @@ impl ThreadPool {
 
         // Publish the new generation under `state` lock before waking workers.
         {
-            let mut state = self.shared.state.lock().unwrap();
+            let mut state = lock_unpoisoned(&self.shared.state);
             state.active_tasks = n_tasks;
             state.trampoline = trampoline::<F>;
             state.data = (&f as *const F).cast::<()>();
@@ -126,27 +167,20 @@ impl ThreadPool {
                 .remaining
                 .store(needed_workers, Ordering::Release);
         }
+        // Guard is created immediately after publishing so even an unexpected unwind waits
+        // until `remaining == 0` before `&f` leaves scope.
+        let dispatch_guard = DispatchGuard {
+            shared: &self.shared,
+        };
         self.shared.wake_workers.notify_all();
 
         // Execute task 0 on the calling thread while workers execute `1..n_tasks`.
         let caller_res = catch_unwind(AssertUnwindSafe(|| f(0)));
 
         // Wait for every worker to finish before `&f` leaves scope (soundness invariant).
-        let mut spins = 0u32;
-        while self.shared.remaining.load(Ordering::Acquire) > 0 {
-            if spins < 64 {
-                std::hint::spin_loop();
-                spins += 1;
-            } else {
-                let mut guard = self.shared.done_mu.lock().unwrap();
-                while self.shared.remaining.load(Ordering::Acquire) > 0 {
-                    guard = self.shared.wake_caller.wait(guard).unwrap();
-                }
-                break;
-            }
-        }
+        drop(dispatch_guard);
 
-        let worker_panic = self.shared.done_mu.lock().unwrap().take();
+        let worker_panic = lock_unpoisoned(&self.shared.done_mu).take();
 
         if let Err(payload) = caller_res {
             resume_unwind(payload);
@@ -160,7 +194,7 @@ impl ThreadPool {
 fn worker_loop(shared: Arc<PoolShared>, worker_id: usize, mut seen_gen: u64) {
     loop {
         let (trampoline, data) = {
-            let mut state = shared.state.lock().unwrap();
+            let mut state = lock_unpoisoned(&shared.state);
             loop {
                 if state.shutdown {
                     return;
@@ -171,13 +205,13 @@ fn worker_loop(shared: Arc<PoolShared>, worker_id: usize, mut seen_gen: u64) {
                         break (state.trampoline, state.data);
                     }
                 }
-                state = shared.wake_workers.wait(state).unwrap();
+                state = wait_unpoisoned(&shared.wake_workers, state);
             }
         };
 
         let res = catch_unwind(AssertUnwindSafe(|| trampoline(data, worker_id)));
         if let Err(payload) = res {
-            let mut guard = shared.done_mu.lock().unwrap();
+            let mut guard = lock_unpoisoned(&shared.done_mu);
             if guard.is_none() {
                 *guard = Some(payload);
             }
@@ -186,7 +220,7 @@ fn worker_loop(shared: Arc<PoolShared>, worker_id: usize, mut seen_gen: u64) {
         if shared.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Acquire and release `done_mu` before notifying so the caller cannot observe
             // `remaining > 0` and then miss this notification.
-            let _guard = shared.done_mu.lock().unwrap();
+            let _guard = lock_unpoisoned(&shared.done_mu);
             drop(_guard);
             shared.wake_caller.notify_one();
         }
@@ -199,7 +233,7 @@ impl Drop for ThreadPool {
             return;
         }
         {
-            let mut state = self.shared.state.lock().unwrap();
+            let mut state = lock_unpoisoned(&self.shared.state);
             state.shutdown = true;
         }
         self.shared.wake_workers.notify_all();
@@ -241,6 +275,30 @@ mod tests {
         assert!(res.is_err());
 
         // Pool remains sound and usable after a caught panic.
+        let sum = AtomicUsize::new(0);
+        pool.parallel_for(4, |i| {
+            sum.fetch_add(i + 1, Ordering::Relaxed);
+        });
+        assert_eq!(sum.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn parallel_for_waits_for_workers_when_caller_task_panics() {
+        let mut pool = ThreadPool::new();
+        let finished = AtomicUsize::new(0);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.parallel_for(4, |i| {
+                if i == 0 {
+                    panic!("caller boom");
+                }
+                finished.fetch_add(1, Ordering::Relaxed);
+            });
+        }));
+        assert!(res.is_err());
+        // All 3 worker tasks must have completed before `parallel_for` unwound.
+        assert_eq!(finished.load(Ordering::Relaxed), 3);
+
+        // Pool remains usable after caller-side panic.
         let sum = AtomicUsize::new(0);
         pool.parallel_for(4, |i| {
             sum.fetch_add(i + 1, Ordering::Relaxed);

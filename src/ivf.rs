@@ -28,6 +28,8 @@
 //! | 0 | 4 | Size of the frame data (excluding this header) |
 //! | 4 | 8 | 64-bit presentation timestamp |
 
+use std::fmt;
+
 /// Size of the IVF file header (bytes).
 const IVF_FILE_HEADER_SIZE: usize = 32;
 /// Size of the IVF frame header (bytes).
@@ -49,6 +51,22 @@ pub enum IvfError {
     /// The buffer does not contain as many bytes as the frame header claims for the data size.
     TruncatedFrameData,
 }
+
+impl fmt::Display for IvfError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IvfError::TooShortForFileHeader => {
+                f.write_str("IVF buffer shorter than 32-byte header")
+            }
+            IvfError::BadSignature => f.write_str("invalid IVF signature (expected \"DKIF\")"),
+            IvfError::InvalidHeaderLength => f.write_str("invalid IVF header length"),
+            IvfError::TruncatedFrameHeader => f.write_str("truncated IVF frame header"),
+            IvfError::TruncatedFrameData => f.write_str("truncated IVF frame payload"),
+        }
+    }
+}
+
+impl std::error::Error for IvfError {}
 
 /// Contents of the IVF file header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,7 +174,10 @@ impl<'a> Iterator for IvfReader<'a> {
         let timestamp = read_u64_le(self.remaining, 4);
 
         let data_start = IVF_FRAME_HEADER_SIZE;
-        let data_end = data_start + frame_size;
+        let Some(data_end) = data_start.checked_add(frame_size) else {
+            self.remaining = &[];
+            return Some(Err(IvfError::TruncatedFrameData));
+        };
         if self.remaining.len() < data_end {
             self.remaining = &[];
             return Some(Err(IvfError::TruncatedFrameData));
@@ -180,7 +201,12 @@ pub fn write_ivf(
     timebase_num: u32,
     frames: &[Vec<u8>],
 ) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let total_size = IVF_FILE_HEADER_SIZE
+        + frames
+            .iter()
+            .map(|f| IVF_FRAME_HEADER_SIZE + f.len())
+            .sum::<usize>();
+    let mut buf = Vec::with_capacity(total_size);
     buf.extend_from_slice(IVF_SIGNATURE);
     buf.extend_from_slice(&0u16.to_le_bytes()); // version
     buf.extend_from_slice(&(IVF_FILE_HEADER_SIZE as u16).to_le_bytes());

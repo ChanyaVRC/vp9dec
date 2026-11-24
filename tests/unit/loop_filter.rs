@@ -188,13 +188,15 @@ fn avx2_horiz8_matches_scalar_sample_filtering() {
                     &mut plane_scalar,
                     lane,
                     y0,
-                    0,
-                    1,
-                    limit[lane],
-                    blimit[lane],
-                    thresh[lane],
-                    filter_size,
-                    8,
+                    EdgeFilterParams {
+                        dx: 0,
+                        dy: 1,
+                        limit: limit[lane],
+                        blimit: blimit[lane],
+                        thresh: thresh[lane],
+                        filter_size,
+                        bit_depth: 8,
+                    },
                 );
             }
         }
@@ -291,13 +293,15 @@ fn avx2_vert8_matches_scalar_sample_filtering() {
                     &mut plane_scalar,
                     x0,
                     lane,
-                    1,
-                    0,
-                    limit[lane],
-                    blimit[lane],
-                    thresh[lane],
-                    filter_size,
-                    8,
+                    EdgeFilterParams {
+                        dx: 1,
+                        dy: 0,
+                        limit: limit[lane],
+                        blimit: blimit[lane],
+                        thresh: thresh[lane],
+                        filter_size,
+                        bit_depth: 8,
+                    },
                 );
             }
         }

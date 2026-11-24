@@ -8,7 +8,8 @@ use crate::prob_tables::{
     BLOCK_8X8, INTRA_FRAME, NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP,
 };
 use crate::subpel::{
-    INTERP_EXTEND, REF_SCALE_SHIFT, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, SUBPEL_SHIFTS,
+    INTERP_EXTEND, MAX_BLOCK_DIM, MAX_INTERMEDIATE_HEIGHT, REF_SCALE_SHIFT, SUBPEL_BITS,
+    SUBPEL_FILTERS, SUBPEL_MASK, SUBPEL_SHIFTS,
 };
 use crate::tile::Mv;
 
@@ -169,13 +170,6 @@ fn scale_mv_for_plane(
     let start_y = (base_y << SUBPEL_BITS) + d_y;
     (start_x, start_y, step_x, step_y)
 }
-
-/// Max output block dimension for a single `predict_inter` call (64x64).
-pub(crate) const MAX_BLOCK_DIM: usize = 64;
-
-/// Max rows needed in the intermediate (horizontal-filter) buffer under spec §8.5.2.3's 2x
-/// reference-scaling bound: `(((MAX_BLOCK_DIM - 1) * 32 + 15) >> 4) + 8 == 134`.
-pub(crate) const MAX_INTERMEDIATE_HEIGHT: usize = 134;
 
 /// Scalar body of [`block_inter_predict_into_plane`] (spec §8.5.2.4 two-pass loops): the
 /// always-kept fallback and bit-exactness oracle `tests/unit/simd.rs` pins AVX2 against.
@@ -432,6 +426,56 @@ fn try_inter_predict_avx2(
     bit_depth: u8,
     compound: bool,
 ) -> bool {
+    if compound {
+        try_inter_predict_avx2_mode::<true>(
+            ref_plane,
+            dst,
+            dst_x,
+            dst_y,
+            x,
+            y,
+            x_step,
+            y_step,
+            w,
+            h,
+            interp_filter,
+            bit_depth,
+        )
+    } else {
+        try_inter_predict_avx2_mode::<false>(
+            ref_plane,
+            dst,
+            dst_x,
+            dst_y,
+            x,
+            y,
+            x_step,
+            y_step,
+            w,
+            h,
+            interp_filter,
+            bit_depth,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn try_inter_predict_avx2_mode<const COMPOUND: bool>(
+    ref_plane: &Plane,
+    dst: &mut Plane,
+    dst_x: usize,
+    dst_y: usize,
+    x: i64,
+    y: i64,
+    x_step: i64,
+    y_step: i64,
+    w: usize,
+    h: usize,
+    interp_filter: u8,
+    bit_depth: u8,
+) -> bool {
     let max_val = (1i32 << bit_depth) - 1;
     let local_x = dst_x - dst.x0;
     let dst_stride = dst.stride();
@@ -458,41 +502,22 @@ fn try_inter_predict_avx2(
             // SAFETY: `avx2_enabled()` confirmed by caller; `x_ok && y_ok` proves every source
             // pixel read lies in `ref_plane`, and `dst` bounds hold.
             unsafe {
-                if compound {
-                    crate::simd::block_inter_predict_u16_avx2::<true>(
-                        ref_plane.as_slice(),
-                        ref_stride,
-                        dst.as_mut_slice(),
-                        dst_stride,
-                        local_x,
-                        dst_y,
-                        x0,
-                        y0,
-                        fx,
-                        fy,
-                        w,
-                        h,
-                        interp_filter,
-                        max_val,
-                    );
-                } else {
-                    crate::simd::block_inter_predict_u16_avx2::<false>(
-                        ref_plane.as_slice(),
-                        ref_stride,
-                        dst.as_mut_slice(),
-                        dst_stride,
-                        local_x,
-                        dst_y,
-                        x0,
-                        y0,
-                        fx,
-                        fy,
-                        w,
-                        h,
-                        interp_filter,
-                        max_val,
-                    );
-                }
+                crate::simd::block_inter_predict_u16_avx2::<COMPOUND>(
+                    ref_plane.as_slice(),
+                    ref_stride,
+                    dst.as_mut_slice(),
+                    dst_stride,
+                    local_x,
+                    dst_y,
+                    x0,
+                    y0,
+                    fx,
+                    fy,
+                    w,
+                    h,
+                    interp_filter,
+                    max_val,
+                );
             }
             return true;
         }
@@ -507,47 +532,25 @@ fn try_inter_predict_avx2(
         // every source read is clamped inside `width x height`, scratch bounds were checked,
         // and `dst` bounds hold.
         unsafe {
-            if compound {
-                crate::simd::block_inter_predict_scaled_u16_avx2::<true>(
-                    ref_plane.as_slice(),
-                    ref_plane.width,
-                    ref_stride,
-                    ref_plane.height,
-                    dst.as_mut_slice(),
-                    dst_stride,
-                    local_x,
-                    dst_y,
-                    x,
-                    y,
-                    x_step,
-                    y_step,
-                    w,
-                    h,
-                    intermediate_height as usize,
-                    interp_filter,
-                    max_val,
-                );
-            } else {
-                crate::simd::block_inter_predict_scaled_u16_avx2::<false>(
-                    ref_plane.as_slice(),
-                    ref_plane.width,
-                    ref_stride,
-                    ref_plane.height,
-                    dst.as_mut_slice(),
-                    dst_stride,
-                    local_x,
-                    dst_y,
-                    x,
-                    y,
-                    x_step,
-                    y_step,
-                    w,
-                    h,
-                    intermediate_height as usize,
-                    interp_filter,
-                    max_val,
-                );
-            }
+            crate::simd::block_inter_predict_scaled_u16_avx2::<COMPOUND>(
+                ref_plane.as_slice(),
+                ref_plane.width,
+                ref_stride,
+                ref_plane.height,
+                dst.as_mut_slice(),
+                dst_stride,
+                local_x,
+                dst_y,
+                x,
+                y,
+                x_step,
+                y_step,
+                w,
+                h,
+                intermediate_height as usize,
+                interp_filter,
+                max_val,
+            );
         }
         return true;
     }

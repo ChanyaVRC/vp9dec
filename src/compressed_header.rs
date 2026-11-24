@@ -28,6 +28,7 @@
 //! The inter-related reads called only when `FrameIsIntra == 0`
 //! (`read_inter_mode_probs` onward, spec §6.3.9-6.3.18) were implemented in M3.
 
+use std::fmt;
 use std::sync::Arc;
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
@@ -49,6 +50,30 @@ use crate::prob_tables::{
 pub enum CompressedHeaderError {
     /// Bool decoder initialization failed (e.g. `header_size_in_bytes` is 0).
     BoolCoder(BoolCoderError),
+}
+
+impl From<BoolCoderError> for CompressedHeaderError {
+    fn from(e: BoolCoderError) -> Self {
+        CompressedHeaderError::BoolCoder(e)
+    }
+}
+
+impl fmt::Display for CompressedHeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompressedHeaderError::BoolCoder(e) => {
+                write!(f, "compressed header bool decoder error: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompressedHeaderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CompressedHeaderError::BoolCoder(e) => Some(e),
+        }
+    }
 }
 
 /// The full set of probability tables updated by `compressed_header()`.
@@ -338,36 +363,31 @@ fn read_coef_probs(r: &mut BoolDecoder, tx_mode: u8, coef_probs: &mut CoefProbs)
     }
 }
 
-/// `read_skip_prob()` (spec §6.3.8).
-fn read_skip_prob(r: &mut BoolDecoder, skip_prob: &mut [u8; 3]) {
-    for prob in skip_prob.iter_mut() {
+/// Applies [`diff_update_prob`] to every probability in `probs` in place.
+fn diff_update_prob_slice(r: &mut BoolDecoder, probs: &mut [u8]) {
+    for prob in probs.iter_mut() {
         *prob = diff_update_prob(r, *prob);
     }
+}
+
+/// `read_skip_prob()` (spec §6.3.8).
+fn read_skip_prob(r: &mut BoolDecoder, skip_prob: &mut [u8; 3]) {
+    diff_update_prob_slice(r, skip_prob);
 }
 
 /// `read_inter_mode_probs()` (spec §6.3.9).
 fn read_inter_mode_probs(r: &mut BoolDecoder, probs: &mut [[u8; 3]; 7]) {
-    for ctx in probs.iter_mut() {
-        for node in ctx.iter_mut() {
-            *node = diff_update_prob(r, *node);
-        }
-    }
+    diff_update_prob_slice(r, probs.as_flattened_mut());
 }
 
 /// `read_interp_filter_probs()` (spec §6.3.10).
 fn read_interp_filter_probs(r: &mut BoolDecoder, probs: &mut [[u8; 2]; 4]) {
-    for ctx in probs.iter_mut() {
-        for node in ctx.iter_mut() {
-            *node = diff_update_prob(r, *node);
-        }
-    }
+    diff_update_prob_slice(r, probs.as_flattened_mut());
 }
 
 /// `read_is_inter_probs()` (spec §6.3.11).
 fn read_is_inter_probs(r: &mut BoolDecoder, probs: &mut [u8; 4]) {
-    for prob in probs.iter_mut() {
-        *prob = diff_update_prob(r, *prob);
-    }
+    diff_update_prob_slice(r, probs);
 }
 
 /// `setup_compound_reference_mode()` (spec §6.3.18). Returns `(CompFixedRef, CompVarRef)`.
@@ -421,39 +441,24 @@ fn frame_reference_mode_probs(
     probs: &mut CompressedHeaderProbs,
 ) {
     if reference_mode == REFERENCE_MODE_SELECT {
-        for prob in probs.comp_mode_prob.iter_mut() {
-            *prob = diff_update_prob(r, *prob);
-        }
+        diff_update_prob_slice(r, &mut probs.comp_mode_prob);
     }
     if reference_mode != COMPOUND_REFERENCE {
-        for ctx in probs.single_ref_prob.iter_mut() {
-            ctx[0] = diff_update_prob(r, ctx[0]);
-            ctx[1] = diff_update_prob(r, ctx[1]);
-        }
+        diff_update_prob_slice(r, probs.single_ref_prob.as_flattened_mut());
     }
     if reference_mode != SINGLE_REFERENCE {
-        for prob in probs.comp_ref_prob.iter_mut() {
-            *prob = diff_update_prob(r, *prob);
-        }
+        diff_update_prob_slice(r, &mut probs.comp_ref_prob);
     }
 }
 
 /// `read_y_mode_probs()` (spec §6.3.14). Updates the non-key-frame-only `y_mode_probs`.
 fn read_y_mode_probs(r: &mut BoolDecoder, probs: &mut [[u8; 9]; 4]) {
-    for ctx in probs.iter_mut() {
-        for node in ctx.iter_mut() {
-            *node = diff_update_prob(r, *node);
-        }
-    }
+    diff_update_prob_slice(r, probs.as_flattened_mut());
 }
 
 /// `read_partition_probs()` (spec §6.3.15). Updates the non-key-frame-only `partition_probs`.
 fn read_partition_probs(r: &mut BoolDecoder, probs: &mut [[u8; 3]; 16]) {
-    for ctx in probs.iter_mut() {
-        for node in ctx.iter_mut() {
-            *node = diff_update_prob(r, *node);
-        }
-    }
+    diff_update_prob_slice(r, probs.as_flattened_mut());
 }
 
 /// `update_mv_prob( prob )` (spec §6.3.17). Note that, unlike `diff_update_prob`,
@@ -521,7 +526,7 @@ pub fn parse_compressed_header(
     header: &NewFrameHeader,
     starting_probs: FrameContext,
 ) -> Result<CompressedHeader, CompressedHeaderError> {
-    let mut r = BoolDecoder::new(data).map_err(CompressedHeaderError::BoolCoder)?;
+    let mut r = BoolDecoder::new(data)?;
     let mut probs = starting_probs;
 
     let tx_mode = read_tx_mode(&mut r, header.quantization.lossless);

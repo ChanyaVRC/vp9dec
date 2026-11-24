@@ -3,7 +3,7 @@ use super::transform::{
     iwht4_simd, sb_op_simd, sh_op_simd,
 };
 use super::*;
-use crate::predict::MAX_INTERMEDIATE_HEIGHT;
+use crate::subpel::MAX_INTERMEDIATE_HEIGHT;
 use std::arch::x86_64::*;
 
 fn xorshift32(state: &mut u32) -> u32 {

@@ -32,7 +32,7 @@ fn load_clamped_left(plane: &Plane, x: usize, y: usize, max_y: usize, dst: &mut 
 /// referenced within the plane).
 ///
 /// Dispatches `V_PRED`, `H_PRED`, `DC_PRED`, and `TM_PRED` to AVX2 when available; falls back
-/// to [`predict_intra_scalar`] for the six directional modes, `VP9DEC_NO_SIMD=1`, and
+/// to `predict_intra_scalar` for the six directional modes, `VP9DEC_NO_SIMD=1`, and
 /// non-x86_64 targets.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_intra(

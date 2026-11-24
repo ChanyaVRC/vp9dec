@@ -73,16 +73,6 @@ impl<'a> BitReader<'a> {
         self.f(1) == 1
     }
 
-    /// Returns the current bit position (absolute bit count from the start).
-    pub fn bit_position(&self) -> usize {
-        self.bit_pos
-    }
-
-    /// Returns whether the current bit position lies on a byte boundary.
-    pub fn is_byte_aligned(&self) -> bool {
-        self.bit_pos.is_multiple_of(8)
-    }
-
     /// Returns the number of bytes consumed up to and including the byte that
     /// holds the current bit position (rounded up if not on a byte boundary).
     pub fn byte_position_ceil(&self) -> usize {

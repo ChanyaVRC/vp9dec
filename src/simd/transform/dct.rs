@@ -7,6 +7,9 @@ use std::arch::x86_64::*;
 
 /// `round2(x, 14)` (`transform.rs::round2`) lane-wise; the 8-bit `b_op` and `sh_op` sums fit i32,
 /// so `(x + 2^13) >> 14` arithmetic-shifted matches the scalar i64 `round2`.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn round2_14(x: __m256i) -> __m256i {
@@ -14,6 +17,9 @@ pub(super) unsafe fn round2_14(x: __m256i) -> __m256i {
 }
 
 /// Vector `B(a, b, angle, flip)` butterfly (`transform.rs::b_op`) on 8 rows at once (8-bit).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `a, b < t.len()`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn b_op_simd(
@@ -50,6 +56,9 @@ pub(in crate::simd) unsafe fn b_op_simd(
 /// (AVX2 has no 64-bit arithmetic shift): logical and arithmetic shifts differ only in the top
 /// 14 bits of the 64-bit result, and only the low 32 bits are kept -- exact whenever the true
 /// `round2` result fits i32, which §8.7.1.1 guarantees (it is a stored T value).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `a, b < t.len()`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn b_op_simd_hbd(
@@ -109,6 +118,9 @@ pub(in crate::simd) unsafe fn b_op_simd_hbd(
 /// Selects the depth-correct butterfly: `b_op_simd` (i32 products, bit_depth == 8) or
 /// `b_op_simd_hbd` (widened i64 products, 10/12-bit). Monomorphized away -- the 8-bit network
 /// is unchanged.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `a, b < t.len()`.
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn b_op_simd_depth<const HBD: bool>(
@@ -126,6 +138,9 @@ unsafe fn b_op_simd_depth<const HBD: bool>(
 }
 
 /// Vector `H(a, b, flip)` Hadamard rotation (`transform.rs::h_op`) on 8 rows.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `a, b < t.len()`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn h_op_simd(t: &mut [__m256i], a: usize, b: usize, flip: bool) {
@@ -138,6 +153,9 @@ pub(super) unsafe fn h_op_simd(t: &mut [__m256i], a: usize, b: usize, flip: bool
 
 /// Vector `idct_permute` (`transform.rs::idct_permute`): bit-reversal reorder of the element
 /// vectors (no arithmetic, so lane-agnostic and shared between i32 and i64 networks).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `n <= 5`, and `t.len() >= (1 << n)`.
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn idct_permute_simd(t: &mut [__m256i], n: u32) {
@@ -153,6 +171,9 @@ pub(in crate::simd) unsafe fn idct_permute_simd(t: &mut [__m256i], n: u32) {
 /// §8.7.1.3), operating on 8-row i32 element vectors. Assumes `idct_permute_simd` ran first.
 /// `HBD` selects the butterfly's multiply width (see [`b_op_simd_depth`]); the network
 /// structure is identical either way.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `2 <= n <= 5`, and `t.len() >= (1 << n)`.
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn idct_simd<const HBD: bool>(t: &mut [__m256i], n: u32) {
     let n0 = 1i64 << n;

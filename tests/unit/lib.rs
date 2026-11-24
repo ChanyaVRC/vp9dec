@@ -268,3 +268,29 @@ fn decode_recovers_after_a_mid_frame_tile_error() {
         .decode_frame(&frames[2])
         .expect("decode must recover after a mid-frame error on the previous frame");
 }
+
+#[test]
+fn error_types_implement_display_and_std_error_source() {
+    use std::error::Error;
+
+    use crate::bool_coder::BoolCoderError;
+    use crate::ivf::IvfError;
+
+    let header_err = DecodeError::from(HeaderError::InvalidFrameMarker);
+    assert!(!header_err.to_string().is_empty());
+    assert!(header_err.source().is_some());
+
+    let ch_err = DecodeError::from(CompressedHeaderError::from(BoolCoderError::EmptyBuffer));
+    assert!(!ch_err.to_string().is_empty());
+    let ch_src = ch_err.source().expect("CompressedHeader source");
+    assert!(ch_src.source().is_some());
+
+    let tile_err = DecodeError::from(TileError::from(BoolCoderError::InvalidMarker));
+    assert!(!tile_err.to_string().is_empty());
+    let tile_src = tile_err.source().expect("Tile source");
+    assert!(tile_src.source().is_some());
+
+    assert!(DecodeError::TruncatedFrame.source().is_none());
+    assert!(!DecodeError::MissingReferenceFrame.to_string().is_empty());
+    assert!(!IvfError::BadSignature.to_string().is_empty());
+}

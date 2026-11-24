@@ -39,6 +39,7 @@ pub use mv_pred::Mv;
 #[cfg(feature = "test-support")]
 pub use parallel::{FORCE_SEQUENTIAL_TILES, FORCE_TILE_WORKERS};
 
+use std::fmt;
 use std::sync::Arc;
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
@@ -71,7 +72,7 @@ pub enum TileError {
     /// Spec §8.5.2.3's conformance bounds (`2 * FrameWidth >= RefFrameWidth[ refIdx ]` and the
     /// height analog) cap the motion-compensation scaling step at 32 (1/16-pel units), and
     /// every scaled inter-prediction scratch buffer (scalar and AVX2; see
-    /// `predict::MAX_INTERMEDIATE_HEIGHT`) is sized to exactly that bound -- a malformed
+    /// `subpel::MAX_INTERMEDIATE_HEIGHT`) is sized to exactly that bound -- a malformed
     /// stream using a larger ratio is rejected here instead of overflowing them. Checked per
     /// block, not at reference resolution: a conformant stream may *list* an out-of-range
     /// slot it never predicts from (3-layer SVC does; see `Decoder::decode_one_frame`).
@@ -81,6 +82,40 @@ pub enum TileError {
     /// coded bits for its blocks; running thousands of bits past the end means the decode
     /// desynced on corrupt data (libvpx rejects the same via its reader's `has_error`).
     CorruptTile,
+}
+
+impl From<BoolCoderError> for TileError {
+    fn from(e: BoolCoderError) -> Self {
+        TileError::BoolCoder(e)
+    }
+}
+
+impl fmt::Display for TileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TileError::BoolCoder(e) => write!(f, "tile bool decoder error: {e}"),
+            TileError::InvalidTileSize => f.write_str("invalid or truncated tile size"),
+            TileError::InvalidPartition => f.write_str("invalid block partition for subsampling"),
+            TileError::MissingReference => {
+                f.write_str("inter block references an uninitialized DPB slot")
+            }
+            TileError::RefFrameSizeOutOfRange => {
+                f.write_str("reference frame exceeds 2x scaling bound")
+            }
+            TileError::CorruptTile => {
+                f.write_str("corrupt tile data (arithmetic decoder out of sync)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TileError::BoolCoder(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 /// Over-read (bits requested past the tile buffer end) beyond which a tile is treated as
@@ -196,6 +231,11 @@ impl MiGrid {
             col0,
             data: vec![MiInfo::default(); cols * rows],
         }
+    }
+
+    /// Reuses a pooled whole-frame `MiGrid` for `(cols, rows)` if its allocation matches.
+    fn try_reuse(&mut self, cols: usize, rows: usize) -> bool {
+        self.try_reuse_as_strip(cols, rows, 0)
     }
 
     /// Reuses a pooled column-strip `MiGrid` for `(cols, rows, col0)` if its allocation matches.
@@ -434,30 +474,23 @@ impl TileDecoder {
         let y_h = (image_size.sb64_rows * 64) as usize;
         let uv_w = y_w >> subsampling_x;
         let uv_h = y_h >> subsampling_y;
-        let planes = if let Some(mut p) = recycled_planes {
-            if p[0].try_reuse_as(y_w, y_h)
-                && p[1].try_reuse_as(uv_w, uv_h)
-                && p[2].try_reuse_as(uv_w, uv_h)
-            {
-                p
-            } else {
+        let planes = recycled_planes
+            .and_then(|mut p| {
+                (p[0].try_reuse_as(y_w, y_h)
+                    && p[1].try_reuse_as(uv_w, uv_h)
+                    && p[2].try_reuse_as(uv_w, uv_h))
+                .then_some(p)
+            })
+            .unwrap_or_else(|| {
                 [
                     Plane::new(y_w, y_h),
                     Plane::new(uv_w, uv_h),
                     Plane::new(uv_w, uv_h),
                 ]
-            }
-        } else {
-            [
-                Plane::new(y_w, y_h),
-                Plane::new(uv_w, uv_h),
-                Plane::new(uv_w, uv_h),
-            ]
-        };
-        let mi_grid = match recycled_mi_grid {
-            Some(g) if g.cols == grid_cols && g.rows == grid_rows && g.col0 == 0 => g,
-            _ => MiGrid::new(grid_cols, grid_rows),
-        };
+            });
+        let mi_grid = recycled_mi_grid
+            .and_then(|mut g| g.try_reuse(grid_cols, grid_rows).then_some(g))
+            .unwrap_or_else(|| MiGrid::new(grid_cols, grid_rows));
         // AboveNonzeroContext persists across the whole frame width in 4x4 units (2x the 8x8 mi unit).
         let above_nz_len = grid_cols * 2;
         let above_nonzero_context = [
@@ -595,10 +628,10 @@ impl TileDecoder {
 
     /// `clear_above_context( )` (spec §7.4.1): also clears `AboveSegPredContext`.
     fn clear_above_context(&mut self) {
-        self.above_partition_context.iter_mut().for_each(|v| *v = 0);
-        self.above_seg_pred_context.iter_mut().for_each(|v| *v = 0);
-        for plane_ctx in self.above_nonzero_context.iter_mut() {
-            plane_ctx.iter_mut().for_each(|v| *v = 0);
+        self.above_partition_context.fill(0);
+        self.above_seg_pred_context.fill(0);
+        for plane_ctx in &mut self.above_nonzero_context {
+            plane_ctx.fill(0);
         }
     }
 
@@ -673,7 +706,7 @@ impl TileDecoder {
     /// checks. Both the sequential loop above and the tile-column workers use this exact
     /// lifecycle so malformed-tile handling cannot drift between the two paths.
     fn decode_tile_bytes(&mut self, tile_bytes: &[u8]) -> Result<(), TileError> {
-        let mut r = BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
+        let mut r = BoolDecoder::new(tile_bytes)?;
         self.decode_tile(&mut r)?;
         check_tile_read_bounds(&r, tile_bytes)?;
         r.exit_bool();
@@ -853,7 +886,7 @@ impl TileDecoder {
                         None => return Err(TileError::MissingReference),
                         // Spec §8.5.2.3's conformance bound (2x per axis) caps the reference-
                         // scaling step at 32; the motion-compensation scratch buffers (scalar
-                        // and AVX2, `predict::MAX_INTERMEDIATE_HEIGHT`) are sized to exactly
+                        // and AVX2, `subpel::MAX_INTERMEDIATE_HEIGHT`) are sized to exactly
                         // that. A larger ratio would overflow the scalar scratch's slice
                         // bounds (panic), so reject the block's reference before predicting.
                         Some(r)

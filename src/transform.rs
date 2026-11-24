@@ -495,6 +495,22 @@ pub fn inverse_transform_block(dequant: &mut [i64], n: u32, tx_type: TxType, los
     );
     if lossless {
         assert_eq!(n, 2, "lossless transform (WHT) only supports 4x4");
+        let mut t = [0i64; 4];
+        for i in 0..4 {
+            t.copy_from_slice(&dequant[i * 4..(i + 1) * 4]);
+            iwht4(&mut t, 2);
+            dequant[i * 4..(i + 1) * 4].copy_from_slice(&t);
+        }
+        for j in 0..4 {
+            for (i, slot) in t.iter_mut().enumerate() {
+                *slot = dequant[i * 4 + j];
+            }
+            iwht4(&mut t, 0);
+            for (i, &val) in t.iter().enumerate() {
+                dequant[i * 4 + j] = val;
+            }
+        }
+        return;
     }
 
     // Fixed-size scratch (n0 <= 32, the 32x32 max transform), reused for every row and
@@ -505,18 +521,13 @@ pub fn inverse_transform_block(dequant: &mut [i64], n: u32, tx_type: TxType, los
     // Row transform: i = 0..(n0-1).
     for i in 0..n0 {
         t[..n0].copy_from_slice(&dequant[i * n0..(i + 1) * n0]);
-        if lossless {
-            let arr: &mut [i64; 4] = (&mut t[..4]).try_into().unwrap();
-            iwht4(arr, 2);
-        } else {
-            match tx_type {
-                TxType::DctDct | TxType::AdstDct => {
-                    idct_permute(t, n);
-                    idct(t, n);
-                }
-                TxType::DctAdst | TxType::AdstAdst => {
-                    iadst(t, n);
-                }
+        match tx_type {
+            TxType::DctDct | TxType::AdstDct => {
+                idct_permute(t, n);
+                idct(t, n);
+            }
+            TxType::DctAdst | TxType::AdstAdst => {
+                iadst(t, n);
             }
         }
         dequant[i * n0..(i + 1) * n0].copy_from_slice(&t[..n0]);
@@ -528,28 +539,17 @@ pub fn inverse_transform_block(dequant: &mut [i64], n: u32, tx_type: TxType, los
         for i in 0..n0 {
             t[i] = dequant[i * n0 + j];
         }
-        if lossless {
-            let arr: &mut [i64; 4] = (&mut t[..4]).try_into().unwrap();
-            iwht4(arr, 0);
-        } else {
-            match tx_type {
-                TxType::DctDct | TxType::DctAdst => {
-                    idct_permute(t, n);
-                    idct(t, n);
-                }
-                TxType::AdstDct | TxType::AdstAdst => {
-                    iadst(t, n);
-                }
+        match tx_type {
+            TxType::DctDct | TxType::DctAdst => {
+                idct_permute(t, n);
+                idct(t, n);
+            }
+            TxType::AdstDct | TxType::AdstAdst => {
+                iadst(t, n);
             }
         }
-        if lossless {
-            for i in 0..n0 {
-                dequant[i * n0 + j] = t[i];
-            }
-        } else {
-            for i in 0..n0 {
-                dequant[i * n0 + j] = round2(t[i], shift);
-            }
+        for i in 0..n0 {
+            dequant[i * n0 + j] = round2(t[i], shift);
         }
     }
 }
