@@ -220,10 +220,10 @@ fn crop_to_frame(
     }
 }
 
-/// Builds a [`RefFrameData`] for DPB storage by taking ownership of the decoded `planes` and
-/// cropping their logical dimensions in-place (zero allocation, zero copy; the backing buffers
+/// Builds a 10/12-bit [`RefFrameData`] for DPB storage by taking ownership of the decoded `planes`
+/// and cropping their logical dimensions in-place (zero allocation, zero copy; the backing buffers
 /// keep their superblock-aligned stride and are recycled when evicted from the DPB).
-fn build_ref_frame_data_in_place(
+fn build_ref_frame_data_u16_in_place(
     mut planes: [framebuffer::Plane; 3],
     width: u32,
     height: u32,
@@ -245,9 +245,9 @@ fn build_ref_frame_data_in_place(
         subsampling_x: sub_x,
         subsampling_y: sub_y,
         bit_depth: color_config.bit_depth,
-        y,
-        u,
-        v,
+        y: framebuffer::RefPlane::from_u16_plane(y),
+        u: framebuffer::RefPlane::from_u16_plane(u),
+        v: framebuffer::RefPlane::from_u16_plane(v),
     }
 }
 
@@ -278,9 +278,9 @@ fn ref_frame_data_to_frame(data: &RefFrameData) -> Frame {
         bit_depth: data.bit_depth,
         subsampling_x: data.subsampling_x,
         subsampling_y: data.subsampling_y,
-        y: plane_to_plane_data(&data.y, data.y.width, data.y.height, data.bit_depth),
-        u: plane_to_plane_data(&data.u, data.u.width, data.u.height, data.bit_depth),
-        v: plane_to_plane_data(&data.v, data.v.width, data.v.height, data.bit_depth),
+        y: data.y.to_plane_data(),
+        u: data.u.to_plane_data(),
+        v: data.v.to_plane_data(),
     }
 }
 
@@ -346,9 +346,12 @@ pub struct Decoder {
     prev_segment_ids: Arc<Vec<u8>>,
     /// `LastFrameType` (spec §7.2). Not updated on `show_existing_frame` frames.
     last_frame_type: Option<FrameType>,
-    /// Recycled whole-frame `[Plane; 3]` buffers (at most one per active resolution geometry),
-    /// avoiding both per-frame 6+ MB alloc/free cycles and redundant identical-size pooling.
+    /// Recycled whole-frame `[Plane; 3]` working buffers (and evicted 10/12-bit DPB planes),
+    /// at most one per active resolution geometry.
     plane_pool: Vec<[framebuffer::Plane; 3]>,
+    /// Recycled cropped `[Vec<u8>; 3]` buffers from evicted 8-bit DPB slots (at most one per
+    /// active resolution geometry).
+    ref_u8_pool: Vec<[Vec<u8>; 3]>,
     /// Recycled `MiGrid` allocation from the replaced `prev_mi_grid`.
     mi_grid_pool: Option<MiGrid>,
     /// Recycled frame-width above contexts for `TileDecoder`.
@@ -395,6 +398,7 @@ impl Decoder {
             prev_segment_ids: Arc::new(Vec::new()),
             last_frame_type: None,
             plane_pool: Vec::new(),
+            ref_u8_pool: Vec::new(),
             mi_grid_pool: None,
             above_ctx_pool: None,
             tile_scratch_pool: None,
@@ -404,7 +408,10 @@ impl Decoder {
         }
     }
 
-    /// Finds and removes a pooled `[Plane; 3]` whose backing dimensions match `(y_w, y_h, uv_w, uv_h)`.
+    /// Finds and removes a pooled `[Plane; 3]` reusable for `(y_w, y_h, uv_w, uv_h)`.
+    /// Prefers an exact backing-dimension match, falling back to capacity reuse bounded by the
+    /// largest live DPB resolution (so multi-layer 8-bit SVC shares one working buffer set with
+    /// zero reallocations).
     fn take_matching_planes(
         &mut self,
         y_w: usize,
@@ -413,28 +420,75 @@ impl Decoder {
         uv_h: usize,
     ) -> Option<[framebuffer::Plane; 3]> {
         let want: PlaneGeom = ((y_w, y_w * y_h), (uv_w, uv_w * uv_h));
-        let idx = self
+        if let Some(idx) = self
             .plane_pool
             .iter()
-            .position(|p| plane_set_geom(p) == want)?;
-        Some(self.plane_pool.swap_remove(idx))
+            .position(|p| plane_set_geom(p) == want)
+        {
+            return Some(self.plane_pool.swap_remove(idx));
+        }
+        let (max_y, max_uv) = self.dpb.max_sb_plane_elems();
+        let max_y = max_y.max(y_w * y_h);
+        let max_uv = max_uv.max(uv_w * uv_h);
+        for idx in 0..self.plane_pool.len() {
+            let p = &mut self.plane_pool[idx];
+            if p[0].try_reuse_working(y_w, y_h, max_y)
+                && p[1].try_reuse_working(uv_w, uv_h, max_uv)
+                && p[2].try_reuse_working(uv_w, uv_h, max_uv)
+            {
+                return Some(self.plane_pool.swap_remove(idx));
+            }
+        }
+        None
+    }
+
+    /// Finds and removes a pooled `[Vec<u8>; 3]` matching `(y_len, uv_len)`.
+    fn take_matching_ref_u8(&mut self, y_len: usize, uv_len: usize) -> Option<[Vec<u8>; 3]> {
+        let idx = self.ref_u8_pool.iter().position(|v| {
+            v[0].capacity() >= y_len
+                && v[1].capacity() >= uv_len
+                && v[0].len() == y_len
+                && v[1].len() == uv_len
+        })?;
+        Some(self.ref_u8_pool.swap_remove(idx))
     }
 
     /// Recycles `planes` into `self.plane_pool`, keeping at most one cached buffer set per active
-    /// resolution (current frame or any live DPB slot) and pruning stale resolutions.
+    /// resolution (current frame or any live 10/12-bit DPB slot) and pruning stale resolutions.
     fn recycle_planes(&mut self, planes: [framebuffer::Plane; 3], active_geom: PlaneGeom) {
         let geom = plane_set_geom(&planes);
         let dpb = &self.dpb;
         self.plane_pool.retain(|p| {
             let g = plane_set_geom(p);
-            g == active_geom || dpb.has_plane_geometry(g)
+            g == active_geom || dpb.has_u16_geometry(g)
         });
-        let relevant = geom == active_geom || dpb.has_plane_geometry(geom);
+        let relevant = geom == active_geom || dpb.has_u16_geometry(geom);
         if relevant
             && self.plane_pool.len() < MAX_POOLED_PLANE_SETS
             && !self.plane_pool.iter().any(|p| plane_set_geom(p) == geom)
         {
             self.plane_pool.push(planes);
+        }
+    }
+
+    /// Recycles an evicted 8-bit DPB frame's `[Vec<u8>; 3]` buffers into `self.ref_u8_pool`
+    /// (at most one cached set per active cropped resolution).
+    fn recycle_ref_u8(&mut self, bufs: [Vec<u8>; 3], active_u8_geom: (usize, usize)) {
+        let geom = (bufs[0].len(), bufs[1].len());
+        let dpb = &self.dpb;
+        self.ref_u8_pool.retain(|b| {
+            let g = (b[0].len(), b[1].len());
+            g == active_u8_geom || dpb.has_u8_geometry(g)
+        });
+        let relevant = geom == active_u8_geom || dpb.has_u8_geometry(geom);
+        if relevant
+            && self.ref_u8_pool.len() < MAX_POOLED_PLANE_SETS
+            && !self
+                .ref_u8_pool
+                .iter()
+                .any(|b| (b[0].len(), b[1].len()) == geom)
+        {
+            self.ref_u8_pool.push(bufs);
         }
     }
 
@@ -482,47 +536,112 @@ impl Decoder {
         }
     }
 
-    /// Reference frame update process (spec §8.10). Consumes `planes` by value: if any DPB slot
-    /// refreshes, crops `planes` in-place with zero copy and recycles any evicted slot buffers;
-    /// otherwise returns `planes` straight to `self.plane_pool`.
-    fn refresh_reference_frames(
+    /// Reference frame update process (spec §8.10) + optional shown-frame construction.
+    ///
+    /// - For **8-bit** frames (`bit_depth == 8`), narrows the cropped pixels once into packed
+    ///   `u8` DPB planes (`RefPlaneData::U8`), immediately returns the working `u16` `[Plane; 3]`
+    ///   back to `plane_pool`, and clones the compact `u8` planes if `show_frame` is set (so only
+    ///   a single working `u16` buffer is ever needed and DPB slots use half the memory).
+    /// - For **10/12-bit** frames, crops the `u16` planes in-place into the DPB with zero copy
+    ///   and recycles evicted slots back into `plane_pool`.
+    fn output_and_refresh_refs(
         &mut self,
         header: &header::NewFrameHeader,
         color_config: &ColorConfig,
         planes: [framebuffer::Plane; 3],
-    ) {
+    ) -> Option<Frame> {
         let active_geom = plane_set_geom(&planes);
+        let sub_x = color_config.subsampling_x as u32;
+        let sub_y = color_config.subsampling_y as u32;
+        let y_w = header.width as usize;
+        let y_h = header.height as usize;
+        let uv_w = ((header.width + sub_x) >> sub_x) as usize;
+        let uv_h = ((header.height + sub_y) >> sub_y) as usize;
+
         if header.refresh_frame_flags == 0 {
+            let frame = header
+                .show_frame
+                .then(|| crop_to_frame(&planes, header.width, header.height, color_config));
             self.recycle_planes(planes, active_geom);
-            return;
+            return frame;
         }
 
-        // Arc-wrapped so `Dpb::update_and_recycle` shares this frame's pixel data across every
-        // refreshed slot instead of deep-cloning it per slot (up to 8x on a keyframe).
-        let ref_data = Arc::new(build_ref_frame_data_in_place(
-            planes,
-            header.width,
-            header.height,
-            color_config,
-        ));
+        let (frame, ref_data) = if color_config.bit_depth == 8 {
+            let mut bufs = self
+                .take_matching_ref_u8(y_w * y_h, uv_w * uv_h)
+                .unwrap_or_else(|| [Vec::new(), Vec::new(), Vec::new()]);
+            planes[0].narrow_u8_into(y_w, y_h, &mut bufs[0]);
+            planes[1].narrow_u8_into(uv_w, uv_h, &mut bufs[1]);
+            planes[2].narrow_u8_into(uv_w, uv_h, &mut bufs[2]);
+            let [y_u8, u_u8, v_u8] = bufs;
+            let frame = header.show_frame.then(|| Frame {
+                width: header.width,
+                height: header.height,
+                bit_depth: 8,
+                subsampling_x: sub_x,
+                subsampling_y: sub_y,
+                y: PlaneData::U8(y_u8.clone()),
+                u: PlaneData::U8(u_u8.clone()),
+                v: PlaneData::U8(v_u8.clone()),
+            });
+            self.recycle_planes(planes, active_geom);
+            let ref_data = Arc::new(RefFrameData {
+                width: header.width,
+                height: header.height,
+                subsampling_x: sub_x,
+                subsampling_y: sub_y,
+                bit_depth: 8,
+                y: framebuffer::RefPlane::from_u8_cropped(y_w, y_h, y_u8),
+                u: framebuffer::RefPlane::from_u8_cropped(uv_w, uv_h, u_u8),
+                v: framebuffer::RefPlane::from_u8_cropped(uv_w, uv_h, v_u8),
+            });
+            (frame, ref_data)
+        } else {
+            let frame = header
+                .show_frame
+                .then(|| crop_to_frame(&planes, header.width, header.height, color_config));
+            let ref_data = Arc::new(build_ref_frame_data_u16_in_place(
+                planes,
+                header.width,
+                header.height,
+                color_config,
+            ));
+            (frame, ref_data)
+        };
+
+        let active_u8_geom = (y_w * y_h, uv_w * uv_h);
         let mut evicted = Vec::new();
         self.dpb
-            .update_and_recycle(header.refresh_frame_flags, &ref_data, |p| evicted.push(p));
-        for p in evicted {
-            self.recycle_planes(p, active_geom);
+            .update_and_recycle(header.refresh_frame_flags, &ref_data, |old| {
+                evicted.push(old)
+            });
+        for old in evicted {
+            match (
+                old.y.into_backing(),
+                old.u.into_backing(),
+                old.v.into_backing(),
+            ) {
+                (Ok(y), Ok(u), Ok(v)) => self.recycle_ref_u8([y, u, v], active_u8_geom),
+                (Err(y), Err(u), Err(v)) => self.recycle_planes([y, u, v], active_geom),
+                _ => {}
+            }
         }
-        // Also prune any stale cached geometries after the DPB update (e.g. a keyframe resize
-        // that replaced all 8 DPB slots at a new resolution).
+        // Prune stale geometries after the DPB update.
         let dpb = &self.dpb;
         self.plane_pool.retain(|p| {
             let g = plane_set_geom(p);
-            g == active_geom || dpb.has_plane_geometry(g)
+            g == active_geom || dpb.has_u16_geometry(g)
+        });
+        self.ref_u8_pool.retain(|b| {
+            let g = (b[0].len(), b[1].len());
+            g == active_u8_geom || dpb.has_u8_geometry(g)
         });
         for (slot, size) in self.persist.ref_frame_sizes.iter_mut().enumerate() {
             if (header.refresh_frame_flags >> slot) & 1 == 1 {
                 *size = (header.width, header.height);
             }
         }
+        frame
     }
 
     /// Decodes one container chunk (one IVF frame, one WebM block, etc.). Callers must pass
@@ -800,20 +919,10 @@ impl Decoder {
         self.update_persistent_state(&header);
         let info = build_frame_decode_info(&header);
 
-        let frame = if header.show_frame {
-            Some(crop_to_frame(
-                tile_decoder.planes(),
-                header.width,
-                header.height,
-                &color_config,
-            ))
-        } else {
-            None
-        };
         // Last use of tile_decoder: consume it to drop its read-only `Arc`s to DPB slots,
         // `prev_mi_grid`, and `compressed.probs` BEFORE refreshing DPB / saving probs /
         // replacing `self.prev_mi_grid`, so evicted buffers have strong count 1 and recycle
-        // cleanly into our pools with zero copy.
+        // cleanly into our pools.
         let (planes, mi_grid, above_ctx, scratch, counts) = tile_decoder.into_parts();
         self.above_ctx_pool = Some(above_ctx);
         self.tile_scratch_pool = Some(scratch);
@@ -824,7 +933,7 @@ impl Decoder {
             self.frame_contexts
                 .save(ctx_idx, Arc::unwrap_or_clone(compressed.probs));
         }
-        self.refresh_reference_frames(&header, &color_config, planes);
+        let frame = self.output_and_refresh_refs(&header, &color_config, planes);
         self.store_and_recycle_mi_grid(mi_grid);
         Ok(DecodedFrame {
             info: Some(info),

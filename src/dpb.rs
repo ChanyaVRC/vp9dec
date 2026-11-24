@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use crate::framebuffer::Plane;
+use crate::framebuffer::RefPlane;
 use crate::prob_tables::NUM_REF_FRAMES;
 
 /// One slot's worth of reference frame data (the spec's `FrameStore[ i ]` + accompanying size info).
@@ -26,11 +26,11 @@ pub struct RefFrameData {
     pub subsampling_x: u32,
     pub subsampling_y: u32,
     pub bit_depth: u8,
-    /// Cropped (`width x height`) luma plane.
-    pub y: Plane,
+    /// Cropped (`width x height`) luma plane (`u8` for 8-bit, `u16` for 10/12-bit).
+    pub y: RefPlane,
     /// Cropped (`((width+subX)>>subX) x ((height+subY)>>subY)`) chroma plane.
-    pub u: Plane,
-    pub v: Plane,
+    pub u: RefPlane,
+    pub v: RefPlane,
 }
 
 /// The DPB, with 8 slots.
@@ -75,27 +75,51 @@ impl Dpb {
         }
     }
 
-    /// Returns `true` if any live DPB slot has matching luma/chroma backing buffer geometry.
-    pub(crate) fn has_plane_geometry(&self, key: ((usize, usize), (usize, usize))) -> bool {
-        self.slots
-            .iter()
-            .flatten()
-            .any(|slot| (slot.y.backing_dims(), slot.u.backing_dims()) == key)
+    /// Maximum superblock-padded `(y_elems, uv_elems)` across all live DPB slots (used to bound
+    /// working-plane capacity reuse across spatial SVC layers without retaining stale resizes).
+    pub(crate) fn max_sb_plane_elems(&self) -> (usize, usize) {
+        self.slots.iter().flatten().fold((0, 0), |(my, muv), slot| {
+            let y_w = (slot.width as usize).next_multiple_of(64);
+            let y_h = (slot.height as usize).next_multiple_of(64);
+            let uv_w = y_w >> slot.subsampling_x;
+            let uv_h = y_h >> slot.subsampling_y;
+            (my.max(y_w * y_h), muv.max(uv_w * uv_h))
+        })
     }
 
-    /// Same as [`Dpb::update`], additionally passing the backing `[Plane; 3]` of any evicted
-    /// slot whose `Arc` refcount drops to 0 into `on_evict` for caller-managed pooling.
+    /// Returns `true` if any live 10/12-bit DPB slot has matching luma/chroma backing geometry.
+    pub(crate) fn has_u16_geometry(&self, key: ((usize, usize), (usize, usize))) -> bool {
+        self.slots.iter().flatten().any(|slot| {
+            matches!(
+                (slot.y.u16_backing_dims(), slot.u.u16_backing_dims()),
+                (Some(y), Some(u)) if (y, u) == key
+            )
+        })
+    }
+
+    /// Returns `true` if any live 8-bit DPB slot has matching cropped `(y_len, uv_len)`.
+    pub(crate) fn has_u8_geometry(&self, key: (usize, usize)) -> bool {
+        self.slots.iter().flatten().any(|slot| {
+            matches!(
+                (slot.y.u8_len(), slot.u.u8_len()),
+                (Some(y), Some(u)) if (y, u) == key
+            )
+        })
+    }
+
+    /// Same as [`Dpb::update`], additionally passing any evicted slot whose `Arc` refcount drops
+    /// to 0 into `on_evict` for caller-managed buffer pooling.
     pub(crate) fn update_and_recycle(
         &mut self,
         refresh_frame_flags: u8,
         data: &Arc<RefFrameData>,
-        mut on_evict: impl FnMut([Plane; 3]),
+        mut on_evict: impl FnMut(RefFrameData),
     ) {
         for (slot, entry) in self.slots.iter_mut().enumerate() {
             if (refresh_frame_flags >> slot) & 1 == 1 {
                 if let Some(old) = entry.replace(data.clone()) {
                     if let Ok(owned) = Arc::try_unwrap(old) {
-                        on_evict([owned.y, owned.u, owned.v]);
+                        on_evict(owned);
                     }
                 }
             }

@@ -677,10 +677,10 @@ impl TileDecoder {
         let uv_h = y_h >> subsampling_y;
         let planes = recycled_planes
             .and_then(|mut p| {
-                (p[0].try_reuse_as(y_w, y_h)
+                let cap_ok = p[0].try_reuse_as(y_w, y_h)
                     && p[1].try_reuse_as(uv_w, uv_h)
-                    && p[2].try_reuse_as(uv_w, uv_h))
-                .then_some(p)
+                    && p[2].try_reuse_as(uv_w, uv_h);
+                cap_ok.then_some(p)
             })
             .unwrap_or_else(|| {
                 [
