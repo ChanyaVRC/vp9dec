@@ -312,6 +312,14 @@ pub struct TileDecoder {
 
     // --- Counter collection for probability adaptation (spec §8.4, spec §9.3.4). ---
     counts: Counts,
+    /// Whether this frame will actually use `counts` for backward adaptation. Defaults to `true`
+    /// for standalone `TileDecoder` callers/tests; `Decoder` disables it when
+    /// `!refresh_frame_context || error_resilient_mode || frame_parallel_decoding_mode`.
+    collect_counts: bool,
+
+    // --- Reusable per-block scratch for `tokens_and_reconstruct` (avoids 9 KB stack zeroing). ---
+    dequant_buf: [i64; 1024],
+    token_cache_buf: [u8; 1024],
 }
 
 impl TileDecoder {
@@ -433,7 +441,15 @@ impl TileDecoder {
             frame_height: header.height,
             resolved_refs,
             counts: Counts::new(),
+            collect_counts: true,
+            dequant_buf: [0i64; 1024],
+            token_cache_buf: [0u8; 1024],
         }
+    }
+
+    /// Configures whether syntax-element counters are accumulated during tile decode.
+    pub(crate) fn set_collect_counts(&mut self, collect: bool) {
+        self.collect_counts = collect;
     }
 
     /// The collected syntax element counters (used for probability adaptation, spec §8.4).

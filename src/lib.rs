@@ -605,6 +605,11 @@ impl Decoder {
             resolved_refs,
             self.prev_segment_ids.clone(),
         );
+        tile_decoder.set_collect_counts(
+            header.refresh_frame_context
+                && !header.error_resilient_mode
+                && !header.frame_parallel_decoding_mode,
+        );
         {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::TileDecode);
             tile_decoder.decode_tiles(tile_data)?;
@@ -625,15 +630,15 @@ impl Decoder {
 
         self.refresh_prev_segment_ids(&header, &image_size, tile_decoder.mi_grid());
 
-        // refresh_probs() (spec §6.1.2).
-        let final_probs = refresh_probs(
-            &header,
-            starting_probs,
-            &compressed,
-            tile_decoder.counts(),
-            self.last_frame_type,
-        );
+        // refresh_probs() (spec §6.1.2): only run when the frame context will actually be saved.
         if header.refresh_frame_context {
+            let final_probs = refresh_probs(
+                &header,
+                starting_probs,
+                &compressed,
+                tile_decoder.counts(),
+                self.last_frame_type,
+            );
             self.frame_contexts
                 .save(header.effective_frame_context_idx(), final_probs);
         }

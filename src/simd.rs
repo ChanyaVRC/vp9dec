@@ -39,8 +39,10 @@ pub use intra::{
 pub use loop_filter::{loop_filter_horiz8_avx2, loop_filter_vert8_avx2};
 pub use transform::{
     inverse_transform_adst_reconstruct_avx2, inverse_transform_adst_reconstruct_hbd_avx2,
-    inverse_transform_dct_dct_reconstruct_avx2, inverse_transform_dct_dct_reconstruct_hbd_avx2,
-    inverse_transform_wht_reconstruct_avx2,
+    inverse_transform_dct_dct_reconstruct_avx2, inverse_transform_dct_dct_reconstruct_eob_avx2,
+    inverse_transform_dct_dct_reconstruct_hbd_avx2,
+    inverse_transform_dct_dct_reconstruct_hbd_eob_avx2, inverse_transform_wht_reconstruct_avx2,
+    reconstruct_add_const_avx2,
 };
 
 use std::sync::OnceLock;

@@ -1569,6 +1569,7 @@ pub const COEFBAND_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5,
 /// (1003 of the 1024 elements are 5).
 /// Instead of transcribing the 1024-element array verbatim, this structure is
 /// implemented as a formula.
+#[inline]
 pub fn coefband_8x8plus(c: usize) -> u8 {
     const HEAD: [u8; 21] = [
         0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
@@ -1771,19 +1772,36 @@ pub const PARETO_TABLE: [[u8; 8]; 128] = [
     [255, 246, 247, 255, 239, 255, 253, 255],
 ];
 
+/// Precomputed `pareto(node, prob)` table for `prob in 1..=255` and `node - 2 in 0..8`,
+/// turning `pareto()` into a branchless table lookup in the token-decoding hot loop.
+const PARETO_FULL: [[u8; 8]; 256] = {
+    let mut out = [[0u8; 8]; 256];
+    let mut prob = 1usize;
+    while prob < 256 {
+        let x = (prob - 1) >> 1;
+        let mut k = 0usize;
+        while k < 8 {
+            out[prob][k] = if prob & 1 == 1 {
+                PARETO_TABLE[x][k]
+            } else {
+                ((PARETO_TABLE[x][k] as u32 + PARETO_TABLE[x + 1][k] as u32) >> 1) as u8
+            };
+            k += 1;
+        }
+        prob += 1;
+    }
+    out
+};
+
 /// `pareto( node, prob )` (spec §9.3.2). Used to select the probability for the
 /// `token` syntax element. Returns `prob` unmodified when `node < 2`; otherwise looks
 /// up [`PARETO_TABLE`] (averaging the two adjacent rows when `prob` is even).
+#[inline]
 pub fn pareto(node: usize, prob: u8) -> u8 {
     if node < 2 {
         return prob;
     }
-    let x = ((prob as u32 - 1) / 2) as usize;
-    if prob & 1 == 1 {
-        PARETO_TABLE[x][node - 2]
-    } else {
-        ((PARETO_TABLE[x][node - 2] as u32 + PARETO_TABLE[x + 1][node - 2] as u32) >> 1) as u8
-    }
+    PARETO_FULL[prob as usize][node - 2]
 }
 
 // ---------------------------------------------------------------------------

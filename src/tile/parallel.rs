@@ -121,6 +121,9 @@ impl TileDecoder {
             frame_height: self.frame_height,
             resolved_refs: self.resolved_refs.clone(),
             counts: Counts::new(),
+            collect_counts: self.collect_counts,
+            dequant_buf: [0i64; 1024],
+            token_cache_buf: [0u8; 1024],
         }
     }
 
@@ -133,8 +136,10 @@ impl TileDecoder {
     /// also holds, see [`Self::spawn_column_worker`]) is dropped, staying zero in the merged
     /// frame exactly as in a sequential decode's output path.
     pub(super) fn merge_column_worker(&mut self, w: &TileDecoder) {
-        // Counts (order-independent integer sums).
-        self.counts.add_assign(&w.counts);
+        // Counts (order-independent integer sums); skipped when backward adaptation is disabled.
+        if self.collect_counts {
+            self.counts.add_assign(&w.counts);
+        }
         // mi_grid: MI columns [mi_col_start, mi_col_end) across all rows. The worker strip's
         // stride is its own `cols`; its first column is absolute column `mi_col_start`.
         let cols = self.mi_grid.cols();

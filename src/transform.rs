@@ -36,31 +36,46 @@ const COS64_LOOKUP: [i64; 33] = [
     0,
 ];
 
-/// Spec §8.7.1.1 `cos64( angle )`.
-pub(crate) fn cos64(angle: i32) -> i64 {
-    // `angle & 127` is equivalent to `angle.rem_euclid(128)` in two's complement.
-    let angle2 = angle.rem_euclid(128);
-    match angle2 {
-        0..=32 => COS64_LOOKUP[angle2 as usize],
-        33..=64 => -COS64_LOOKUP[(64 - angle2) as usize],
-        65..=96 => -COS64_LOOKUP[(angle2 - 64) as usize],
-        _ => COS64_LOOKUP[(128 - angle2) as usize],
+/// Precomputed full-period `cos64(angle & 127)` table so `cos64`/`sin64` are single table
+/// lookups with no runtime `rem_euclid` or branch chain.
+const COS64_FULL: [i64; 128] = {
+    let mut table = [0i64; 128];
+    let mut a = 0usize;
+    while a < 128 {
+        table[a] = if a <= 32 {
+            COS64_LOOKUP[a]
+        } else if a <= 64 {
+            -COS64_LOOKUP[64 - a]
+        } else if a <= 96 {
+            -COS64_LOOKUP[a - 64]
+        } else {
+            COS64_LOOKUP[128 - a]
+        };
+        a += 1;
     }
+    table
+};
+
+/// Spec §8.7.1.1 `cos64( angle )`.
+#[inline]
+pub(crate) fn cos64(angle: i32) -> i64 {
+    COS64_FULL[(angle & 127) as usize]
 }
 
 /// Spec §8.7.1.1 `sin64( angle ) = cos64( angle - 32 )`.
+#[inline]
 pub(crate) fn sin64(angle: i32) -> i64 {
-    cos64(angle - 32)
+    COS64_FULL[((angle - 32) & 127) as usize]
 }
 
 /// Spec §8.7.1.1 `brev(numBits, x)` (bit reversal).
+#[inline]
 pub(crate) fn brev(num_bits: u32, x: usize) -> usize {
-    let mut t = 0usize;
-    for i in 0..num_bits {
-        let bit = (x >> i) & 1;
-        t += bit << (num_bits - 1 - i);
+    if num_bits == 0 {
+        0
+    } else {
+        x.reverse_bits() >> (usize::BITS - num_bits)
     }
-    t
 }
 
 /// Spec §8.7.1.1 `B( a, b, angle, flip )` butterfly rotation.
