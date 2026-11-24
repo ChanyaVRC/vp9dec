@@ -36,7 +36,10 @@ pub use intra::{
     intra_pred_dc_avx2, intra_pred_fill_avx2, intra_pred_h_avx2, intra_pred_tm_avx2,
     intra_pred_v_avx2,
 };
-pub use loop_filter::{loop_filter_horiz8_avx2, loop_filter_vert8_avx2};
+pub use loop_filter::{
+    loop_filter_horiz8_avx2, loop_filter_horiz8_uniform_avx2, loop_filter_vert8_avx2,
+    loop_filter_vert8_uniform_avx2,
+};
 pub use transform::{
     inverse_transform_adst_reconstruct_avx2, inverse_transform_adst_reconstruct_hbd_avx2,
     inverse_transform_dct_dct_reconstruct_avx2, inverse_transform_dct_dct_reconstruct_eob_avx2,
