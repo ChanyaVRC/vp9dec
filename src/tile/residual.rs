@@ -401,7 +401,7 @@ impl TileDecoder {
             // within `[-max_val, max_val]` (`max_val <= 4095`); block lies inside the plane strip.
             unsafe {
                 crate::simd::reconstruct_add_const_avx2(
-                    self.planes[plane].as_mut_slice(),
+                    self.planes[plane].base_ptr_mut(),
                     pw,
                     local_x,
                     start_y,
@@ -413,13 +413,11 @@ impl TileDecoder {
             return;
         }
 
-        let pw = self.planes[plane].stride();
         let local_x = start_x - self.planes[plane].x0;
-        let data = self.planes[plane].as_mut_slice();
         let delta = clamped_delta as i32;
         let max_i32 = max_val as i32;
         for i in 0..n0 {
-            let row = &mut data[(start_y + i) * pw + local_x..][..n0];
+            let row = &mut self.planes[plane].row_mut(start_y + i)[local_x..local_x + n0];
             for px in row {
                 *px = (*px as i32 + delta).clamp(0, max_i32) as u16;
             }
@@ -639,10 +637,11 @@ impl TileDecoder {
                 // bounds of the plane strip; lossless forces TX_4X4; ADST runs with n <= 4;
                 // every row strictly below `max_row` in `dequant_buf` is zero.
                 unsafe {
+                    let plane_base = self.planes[plane].base_ptr_mut();
                     if self.lossless {
                         debug_assert_eq!(n, 2, "lossless transform (WHT) only supports 4x4");
                         crate::simd::inverse_transform_wht_reconstruct_avx2(
-                            self.planes[plane].as_mut_slice(),
+                            plane_base,
                             pw,
                             local_x,
                             start_y,
@@ -652,7 +651,7 @@ impl TileDecoder {
                     } else if tx_type != TxType::DctDct {
                         if self.bit_depth == 8 {
                             crate::simd::inverse_transform_adst_reconstruct_avx2(
-                                self.planes[plane].as_mut_slice(),
+                                plane_base,
                                 pw,
                                 local_x,
                                 start_y,
@@ -662,7 +661,7 @@ impl TileDecoder {
                             );
                         } else {
                             crate::simd::inverse_transform_adst_reconstruct_hbd_avx2(
-                                self.planes[plane].as_mut_slice(),
+                                plane_base,
                                 pw,
                                 local_x,
                                 start_y,
@@ -674,7 +673,7 @@ impl TileDecoder {
                         }
                     } else if self.bit_depth == 8 {
                         crate::simd::inverse_transform_dct_dct_reconstruct_eob_avx2(
-                            self.planes[plane].as_mut_slice(),
+                            plane_base,
                             pw,
                             local_x,
                             start_y,
@@ -684,7 +683,7 @@ impl TileDecoder {
                         );
                     } else {
                         crate::simd::inverse_transform_dct_dct_reconstruct_hbd_eob_avx2(
-                            self.planes[plane].as_mut_slice(),
+                            plane_base,
                             pw,
                             local_x,
                             start_y,
@@ -714,11 +713,9 @@ impl TileDecoder {
 
         if !fused {
             let max_val = (1i64 << self.bit_depth) - 1;
-            let pw = self.planes[plane].stride();
             let local_x = start_x - self.planes[plane].x0;
-            let data = self.planes[plane].as_mut_slice();
             for i in 0..n0 {
-                let row = &mut data[(start_y + i) * pw + local_x..][..n0];
+                let row = &mut self.planes[plane].row_mut(start_y + i)[local_x..local_x + n0];
                 let dq_row = &self.scratch.dequant_buf[i * n0..(i + 1) * n0];
                 for (px, &dq) in row.iter_mut().zip(dq_row.iter()) {
                     *px = (*px as i64 + dq).clamp(0, max_val) as u16;

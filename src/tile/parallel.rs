@@ -93,92 +93,32 @@ impl<T> DisjointSlicePtr<T> {
     }
 }
 
-/// Raw write-only view of the destination frame's `MiGrid` and `[Plane; 3]` for parallel
-/// disjoint column-strip merging.
+/// Raw backing pointers into the parent frame's owned `MiGrid` and `[Plane; 3]`, used to bind
+/// strictly disjoint direct-write column strips for concurrent tile-column workers (eliminating
+/// per-worker strip buffer allocations and post-decode strip copies).
 #[derive(Clone, Copy)]
-struct DstFrameView {
+struct ParentFramePtrs {
     mi_ptr: *mut MiInfo,
     mi_cols: usize,
     mi_rows: usize,
     plane_ptrs: [*mut u16; 3],
     plane_strides: [usize; 3],
-    plane_heights: [usize; 3],
-    subsampling_x: u32,
 }
-// SAFETY: Backed by `&mut TileDecoder`'s `mi_grid` and `planes` for the duration of the
-// synchronous parallel dispatch; each worker writes only its own non-overlapping column range
-// `[mi_col_start, mi_col_end)` (and corresponding `[px0, px1)` per plane).
-unsafe impl Send for DstFrameView {}
-// SAFETY: Sharing `&DstFrameView` across tile-column workers is sound because every worker's
-// column range `[mi_col_start, mi_col_end)` is strictly disjoint.
-unsafe impl Sync for DstFrameView {}
 
-impl DstFrameView {
-    fn new(dst: &mut TileDecoder) -> Self {
-        let mi_cols = dst.mi_grid.cols();
-        let mi_rows = dst.planes[0].height / 8;
-        let mi_ptr = dst.mi_grid.data.as_mut_ptr();
-        let [p0, p1, p2] = &mut dst.planes;
+impl ParentFramePtrs {
+    fn new(parent: &mut TileDecoder) -> Self {
+        let mi_cols = parent.mi_grid.cols();
+        let mi_rows = parent.planes[0].height / 8;
+        let mi_ptr = parent.mi_grid.owned_mut_ptr();
+        let [p0, p1, p2] = &mut parent.planes;
         let plane_strides = [p0.stride(), p1.stride(), p2.stride()];
-        let plane_heights = [p0.height, p1.height, p2.height];
-        let plane_ptrs = [
-            p0.as_mut_slice().as_mut_ptr(),
-            p1.as_mut_slice().as_mut_ptr(),
-            p2.as_mut_slice().as_mut_ptr(),
-        ];
+        let plane_ptrs = [p0.base_ptr_mut(), p1.base_ptr_mut(), p2.base_ptr_mut()];
         Self {
             mi_ptr,
             mi_cols,
             mi_rows,
             plane_ptrs,
             plane_strides,
-            plane_heights,
-            subsampling_x: dst.subsampling_x,
-        }
-    }
-
-    /// Copies worker `w`'s disjoint column strip of `mi_grid` and `planes` into the destination
-    /// frame buffer.
-    ///
-    /// # Safety
-    /// Caller must ensure `[w.mi_col_start, w.mi_col_end)` is disjoint from every other
-    /// concurrently executing worker's column range and within the destination frame's bounds.
-    unsafe fn copy_worker_strip(&self, w: &TileDecoder) {
-        let (c0, c1) = (w.mi_col_start as usize, w.mi_col_end as usize);
-        let strip_cols = c1 - c0;
-        let src_cols = w.mi_grid.cols();
-        let src_mi = w.mi_grid.data.as_ptr();
-        for row in 0..self.mi_rows {
-            // SAFETY: `[c0, c1)` is disjoint per worker and `< self.mi_cols`; `row < self.mi_rows`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src_mi.add(row * src_cols),
-                    self.mi_ptr.add(row * self.mi_cols + c0),
-                    strip_cols,
-                );
-            }
-        }
-        for p in 0..3 {
-            let sub = if p == 0 { 0 } else { self.subsampling_x };
-            let px0 = (c0 * 8) >> sub;
-            let px1 = (c1 * 8) >> sub;
-            let copy_w = px1 - px0;
-            let dst_stride = self.plane_strides[p];
-            let height = self.plane_heights[p];
-            let src_stride = w.planes[p].stride();
-            let src_ptr = w.planes[p].as_slice().as_ptr();
-            let dst_ptr = self.plane_ptrs[p];
-            debug_assert_eq!(w.planes[p].x0, px0);
-            for row in 0..height {
-                // SAFETY: `[px0, px1)` is disjoint per worker and within row stride; `row < height`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src_ptr.add(row * src_stride),
-                        dst_ptr.add(row * dst_stride + px0),
-                        copy_w,
-                    );
-                }
-            }
         }
     }
 }
@@ -186,7 +126,6 @@ impl DstFrameView {
 /// Precomputed column-strip dimensions for a tile-column worker covering `[mi_col_start, mi_col_end)`.
 struct ColumnStripGeometry {
     grid_cols: usize,
-    grid_rows: usize,
     strip_mi_cols: usize,
     plane_strips: [(usize, usize, usize); 3], // (x0, width, height)
 }
@@ -194,7 +133,6 @@ struct ColumnStripGeometry {
 impl ColumnStripGeometry {
     fn new(parent: &TileDecoder, mi_col_start: u32, mi_col_end: u32) -> Self {
         let grid_cols = parent.mi_grid.cols();
-        let grid_rows = parent.planes[0].height / 8;
         let last = mi_col_end == parent.mi_cols;
         let grid_col_end = if last { grid_cols } else { mi_col_end as usize };
         let plane_strips = std::array::from_fn(|p| {
@@ -209,7 +147,6 @@ impl ColumnStripGeometry {
         });
         Self {
             grid_cols,
-            grid_rows,
             strip_mi_cols: grid_col_end - mi_col_start as usize,
             plane_strips,
         }
@@ -219,8 +156,6 @@ impl ColumnStripGeometry {
 impl TileDecoder {
     /// Copies every read-only frame configuration field and cheap `Arc` handle from `parent`
     /// onto this worker and binds its active tile-column range `[mi_col_start, mi_col_end)`.
-    /// Shared by [`Self::spawn_column_worker`] and [`Self::reuse_or_spawn_column_worker`] so the
-    /// two paths can never drift when a field is added to [`TileDecoder`].
     fn sync_frame_config_from(&mut self, parent: &TileDecoder, mi_col_start: u32, mi_col_end: u32) {
         self.tx_mode = parent.tx_mode;
         self.probs = parent.probs.clone();
@@ -253,124 +188,126 @@ impl TileDecoder {
         self.resolved_refs = parent.resolved_refs.clone();
     }
 
-    /// Builds a fresh worker `TileDecoder` that shares this frame's read-only / config state
-    /// (cheap `Arc` / `Copy` clones) but gets its own mutable buffers, sized to the tile
-    /// column `[mi_col_start, mi_col_end)` it will decode: the planes and `mi_grid` are *column
-    /// strips* (see [`Plane::new_strip`] / [`MiGrid::new_strip`] -- indexed by absolute
-    /// coordinates, so the decode path is unchanged), not full frames.
-    pub(super) fn spawn_column_worker(&self, mi_col_start: u32, mi_col_end: u32) -> TileDecoder {
-        let geom = ColumnStripGeometry::new(self, mi_col_start, mi_col_end);
-        let planes = std::array::from_fn(|p| {
-            let (x0, w, h) = geom.plane_strips[p];
-            Plane::new_strip(w, h, x0)
-        });
-        let mut worker = TileDecoder {
-            tx_mode: self.tx_mode,
-            probs: self.probs.clone(),
-            segmentation: self.segmentation,
-            mi_cols: self.mi_cols,
-            mi_rows: self.mi_rows,
-            tile_cols_log2: self.tile_cols_log2,
-            tile_rows_log2: self.tile_rows_log2,
-            mi_grid: MiGrid::new_strip(geom.strip_mi_cols, geom.grid_rows, mi_col_start),
-            above_ctx: AboveContexts::new(geom.grid_cols),
-            left_partition_context: [0u8; 8],
-            left_seg_pred_context: [0u8; 8],
-            prev_segment_ids: self.prev_segment_ids.clone(),
-            mi_col_start,
-            mi_col_end,
-            mi_row_start: 0,
-            mi_row_end: self.mi_rows,
-            bit_depth: self.bit_depth,
-            subsampling_x: self.subsampling_x,
-            subsampling_y: self.subsampling_y,
-            lossless: self.lossless,
-            dequant_table: self.dequant_table,
-            planes,
-            left_nonzero_context: [[0u8; 16]; 3],
-            frame_is_intra: self.frame_is_intra,
-            ref_frame_sign_bias: self.ref_frame_sign_bias,
-            allow_high_precision_mv: self.allow_high_precision_mv,
-            interpolation_filter: self.interpolation_filter,
-            reference_mode: self.reference_mode,
-            comp_fixed_ref: self.comp_fixed_ref,
-            comp_var_ref: self.comp_var_ref,
-            use_prev_frame_mvs: self.use_prev_frame_mvs,
-            prev_mi_grid: self.prev_mi_grid.clone(),
-            frame_width: self.frame_width,
-            frame_height: self.frame_height,
-            resolved_refs: self.resolved_refs.clone(),
-            counts: self.counts.as_ref().map(|_| Box::new(Counts::new())),
-            scratch: TileScratch::new(),
-        };
-        worker.sync_frame_config_from(self, mi_col_start, mi_col_end);
-        worker
-    }
-
-    /// Reuses a pooled column-worker `TileDecoder` when available (reusing its strip `planes`,
-    /// `mi_grid`, and context allocations without heap alloc/free), or spawns a fresh one.
-    fn reuse_or_spawn_column_worker(
+    /// Builds or reuses a worker `TileDecoder` whose `planes` and `mi_grid` are non-owning
+    /// direct-write column strips pointing straight into `parent_ptrs` at `[mi_col_start, mi_col_end)`.
+    ///
+    /// # Safety
+    /// - `parent_ptrs` must remain valid (no reallocation/drop) for the entire lifetime until the
+    ///   returned worker has [`Self::release_frame_refs`] called or is dropped.
+    /// - `[mi_col_start, mi_col_end)` must be strictly disjoint from every other concurrently live
+    ///   worker's column range and within the parent frame's bounds.
+    unsafe fn bind_column_worker(
         &self,
+        parent_ptrs: ParentFramePtrs,
         mi_col_start: u32,
         mi_col_end: u32,
         recycled: Option<TileDecoder>,
     ) -> TileDecoder {
-        let Some(mut w) = recycled else {
-            return self.spawn_column_worker(mi_col_start, mi_col_end);
-        };
-
         let geom = ColumnStripGeometry::new(self, mi_col_start, mi_col_end);
-        if !w
-            .mi_grid
-            .try_reuse_as_strip(geom.strip_mi_cols, geom.grid_rows, mi_col_start)
-        {
-            w.mi_grid = MiGrid::new_strip(geom.strip_mi_cols, geom.grid_rows, mi_col_start);
-        }
-        for (p, &(x0, strip_w, strip_h)) in geom.plane_strips.iter().enumerate() {
-            if !w.planes[p].try_reuse_as_strip(strip_w, strip_h, x0) {
-                w.planes[p] = Plane::new_strip(strip_w, strip_h, x0);
-            }
-        }
+        let planes = std::array::from_fn(|p| {
+            let (x0, w, h) = geom.plane_strips[p];
+            // SAFETY: caller guarantees `parent_ptrs.plane_ptrs[p]` outlives this worker and
+            // `[x0, x0 + w)` is disjoint from all sibling workers.
+            Plane::new_borrowed_strip(
+                parent_ptrs.plane_ptrs[p],
+                x0,
+                w,
+                h,
+                parent_ptrs.plane_strides[p],
+            )
+        });
 
-        w.above_ctx.reset_for(geom.grid_cols);
-        w.clear_left_context();
-        w.sync_frame_config_from(self, mi_col_start, mi_col_end);
-        if self.counts.is_some() {
-            match w.counts.as_deref_mut() {
-                Some(c) => c.reset(),
-                None => w.counts = Some(Box::new(Counts::new())),
+        let mut w = match recycled {
+            Some(mut w) => {
+                w.planes = planes;
+                w.above_ctx.reset_for(geom.grid_cols);
+                w.clear_left_context();
+                w.sync_frame_config_from(self, mi_col_start, mi_col_end);
+                if self.counts.is_some() {
+                    match w.counts.as_deref_mut() {
+                        Some(c) => c.reset(),
+                        None => w.counts = Some(Box::new(Counts::new())),
+                    }
+                } else {
+                    w.counts = None;
+                }
+                w
             }
-        } else {
-            w.counts = None;
-        }
+            None => TileDecoder {
+                tx_mode: self.tx_mode,
+                probs: self.probs.clone(),
+                segmentation: self.segmentation,
+                mi_cols: self.mi_cols,
+                mi_rows: self.mi_rows,
+                tile_cols_log2: self.tile_cols_log2,
+                tile_rows_log2: self.tile_rows_log2,
+                mi_grid: MiGrid::empty(),
+                above_ctx: AboveContexts::new(geom.grid_cols),
+                left_partition_context: [0u8; 8],
+                left_seg_pred_context: [0u8; 8],
+                prev_segment_ids: self.prev_segment_ids.clone(),
+                mi_col_start,
+                mi_col_end,
+                mi_row_start: 0,
+                mi_row_end: self.mi_rows,
+                bit_depth: self.bit_depth,
+                subsampling_x: self.subsampling_x,
+                subsampling_y: self.subsampling_y,
+                lossless: self.lossless,
+                dequant_table: self.dequant_table,
+                planes,
+                left_nonzero_context: [[0u8; 16]; 3],
+                frame_is_intra: self.frame_is_intra,
+                ref_frame_sign_bias: self.ref_frame_sign_bias,
+                allow_high_precision_mv: self.allow_high_precision_mv,
+                interpolation_filter: self.interpolation_filter,
+                reference_mode: self.reference_mode,
+                comp_fixed_ref: self.comp_fixed_ref,
+                comp_var_ref: self.comp_var_ref,
+                use_prev_frame_mvs: self.use_prev_frame_mvs,
+                prev_mi_grid: self.prev_mi_grid.clone(),
+                frame_width: self.frame_width,
+                frame_height: self.frame_height,
+                resolved_refs: self.resolved_refs.clone(),
+                counts: self.counts.as_ref().map(|_| Box::new(Counts::new())),
+                scratch: TileScratch::new(),
+            },
+        };
+        // SAFETY: caller guarantees `parent_ptrs.mi_ptr` outlives this worker and
+        // `[mi_col_start, mi_col_start + strip_mi_cols)` is disjoint from all sibling workers.
+        w.mi_grid.bind_borrowed_strip(
+            parent_ptrs.mi_ptr,
+            mi_col_start,
+            geom.strip_mi_cols,
+            parent_ptrs.mi_rows,
+            parent_ptrs.mi_cols,
+        );
         w
     }
 
-    /// Drops frame-specific `Arc` handles (`probs`, `resolved_refs`, `prev_mi_grid`,
-    /// `prev_segment_ids`) before parking a worker back in `Decoder::tile_worker_pool`, so DPB,
-    /// `MiGrid`, and `CompressedHeaderProbs` recycling observes `Arc::strong_count == 1`.
+    /// Detaches borrowed strip raw pointers and drops frame-specific `Arc` handles (`probs`,
+    /// `resolved_refs`, `prev_mi_grid`, `prev_segment_ids`) before parking a worker back in
+    /// `Decoder::tile_worker_pool`, so no borrowed pointer escapes `decode_tiles_parallel` and
+    /// DPB / `MiGrid` / `CompressedHeaderProbs` recycling observes `Arc::strong_count == 1`.
     fn release_frame_refs(&mut self) {
+        self.planes = [Plane::empty(), Plane::empty(), Plane::empty()];
+        self.mi_grid.detach_strip();
         self.probs = default_probs_sentinel();
         self.resolved_refs = [None, None, None];
         self.prev_mi_grid = None;
         self.prev_segment_ids = empty_segment_ids();
     }
 
-    /// Merges tile-column worker `w` (which decoded MI columns `[w.mi_col_start, w.mi_col_end)`
-    /// into column-strip buffers) back into `self`: copies that column strip of every plane and
-    /// of `mi_grid`, and sums the worker's probability-adaptation counts. Kept for unit tests.
+    /// Test helper: spawns a borrowed direct-write column worker covering `[mi_col_start, mi_col_end)`
+    /// into `self`'s backing buffers.
     #[cfg(test)]
-    pub(super) fn merge_column_worker(&mut self, w: &TileDecoder) {
-        if let (Some(dst_counts), Some(src_counts)) =
-            (self.counts.as_deref_mut(), w.counts.as_deref())
-        {
-            dst_counts.add_assign(src_counts);
-        }
-        let dst_view = DstFrameView::new(self);
-        // SAFETY: sole writer to `self`; `[w.mi_col_start, w.mi_col_end)` is in bounds.
-        unsafe {
-            dst_view.copy_worker_strip(w);
-        }
+    pub(super) unsafe fn spawn_borrowed_column_worker(
+        &mut self,
+        mi_col_start: u32,
+        mi_col_end: u32,
+    ) -> TileDecoder {
+        let ptrs = ParentFramePtrs::new(self);
+        self.bind_column_worker(ptrs, mi_col_start, mi_col_end, None)
     }
 
     /// Splits `data` (the concatenated tiles, each non-final one prefixed by a 4-byte big-endian
@@ -400,10 +337,10 @@ impl TileDecoder {
         Ok(out)
     }
 
-    /// Tile-parallel `decode_tiles` for the `tile_cols > 1 && tile_rows == 1` case: decode each
-    /// tile column on its own worker thread (VP9 tile columns are independent) and merge its
-    /// disjoint column strip back into `self` in parallel. Bit-identical to the sequential path
-    /// (disjoint column writes; order-independent count sums).
+    /// Tile-parallel `decode_tiles` for the `tile_cols > 1 && tile_rows == 1` case: each worker
+    /// thread decodes its independent VP9 tile column directly into its disjoint column strip of
+    /// `self.planes` and `self.mi_grid` (zero strip allocation, zero copy). Bit-identical to the
+    /// sequential path (disjoint column writes; order-independent count sums).
     pub(super) fn decode_tiles_parallel(
         &mut self,
         data: &[u8],
@@ -421,6 +358,7 @@ impl TileDecoder {
             .map(std::mem::take)
             .unwrap_or_default();
 
+        let parent_ptrs = ParentFramePtrs::new(self);
         let mut c0 = 0u32;
         let mut first_err: Option<TileError> = None;
         while c0 < tile_cols {
@@ -429,11 +367,14 @@ impl TileDecoder {
             let mut existing = std::mem::take(&mut parked).into_iter();
             let mut workers: Vec<TileDecoder> = (c0..c1)
                 .map(|c| {
-                    self.reuse_or_spawn_column_worker(
-                        get_tile_offset(c, self.mi_cols, self.tile_cols_log2),
-                        get_tile_offset(c + 1, self.mi_cols, self.tile_cols_log2),
-                        existing.next(),
-                    )
+                    let col_start = get_tile_offset(c, self.mi_cols, self.tile_cols_log2);
+                    let col_end = get_tile_offset(c + 1, self.mi_cols, self.tile_cols_log2);
+                    // SAFETY: `self.planes` and `self.mi_grid` are not accessed through `self`
+                    // while `workers` are live (including across unwind), and each `c in c0..c1`
+                    // maps to a strictly disjoint `[col_start, col_end)` column range.
+                    unsafe {
+                        self.bind_column_worker(parent_ptrs, col_start, col_end, existing.next())
+                    }
                 })
                 .collect();
 
@@ -443,14 +384,13 @@ impl TileDecoder {
             )> = vec![(Ok(()), [0u64; crate::bench_timing::STAGE_COUNT]); n_chunk];
 
             let tile_slice = &tiles[c0 as usize..c1 as usize];
-            let dst_view = DstFrameView::new(self);
             let workers_ptr = DisjointSlicePtr::from_slice(&mut workers);
             let results_ptr = DisjointSlicePtr::from_slice(&mut results);
 
             let run_task = |i: usize| {
                 // SAFETY: each `i in 0..n_chunk` runs once, so `workers_ptr.add(i)` and
-                // `results_ptr.add(i)` are exclusively owned by this task, and `w`'s tile
-                // column range `[mi_col_start, mi_col_end)` is disjoint from all other tasks.
+                // `results_ptr.add(i)` are exclusively owned by this task, and `w`'s borrowed
+                // strip `[mi_col_start, mi_col_end)` is disjoint from all other tasks.
                 unsafe {
                     let w = &mut *workers_ptr.add(i);
                     // Task 0 runs on the calling thread, which already accumulates directly into
@@ -459,9 +399,6 @@ impl TileDecoder {
                         crate::bench_timing::reset();
                     }
                     let res = w.decode_tile_bytes(tile_slice[i]);
-                    if res.is_ok() {
-                        dst_view.copy_worker_strip(w);
-                    }
                     let snap = if i != 0 {
                         crate::bench_timing::snapshot()
                     } else {

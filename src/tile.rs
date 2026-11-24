@@ -315,63 +315,145 @@ impl Default for MiInfo {
     }
 }
 
+/// Backing storage of a [`MiGrid`]: either an owned `Vec<MiInfo>` or a non-owning raw pointer into
+/// a disjoint column strip `[col0, col0 + cols)` of a parent `MiGrid` during parallel tile decode.
+enum MiStorage {
+    Owned(Vec<MiInfo>),
+    /// Points to `(row = 0, col = col0)` of the parent buffer (stride = parent's `cols`).
+    BorrowedStrip(*mut MiInfo),
+}
+
 /// A grid holding mode info for the whole frame, in 8x8 units.
 ///
 /// This bundles the spec's `Skips`/`TxSizes`/`MiSizes`/`YModes`/`SegmentIds`/`SubModes`
 /// arrays into a single compact struct. Its size is `Sb64Cols*8 x Sb64Rows*8`
 /// (allocated to also cover the portion of edge superblocks that extends past the frame).
 ///
-/// A tile-parallel worker instead holds a *column strip* (`MiGrid::new_strip`) covering only
-/// the absolute MI columns `[col0, col0 + cols)`; accessors keep taking **absolute** columns
-/// (the origin is subtracted internally), mirroring [`Plane`]'s strip scheme.
+/// A tile-parallel worker instead holds a direct-write *borrowed column strip*
+/// (`MiGrid::bind_borrowed_strip`) covering only the absolute MI columns `[col0, col0 + cols)` of
+/// the parent frame grid; accessors keep taking **absolute** columns (the origin is subtracted
+/// internally), mirroring [`Plane`]'s strip scheme.
 ///
 /// Not `Clone`: the previous frame's grid is shared into the next frame's `TileDecoder` via
 /// `Arc<MiGrid>` (see `crate::Decoder::prev_mi_grid`) rather than deep-cloned.
-#[derive(Debug)]
 pub struct MiGrid {
     cols: usize,
     rows: usize,
+    /// Row stride in MI units (`== cols` for owned grids, parent's `cols` for borrowed strips).
+    stride: usize,
     /// Absolute MI column of this grid's first column (0 for a whole-frame grid).
     col0: u32,
-    data: Vec<MiInfo>,
+    storage: MiStorage,
     /// Sparse storage of sub-block MVs `0..3` (sub-block `3` is [`MiInfo::mv`]) for inter blocks
     /// with `mi_size < BLOCK_8X8`. Only populated during tile decode; cleared before storing as
     /// `prev_mi_grid` (which only reads `mv` and `ref_frame`).
     sub_mvs: Vec<[[Mv; 3]; 2]>,
 }
 
+// SAFETY: `Owned(Vec<MiInfo>)` is `Send`; `BorrowedStrip(*mut MiInfo)` is only created inside
+// `tile::parallel::decode_tiles_parallel` over strictly disjoint `[col0, col0 + cols)` strips of a
+// parent `MiGrid` that outlives the synchronous parallel dispatch.
+unsafe impl Send for MiGrid {}
+// SAFETY: Shared `&MiGrid` reads stay strictly inside `[col0, col0 + cols)` under the same
+// disjoint-strip and lifetime guarantees as `Send`.
+unsafe impl Sync for MiGrid {}
+
+impl fmt::Debug for MiGrid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MiGrid")
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("stride", &self.stride)
+            .field("col0", &self.col0)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MiGrid {
     fn new(cols: usize, rows: usize) -> Self {
-        Self::new_strip(cols, rows, 0)
-    }
-
-    /// A column strip covering absolute MI columns `[col0, col0 + cols)` (used by the
-    /// tile-parallel worker decoders, [`TileDecoder::spawn_column_worker`]).
-    fn new_strip(cols: usize, rows: usize, col0: u32) -> Self {
         Self {
             cols,
             rows,
-            col0,
-            data: vec![MiInfo::default(); cols * rows],
+            stride: cols,
+            col0: 0,
+            storage: MiStorage::Owned(vec![MiInfo::default(); cols * rows]),
             sub_mvs: Vec::new(),
+        }
+    }
+
+    /// Zero-allocation placeholder grid used when parking tile-parallel worker structs.
+    pub(super) fn empty() -> Self {
+        Self {
+            cols: 0,
+            rows: 0,
+            stride: 0,
+            col0: 0,
+            storage: MiStorage::Owned(Vec::new()),
+            sub_mvs: Vec::new(),
+        }
+    }
+
+    /// Binds this grid as a non-owning direct-write column strip covering `[col0, col0 + cols)` of
+    /// a parent grid starting at `parent_ptr` (row stride `stride`), retaining `self.sub_mvs`'s
+    /// heap capacity across frames.
+    ///
+    /// # Safety
+    /// - `parent_ptr` must point to a valid writable allocation of at least `rows * stride`
+    ///   `MiInfo` elements for the entire lifetime until [`Self::detach_strip`] (or drop).
+    /// - `(col0 as usize) + cols <= stride`.
+    /// - No other thread or reference may access columns `[col0, col0 + cols)` concurrently.
+    pub(super) unsafe fn bind_borrowed_strip(
+        &mut self,
+        parent_ptr: *mut MiInfo,
+        col0: u32,
+        cols: usize,
+        rows: usize,
+        stride: usize,
+    ) {
+        debug_assert!((col0 as usize) + cols <= stride);
+        self.cols = cols;
+        self.rows = rows;
+        self.stride = stride;
+        self.col0 = col0;
+        self.storage = MiStorage::BorrowedStrip(parent_ptr.add(col0 as usize));
+        self.sub_mvs.clear();
+    }
+
+    /// Detaches any borrowed raw pointer before parking a worker in `tile_worker_pool`, keeping
+    /// `sub_mvs` capacity for reuse.
+    pub(super) fn detach_strip(&mut self) {
+        self.cols = 0;
+        self.rows = 0;
+        self.stride = 0;
+        self.col0 = 0;
+        self.storage = MiStorage::Owned(Vec::new());
+        self.sub_mvs.clear();
+    }
+
+    /// Mutable raw base pointer for an owned whole-frame `MiGrid` (used by `decode_tiles_parallel`
+    /// to hand strictly disjoint column strips to worker threads).
+    pub(super) fn owned_mut_ptr(&mut self) -> *mut MiInfo {
+        match &mut self.storage {
+            MiStorage::Owned(data) => data.as_mut_ptr(),
+            MiStorage::BorrowedStrip(_) => {
+                panic!("MiGrid::owned_mut_ptr called on a BorrowedStrip grid")
+            }
         }
     }
 
     /// Reuses a pooled whole-frame `MiGrid` for `(cols, rows)` if its capacity suffices (without
     /// retaining grossly oversized buffers after a large down-resize).
     fn try_reuse(&mut self, cols: usize, rows: usize) -> bool {
-        self.try_reuse_as_strip(cols, rows, 0)
-    }
-
-    /// Reuses a pooled column-strip `MiGrid` for `(cols, rows, col0)` if its capacity suffices.
-    pub(super) fn try_reuse_as_strip(&mut self, cols: usize, rows: usize, col0: u32) -> bool {
+        let MiStorage::Owned(data) = &mut self.storage else {
+            return false;
+        };
         let need = cols * rows;
-        if self.data.capacity() >= need && self.data.capacity() <= need.saturating_mul(4).max(1024)
-        {
+        if data.capacity() >= need && data.capacity() <= need.saturating_mul(4).max(1024) {
             self.cols = cols;
             self.rows = rows;
-            self.col0 = col0;
-            self.data.resize(need, MiInfo::default());
+            self.stride = cols;
+            self.col0 = 0;
+            data.resize(need, MiInfo::default());
             self.sub_mvs.clear();
             true
         } else {
@@ -413,24 +495,67 @@ impl MiGrid {
     }
 
     #[inline]
+    fn base_ptr(&self) -> *const MiInfo {
+        match &self.storage {
+            MiStorage::Owned(data) => data.as_ptr(),
+            MiStorage::BorrowedStrip(ptr) => *ptr,
+        }
+    }
+
+    #[inline]
+    fn base_ptr_mut(&mut self) -> *mut MiInfo {
+        match &mut self.storage {
+            MiStorage::Owned(data) => data.as_mut_ptr(),
+            MiStorage::BorrowedStrip(ptr) => *ptr,
+        }
+    }
+
+    #[inline]
     pub fn get(&self, row: u32, col: u32) -> &MiInfo {
-        &self.data[row as usize * self.cols + (col - self.col0) as usize]
+        debug_assert!(
+            (row as usize) < self.rows
+                && col >= self.col0
+                && ((col - self.col0) as usize) < self.cols,
+            "MiGrid::get out of range"
+        );
+        // SAFETY: `(row, col - self.col0)` lies strictly inside `[0..self.rows) x [0..self.cols)`.
+        unsafe {
+            &*self
+                .base_ptr()
+                .add(row as usize * self.stride + (col - self.col0) as usize)
+        }
     }
 
     #[cfg(test)]
     fn get_mut(&mut self, row: u32, col: u32) -> &mut MiInfo {
-        &mut self.data[row as usize * self.cols + (col - self.col0) as usize]
+        debug_assert!(
+            (row as usize) < self.rows
+                && col >= self.col0
+                && ((col - self.col0) as usize) < self.cols,
+            "MiGrid::get_mut out of range"
+        );
+        let offset = row as usize * self.stride + (col - self.col0) as usize;
+        // SAFETY: `(row, col - self.col0)` lies strictly inside `[0..self.rows) x [0..self.cols)`.
+        unsafe { &mut *self.base_ptr_mut().add(offset) }
     }
 
     #[inline]
     fn fill_rect(&mut self, row: u32, col: u32, bw: u32, bh: u32, info: MiInfo) {
         let c = (col - self.col0) as usize;
         let bw = bw as usize;
-        let stride = self.cols;
-        let mut base = row as usize * stride + c;
-        for _ in 0..bh {
-            self.data[base..base + bw].fill(info);
-            base += stride;
+        debug_assert!(
+            col >= self.col0 && c + bw <= self.cols && (row as usize) + (bh as usize) <= self.rows,
+            "MiGrid::fill_rect out of range"
+        );
+        let stride = self.stride;
+        let base = self.base_ptr_mut();
+        for r in 0..bh as usize {
+            // SAFETY: each row slice `[c..c + bw]` lies strictly within this grid/strip's
+            // disjoint column range `[0..self.cols)` and `row + r < self.rows`.
+            unsafe {
+                std::slice::from_raw_parts_mut(base.add((row as usize + r) * stride + c), bw)
+                    .fill(info);
+            }
         }
     }
 }

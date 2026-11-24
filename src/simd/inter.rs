@@ -414,7 +414,7 @@ unsafe fn copy_u16_avx2<S: RefSample, const COMPOUND: bool>(
 pub(crate) unsafe fn block_inter_predict_u16_avx2<S: RefSample, const COMPOUND: bool>(
     ref_data: &[S],
     ref_width: usize,
-    dst_data: &mut [u16],
+    dst_base: *mut u16,
     dst_width: usize,
     dst_x: usize,
     dst_y: usize,
@@ -428,8 +428,7 @@ pub(crate) unsafe fn block_inter_predict_u16_avx2<S: RefSample, const COMPOUND: 
     max_val: i32,
 ) {
     debug_assert!(dst_x + w <= dst_width);
-    debug_assert!(h == 0 || (dst_y + h - 1) * dst_width + dst_x + w <= dst_data.len());
-    let dst = dst_data.as_mut_ptr().add(dst_y * dst_width + dst_x);
+    let dst = dst_base.add(dst_y * dst_width + dst_x);
     block_inter_predict_u16_ptr_avx2::<S, COMPOUND>(
         ref_data,
         ref_width,
@@ -568,7 +567,7 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
     ref_width: usize,
     ref_stride: usize,
     ref_height: usize,
-    dst_data: &mut [u16],
+    dst_base: *mut u16,
     dst_width: usize,
     dst_x: usize,
     dst_y: usize,
@@ -589,7 +588,7 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
     debug_assert!(ref_data.len() >= ref_stride * ref_height);
     debug_assert!(x_step >= 0 && y_step >= 0);
 
-    let dst = dst_data.as_mut_ptr().add(dst_y * dst_width + dst_x);
+    let dst = dst_base.add(dst_y * dst_width + dst_x);
     let last_x = ref_width as i64 - 1;
     let last_y = ref_height as i64 - 1;
     let filters = &SUBPEL_FILTERS[interp_filter as usize];

@@ -19,7 +19,7 @@ use std::arch::x86_64::*;
 /// `plane_data`.
 #[target_feature(enable = "avx2")]
 pub unsafe fn intra_pred_fill_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -28,9 +28,8 @@ pub unsafe fn intra_pred_fill_avx2(
 ) {
     debug_assert!(matches!(size, 4 | 8 | 16 | 32));
     debug_assert!(start_x + size <= plane_width);
-    debug_assert!((start_y + size - 1) * plane_width + start_x + size <= plane_data.len());
 
-    let base = plane_data.as_mut_ptr();
+    let base = plane_base;
     if size <= 8 {
         let v = _mm_set1_epi16(val as i16);
         for i in 0..size {
@@ -64,7 +63,7 @@ pub unsafe fn intra_pred_fill_avx2(
 /// for `plane_data`.
 #[target_feature(enable = "avx2")]
 pub unsafe fn intra_pred_v_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -74,9 +73,8 @@ pub unsafe fn intra_pred_v_avx2(
     debug_assert!(matches!(size, 4 | 8 | 16 | 32));
     debug_assert!(above.len() >= size);
     debug_assert!(start_x + size <= plane_width);
-    debug_assert!((start_y + size - 1) * plane_width + start_x + size <= plane_data.len());
 
-    let base = plane_data.as_mut_ptr();
+    let base = plane_base;
     let src = above.as_ptr();
     if size <= 8 {
         let v = if size == 4 {
@@ -119,7 +117,7 @@ pub unsafe fn intra_pred_v_avx2(
 /// for `plane_data`.
 #[target_feature(enable = "avx2")]
 pub unsafe fn intra_pred_h_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -129,9 +127,8 @@ pub unsafe fn intra_pred_h_avx2(
     debug_assert!(matches!(size, 4 | 8 | 16 | 32));
     debug_assert!(left.len() >= size);
     debug_assert!(start_x + size <= plane_width);
-    debug_assert!((start_y + size - 1) * plane_width + start_x + size <= plane_data.len());
 
-    let base = plane_data.as_mut_ptr();
+    let base = plane_base;
     if size <= 8 {
         for (i, &lv) in left[..size].iter().enumerate() {
             let v = _mm_set1_epi16(lv as i16);
@@ -206,7 +203,7 @@ unsafe fn sum_u16_avx2(samples: &[u16], size: usize) -> i32 {
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 pub unsafe fn intra_pred_dc_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -232,7 +229,7 @@ pub unsafe fn intra_pred_dc_avx2(
         }
         (None, None) => 1i32 << (bit_depth - 1),
     };
-    intra_pred_fill_avx2(plane_data, plane_width, start_x, start_y, dc as u16, size);
+    intra_pred_fill_avx2(plane_base, plane_width, start_x, start_y, dc as u16, size);
 }
 
 /// AVX2 `TM_PRED` (TrueMotion prediction, spec §8.5.1): writes
@@ -254,7 +251,7 @@ pub unsafe fn intra_pred_dc_avx2(
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 pub unsafe fn intra_pred_tm_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -267,12 +264,11 @@ pub unsafe fn intra_pred_tm_avx2(
     debug_assert!(matches!(size, 4 | 8 | 16 | 32));
     debug_assert!(above.len() >= size && left.len() >= size);
     debug_assert!(start_x + size <= plane_width);
-    debug_assert!((start_y + size - 1) * plane_width + start_x + size <= plane_data.len());
     debug_assert!(top_left <= 4095);
     debug_assert!(above[..size].iter().all(|&v| v <= 4095));
     debug_assert!(left[..size].iter().all(|&v| v <= 4095));
 
-    let base = plane_data.as_mut_ptr();
+    let base = plane_base;
     let max_val = ((1i32 << bit_depth) - 1) as i16;
     if size <= 8 {
         let zero = _mm_setzero_si128();

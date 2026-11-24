@@ -111,7 +111,7 @@ fn non_skip_block_with_immediate_eob_decodes_successfully() {
 }
 
 #[test]
-fn column_worker_strips_are_sized_and_merged_by_absolute_position() {
+fn column_worker_strips_are_sized_and_written_by_absolute_position() {
     // 200x80 (4:2:0): MiCols=25, Sb64Cols=4 -> padded planes 256 (luma) / 128 (chroma) wide,
     // padded grid 32 columns. Two tile columns as get_tile_offset would split them: [0,16)
     // and [16,25) (the last tile ends at MiCols).
@@ -119,8 +119,14 @@ fn column_worker_strips_are_sized_and_merged_by_absolute_position() {
     let compressed = minimal_compressed_header();
     let mut decoder = TileDecoder::new(&header, header.color_config.unwrap(), &compressed);
 
-    let mut w0 = decoder.spawn_column_worker(0, 16);
-    let mut w1 = decoder.spawn_column_worker(16, 25);
+    // SAFETY: `[0, 16)` and `[16, 25)` are strictly disjoint column strips inside `decoder`,
+    // and both workers are dropped before `decoder` is read below.
+    let (mut w0, mut w1) = unsafe {
+        (
+            decoder.spawn_borrowed_column_worker(0, 16),
+            decoder.spawn_borrowed_column_worker(16, 25),
+        )
+    };
 
     // Strip sizing: a middle column gets exactly its tile's span; the LAST column's strip
     // extends into the superblock-rounded padding (its edge blocks write past MiCols*8).
@@ -131,16 +137,20 @@ fn column_worker_strips_are_sized_and_merged_by_absolute_position() {
     assert_eq!(w0.mi_grid.cols(), 16);
     assert_eq!(w1.mi_grid.cols(), 32 - 16);
 
-    // Workers address planes/mi_grid by ABSOLUTE coordinates; the merge must land each
-    // strip back at its absolute position and sum the counts.
+    // Workers write directly into parent planes/mi_grid by ABSOLUTE coordinates (zero copy).
     w0.planes[0].set(5, 3, 111);
     w1.planes[0].set(130, 7, 222);
     w0.mi_grid.get_mut(2, 3).set_y_mode(5);
     w1.mi_grid.get_mut(2, 20).set_y_mode(6);
     w0.counts.as_deref_mut().unwrap().partition[0][0] = 1;
     w1.counts.as_deref_mut().unwrap().partition[0][0] = 2;
-    decoder.merge_column_worker(&w0);
-    decoder.merge_column_worker(&w1);
+    let c0 = w0.counts.take().unwrap();
+    let c1 = w1.counts.take().unwrap();
+    drop(w0);
+    drop(w1);
+    decoder.counts.as_deref_mut().unwrap().add_assign(&c0);
+    decoder.counts.as_deref_mut().unwrap().add_assign(&c1);
+
     assert_eq!(decoder.planes[0].get(5, 3), 111);
     assert_eq!(decoder.planes[0].get(130, 7), 222);
     assert_eq!(decoder.mi_grid.get(2, 3).y_mode(), 5);

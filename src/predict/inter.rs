@@ -500,11 +500,9 @@ fn block_inter_predict_slice_into_plane<S: RefSample>(
         &mut pred[..w * h],
     );
     let local_x = dst_x - dst.x0;
-    let dst_stride = dst.stride();
-    let dst_slice = dst.as_mut_slice();
     if compound {
         for i in 0..h {
-            let dst_row = &mut dst_slice[(dst_y + i) * dst_stride + local_x..][..w];
+            let dst_row = &mut dst.row_mut(dst_y + i)[local_x..local_x + w];
             let src_row = &pred[i * w..(i + 1) * w];
             for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
                 *d = round2(*d as i32 + s, 1) as u16;
@@ -512,7 +510,7 @@ fn block_inter_predict_slice_into_plane<S: RefSample>(
         }
     } else {
         for i in 0..h {
-            let dst_row = &mut dst_slice[(dst_y + i) * dst_stride + local_x..][..w];
+            let dst_row = &mut dst.row_mut(dst_y + i)[local_x..local_x + w];
             let src_row = &pred[i * w..(i + 1) * w];
             for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
                 *d = s as u16;
@@ -623,12 +621,12 @@ fn try_inter_predict_avx2_mode<S: RefSample, const COMPOUND: bool>(
         };
         if x_ok && y_ok {
             // SAFETY: `avx2_enabled()` confirmed by caller; `x_ok && y_ok` proves every source
-            // pixel read lies in `ref_data`, and `dst` bounds hold.
+            // pixel read lies in `ref_data`, and `dst` bounds hold within this strip.
             unsafe {
                 crate::simd::block_inter_predict_u16_avx2::<S, COMPOUND>(
                     ref_data,
                     ref_stride,
-                    dst.as_mut_slice(),
+                    dst.base_ptr_mut(),
                     dst_stride,
                     local_x,
                     dst_y,
@@ -653,14 +651,14 @@ fn try_inter_predict_avx2_mode<S: RefSample, const COMPOUND: bool>(
     {
         // SAFETY: `avx2_enabled()` confirmed; `ref_data` has `ref_stride * ref_height` samples,
         // every source read is clamped inside `ref_width x ref_height`, scratch bounds were checked,
-        // and `dst` bounds hold.
+        // and `dst` bounds hold within this strip.
         unsafe {
             crate::simd::block_inter_predict_scaled_u16_avx2::<S, COMPOUND>(
                 ref_data,
                 ref_width,
                 ref_stride,
                 ref_height,
-                dst.as_mut_slice(),
+                dst.base_ptr_mut(),
                 dst_stride,
                 local_x,
                 dst_y,

@@ -202,7 +202,7 @@ unsafe fn idct_2d_dct<const HBD: bool>(dequant: &[i64], n: u32, max_row: usize, 
 /// and every row strictly below `max_row` in `dequant` must be all-zero.
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_dct_dct_reconstruct_eob_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -211,7 +211,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_eob_avx2(
     max_row: usize,
 ) {
     idct_dct_reconstruct::<false>(
-        plane_data,
+        plane_base,
         plane_width,
         start_x,
         start_y,
@@ -230,7 +230,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_eob_avx2(
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_eob_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -241,7 +241,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_eob_avx2(
 ) {
     let max_val = (1i32 << bit_depth) - 1;
     idct_dct_reconstruct::<true>(
-        plane_data,
+        plane_base,
         plane_width,
         start_x,
         start_y,
@@ -256,11 +256,11 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_eob_avx2(
 ///
 /// # Safety
 /// `avx2_enabled()` must hold; `dequant.len()` must be `n0*n0` (`2 <= n <= 5`); and the block's
-/// rows `start_y..start_y+n0` x columns `start_x..start_x+n0` must be in bounds for `plane_data`.
+/// rows `start_y..start_y+n0` x columns `start_x..start_x+n0` must be in bounds for `plane_base`.
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_dct_dct_reconstruct_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -269,7 +269,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_avx2(
 ) {
     let n0 = 1usize << n;
     idct_dct_reconstruct::<false>(
-        plane_data,
+        plane_base,
         plane_width,
         start_x,
         start_y,
@@ -288,7 +288,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_avx2(
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -299,7 +299,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_avx2(
     let n0 = 1usize << n;
     let max_val = (1i32 << bit_depth) - 1;
     idct_dct_reconstruct::<true>(
-        plane_data,
+        plane_base,
         plane_width,
         start_x,
         start_y,
@@ -318,7 +318,7 @@ pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_avx2(
 /// `tx_type` must not be `DctDct` and the stream must be 8-bit.
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_adst_reconstruct_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -352,7 +352,7 @@ pub unsafe fn inverse_transform_adst_reconstruct_avx2(
         }
         _ => xform_pass::<false, false>(buf2_ptr, o_ptr, n, Some(shift), n0 - 1),
     }
-    reconstruct_add_clip(plane_data, plane_width, start_x, start_y, o_ptr, n0, 255);
+    reconstruct_add_clip(plane_base, plane_width, start_x, start_y, o_ptr, n0, 255);
 }
 
 /// High-bit-depth (10/12-bit) companion to [`inverse_transform_adst_reconstruct_avx2`].
@@ -363,7 +363,7 @@ pub unsafe fn inverse_transform_adst_reconstruct_avx2(
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_adst_reconstruct_hbd_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -397,7 +397,7 @@ pub unsafe fn inverse_transform_adst_reconstruct_hbd_avx2(
     }
     let max_val = (1i32 << bit_depth) - 1;
     reconstruct_add_clip(
-        plane_data,
+        plane_base,
         plane_width,
         start_x,
         start_y,
@@ -411,11 +411,11 @@ pub unsafe fn inverse_transform_adst_reconstruct_hbd_avx2(
 ///
 /// # Safety
 /// Caller must confirm `avx2_enabled()`, `2 <= n <= 5`, `dequant.len() >= n0 * n0`, and the
-/// `n0 x n0` block at `(start_x, start_y)` is in bounds for `plane_data` (stride `plane_width`).
+/// `n0 x n0` block at `(start_x, start_y)` is in bounds for `plane_base` (stride `plane_width`).
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 unsafe fn idct_dct_reconstruct<const HBD: bool>(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -429,7 +429,7 @@ unsafe fn idct_dct_reconstruct<const HBD: bool>(
     let o_ptr = o.as_mut_ptr() as *mut i32;
     idct_2d_dct::<HBD>(dequant, n, max_row, o_ptr);
     reconstruct_add_clip(
-        plane_data,
+        plane_base,
         plane_width,
         start_x,
         start_y,
@@ -440,16 +440,16 @@ unsafe fn idct_dct_reconstruct<const HBD: bool>(
 }
 
 /// Adds a constant residual `delta` (clamped to `[-max_val, max_val]`, so `pred + delta` fits
-/// signed `i16` for all 8/10/12-bit samples) to an `n0 x n0` block in `plane_data` and clips to
+/// signed `i16` for all 8/10/12-bit samples) to an `n0 x n0` block in `plane_base` and clips to
 /// `0..=max_val`. Used for DC-only `DCT_DCT` transform blocks (`eob == 1`).
 ///
 /// # Safety
 /// `avx2_enabled()` must hold; `n0` must be `4, 8, 16, or 32`; `delta` must be in
 /// `-max_val..=max_val` with `max_val <= 4095`; and `start_y..start_y+n0` x `start_x..start_x+n0`
-/// must be in bounds for `plane_data` (stride `plane_width`).
+/// must be in bounds for `plane_base` (stride `plane_width`).
 #[target_feature(enable = "avx2")]
 pub unsafe fn reconstruct_add_const_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -459,9 +459,8 @@ pub unsafe fn reconstruct_add_const_avx2(
 ) {
     debug_assert!(matches!(n0, 4 | 8 | 16 | 32));
     debug_assert!(start_x + n0 <= plane_width);
-    debug_assert!((start_y + n0 - 1) * plane_width + start_x + n0 <= plane_data.len());
 
-    let base = plane_data.as_mut_ptr();
+    let base = plane_base;
     if n0 <= 8 {
         let zero = _mm_setzero_si128();
         let max_v = _mm_set1_epi16(max_val);
@@ -506,7 +505,7 @@ pub unsafe fn reconstruct_add_const_avx2(
 /// `plane_data` (stride `plane_width`).
 #[target_feature(enable = "avx2")]
 unsafe fn reconstruct_add_clip(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -514,7 +513,7 @@ unsafe fn reconstruct_add_clip(
     n0: usize,
     max_val: i32,
 ) {
-    let base = plane_data.as_mut_ptr();
+    let base = plane_base;
     let zero = _mm256_setzero_si256();
     let max = _mm256_set1_epi32(max_val);
 
@@ -603,7 +602,7 @@ unsafe fn load_4_i64_as_i32(ptr: *const i64) -> __m128i {
 /// and the 4x4 block at `(start_x, start_y)` (stride `plane_width`) must be in bounds.
 #[target_feature(enable = "avx2")]
 pub unsafe fn inverse_transform_wht_reconstruct_avx2(
-    plane_data: &mut [u16],
+    plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
@@ -612,7 +611,6 @@ pub unsafe fn inverse_transform_wht_reconstruct_avx2(
 ) {
     debug_assert_eq!(dequant.len(), 16);
     debug_assert!(start_x + 4 <= plane_width);
-    debug_assert!((start_y + 3) * plane_width + start_x + 4 <= plane_data.len());
 
     let dq_ptr = dequant.as_ptr();
     let rows = [
@@ -627,7 +625,7 @@ pub unsafe fn inverse_transform_wht_reconstruct_avx2(
     let mut col_t = transpose4x4_i32(&t);
     iwht4_simd::<false>(&mut col_t);
 
-    let base = plane_data.as_mut_ptr();
+    let base = plane_base;
     let zero = _mm_setzero_si128();
     let max = _mm_set1_epi32((1i32 << bit_depth) - 1);
     for (i, &resid) in col_t.iter().enumerate() {
