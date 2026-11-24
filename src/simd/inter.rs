@@ -136,17 +136,62 @@ unsafe fn store_or_avg_4<const COMPOUND: bool>(dst: *mut u16, v: __m128i) {
     _mm_storel_epi64(dst as *mut __m128i, out);
 }
 
-/// Horizontal 1D subpel filter over `rows` rows of `src` (stride `src_stride`), writing `w`
-/// (`4` or multiple of `8`) `u16` samples per row into `dst` (stride `dst_stride`), with optional
-/// compound averaging. `src` must point to `(row0, col0)` where `col0` is tap 0 (`(x >> 4) - 3`).
+/// Accumulates 4 adjacent tap pairs `(s0,s1)..(s6,s7)` against pre-packed `i16` pair coefficients
+/// into low/high `i32` accumulators (`8` pixels, 128-bit SSE/AVX2).
 ///
 /// # Safety
-/// Caller must confirm `avx2_enabled()`, `w` is 4 or a multiple of 8, `src` valid for `rows`
-/// rows of `w + 7` `u16` reads at `src_stride`, and `dst` valid for `rows` rows of `w` `u16`
-/// writes at `dst_stride` (initialized when `COMPOUND`).
+/// Caller must confirm `avx2_enabled()`.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn madd_8tap_128(s: [__m128i; 8], c: [__m128i; 4]) -> (__m128i, __m128i) {
+    let mut lo = _mm_madd_epi16(_mm_unpacklo_epi16(s[0], s[1]), c[0]);
+    let mut hi = _mm_madd_epi16(_mm_unpackhi_epi16(s[0], s[1]), c[0]);
+    for i in 1..4 {
+        lo = _mm_add_epi32(
+            lo,
+            _mm_madd_epi16(_mm_unpacklo_epi16(s[2 * i], s[2 * i + 1]), c[i]),
+        );
+        hi = _mm_add_epi32(
+            hi,
+            _mm_madd_epi16(_mm_unpackhi_epi16(s[2 * i], s[2 * i + 1]), c[i]),
+        );
+    }
+    (lo, hi)
+}
+
+/// 256-bit counterpart of [`madd_8tap_128`] (`16` pixels per call).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn madd_8tap_256(s: [__m256i; 8], c: [__m256i; 4]) -> (__m256i, __m256i) {
+    let mut lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(s[0], s[1]), c[0]);
+    let mut hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(s[0], s[1]), c[0]);
+    for i in 1..4 {
+        lo = _mm256_add_epi32(
+            lo,
+            _mm256_madd_epi16(_mm256_unpacklo_epi16(s[2 * i], s[2 * i + 1]), c[i]),
+        );
+        hi = _mm256_add_epi32(
+            hi,
+            _mm256_madd_epi16(_mm256_unpackhi_epi16(s[2 * i], s[2 * i + 1]), c[i]),
+        );
+    }
+    (lo, hi)
+}
+
+/// Unified 1D subpel filter (`HORIZ == true`: horizontal tap step `1`; `HORIZ == false`: vertical
+/// tap step `src_stride`), writing `rows` rows of `w` (`4` or multiple of `8`) `u16` samples into
+/// `dst` (stride `dst_stride`), with optional compound averaging.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`, `w` is 4 or a multiple of 8, `src` valid for all tap
+/// reads across `rows` rows at `src_stride`, and `dst` valid for `rows` rows of `w` `u16` writes
+/// at `dst_stride` (initialized when `COMPOUND`).
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn convolve_horiz_u16_avx2<const COMPOUND: bool>(
+unsafe fn convolve_1d_u16_avx2<const COMPOUND: bool, const HORIZ: bool>(
     src: *const u16,
     src_stride: usize,
     dst: *mut u16,
@@ -157,94 +202,63 @@ unsafe fn convolve_horiz_u16_avx2<const COMPOUND: bool>(
     is_bilinear: bool,
     max_val: i32,
 ) {
-    if w == 4 {
-        let round_add = _mm_set1_epi32(64);
-        let zero = _mm_setzero_si128();
-        let max_clip = _mm_set1_epi32(max_val);
-        if is_bilinear {
-            let c34 = pair_coeff_128(coeffs[3], coeffs[4]);
-            for r in 0..rows {
-                let sp = src.add(r * src_stride);
-                let s3 = _mm_loadl_epi64(sp.add(3) as *const __m128i);
-                let s4 = _mm_loadl_epi64(sp.add(4) as *const __m128i);
-                let acc = _mm_madd_epi16(_mm_unpacklo_epi16(s3, s4), c34);
-                let res = _mm_srai_epi32(_mm_add_epi32(acc, round_add), 7);
-                let clipped = _mm_min_epi32(_mm_max_epi32(res, zero), max_clip);
-                store_or_avg_4::<COMPOUND>(
-                    dst.add(r * dst_stride),
-                    _mm_packus_epi32(clipped, clipped),
-                );
-            }
-        } else {
-            let c01 = pair_coeff_128(coeffs[0], coeffs[1]);
-            let c23 = pair_coeff_128(coeffs[2], coeffs[3]);
-            let c45 = pair_coeff_128(coeffs[4], coeffs[5]);
-            let c67 = pair_coeff_128(coeffs[6], coeffs[7]);
-            for r in 0..rows {
-                let sp = src.add(r * src_stride);
-                let s0 = _mm_loadl_epi64(sp as *const __m128i);
-                let s1 = _mm_loadl_epi64(sp.add(1) as *const __m128i);
-                let s2 = _mm_loadl_epi64(sp.add(2) as *const __m128i);
-                let s3 = _mm_loadl_epi64(sp.add(3) as *const __m128i);
-                let s4 = _mm_loadl_epi64(sp.add(4) as *const __m128i);
-                let s5 = _mm_loadl_epi64(sp.add(5) as *const __m128i);
-                let s6 = _mm_loadl_epi64(sp.add(6) as *const __m128i);
-                let s7 = _mm_loadl_epi64(sp.add(7) as *const __m128i);
-                let mut acc = _mm_madd_epi16(_mm_unpacklo_epi16(s0, s1), c01);
-                acc = _mm_add_epi32(acc, _mm_madd_epi16(_mm_unpacklo_epi16(s2, s3), c23));
-                acc = _mm_add_epi32(acc, _mm_madd_epi16(_mm_unpacklo_epi16(s4, s5), c45));
-                acc = _mm_add_epi32(acc, _mm_madd_epi16(_mm_unpacklo_epi16(s6, s7), c67));
-                let res = _mm_srai_epi32(_mm_add_epi32(acc, round_add), 7);
-                let clipped = _mm_min_epi32(_mm_max_epi32(res, zero), max_clip);
-                store_or_avg_4::<COMPOUND>(
-                    dst.add(r * dst_stride),
-                    _mm_packus_epi32(clipped, clipped),
-                );
-            }
-        }
-        return;
-    }
+    let tap_step = if HORIZ { 1 } else { src_stride };
 
-    if w == 8 {
+    if w <= 8 {
         let round_add = _mm_set1_epi32(64);
         let zero = _mm_setzero_si128();
         let max_clip = _mm_set1_epi32(max_val);
-        if is_bilinear {
-            let c34 = pair_coeff_128(coeffs[3], coeffs[4]);
-            for r in 0..rows {
-                let sp = src.add(r * src_stride);
-                let s3 = _mm_loadu_si128(sp.add(3) as *const __m128i);
-                let s4 = _mm_loadu_si128(sp.add(4) as *const __m128i);
-                let acc_lo = _mm_madd_epi16(_mm_unpacklo_epi16(s3, s4), c34);
-                let acc_hi = _mm_madd_epi16(_mm_unpackhi_epi16(s3, s4), c34);
-                let packed = round_clip_pack_8(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_8::<COMPOUND>(dst.add(r * dst_stride), packed);
+        let c = [
+            pair_coeff_128(coeffs[0], coeffs[1]),
+            pair_coeff_128(coeffs[2], coeffs[3]),
+            pair_coeff_128(coeffs[4], coeffs[5]),
+            pair_coeff_128(coeffs[6], coeffs[7]),
+        ];
+        let c34 = pair_coeff_128(coeffs[3], coeffs[4]);
+        let load = |p: *const u16| -> __m128i {
+            if w == 4 {
+                _mm_loadl_epi64(p as *const __m128i)
+            } else {
+                _mm_loadu_si128(p as *const __m128i)
             }
-        } else {
-            let c01 = pair_coeff_128(coeffs[0], coeffs[1]);
-            let c23 = pair_coeff_128(coeffs[2], coeffs[3]);
-            let c45 = pair_coeff_128(coeffs[4], coeffs[5]);
-            let c67 = pair_coeff_128(coeffs[6], coeffs[7]);
-            for r in 0..rows {
-                let sp = src.add(r * src_stride);
-                let s0 = _mm_loadu_si128(sp as *const __m128i);
-                let s1 = _mm_loadu_si128(sp.add(1) as *const __m128i);
-                let s2 = _mm_loadu_si128(sp.add(2) as *const __m128i);
-                let s3 = _mm_loadu_si128(sp.add(3) as *const __m128i);
-                let s4 = _mm_loadu_si128(sp.add(4) as *const __m128i);
-                let s5 = _mm_loadu_si128(sp.add(5) as *const __m128i);
-                let s6 = _mm_loadu_si128(sp.add(6) as *const __m128i);
-                let s7 = _mm_loadu_si128(sp.add(7) as *const __m128i);
-                let mut acc_lo = _mm_madd_epi16(_mm_unpacklo_epi16(s0, s1), c01);
-                let mut acc_hi = _mm_madd_epi16(_mm_unpackhi_epi16(s0, s1), c01);
-                acc_lo = _mm_add_epi32(acc_lo, _mm_madd_epi16(_mm_unpacklo_epi16(s2, s3), c23));
-                acc_hi = _mm_add_epi32(acc_hi, _mm_madd_epi16(_mm_unpackhi_epi16(s2, s3), c23));
-                acc_lo = _mm_add_epi32(acc_lo, _mm_madd_epi16(_mm_unpacklo_epi16(s4, s5), c45));
-                acc_hi = _mm_add_epi32(acc_hi, _mm_madd_epi16(_mm_unpackhi_epi16(s4, s5), c45));
-                acc_lo = _mm_add_epi32(acc_lo, _mm_madd_epi16(_mm_unpacklo_epi16(s6, s7), c67));
-                acc_hi = _mm_add_epi32(acc_hi, _mm_madd_epi16(_mm_unpackhi_epi16(s6, s7), c67));
+        };
+
+        for r in 0..rows {
+            let sp = src.add(r * src_stride);
+            let dp = dst.add(r * dst_stride);
+            if w == 4 {
+                let acc = if is_bilinear {
+                    let s3 = load(sp.add(3 * tap_step));
+                    let s4 = load(sp.add(4 * tap_step));
+                    _mm_madd_epi16(_mm_unpacklo_epi16(s3, s4), c34)
+                } else {
+                    let s: [__m128i; 8] = std::array::from_fn(|t| load(sp.add(t * tap_step)));
+                    let mut a = _mm_madd_epi16(_mm_unpacklo_epi16(s[0], s[1]), c[0]);
+                    for i in 1..4 {
+                        a = _mm_add_epi32(
+                            a,
+                            _mm_madd_epi16(_mm_unpacklo_epi16(s[2 * i], s[2 * i + 1]), c[i]),
+                        );
+                    }
+                    a
+                };
+                let res = _mm_srai_epi32(_mm_add_epi32(acc, round_add), 7);
+                let clipped = _mm_min_epi32(_mm_max_epi32(res, zero), max_clip);
+                store_or_avg_4::<COMPOUND>(dp, _mm_packus_epi32(clipped, clipped));
+            } else {
+                let (acc_lo, acc_hi) = if is_bilinear {
+                    let s3 = load(sp.add(3 * tap_step));
+                    let s4 = load(sp.add(4 * tap_step));
+                    (
+                        _mm_madd_epi16(_mm_unpacklo_epi16(s3, s4), c34),
+                        _mm_madd_epi16(_mm_unpackhi_epi16(s3, s4), c34),
+                    )
+                } else {
+                    let s: [__m128i; 8] = std::array::from_fn(|t| load(sp.add(t * tap_step)));
+                    madd_8tap_128(s, c)
+                };
                 let packed = round_clip_pack_8(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_8::<COMPOUND>(dst.add(r * dst_stride), packed);
+                store_or_avg_8::<COMPOUND>(dp, packed);
             }
         }
         return;
@@ -258,260 +272,39 @@ unsafe fn convolve_horiz_u16_avx2<const COMPOUND: bool>(
     if is_bilinear {
         let c34 = pair_coeff_256(coeffs[3], coeffs[4]);
         for r in 0..rows {
-            let row_src = src.add(r * src_stride);
+            let p3 = src.add(r * src_stride + 3 * tap_step);
+            let p4 = src.add(r * src_stride + 4 * tap_step);
             let row_dst = dst.add(r * dst_stride);
-            let mut c = 0usize;
-            while c < w {
-                let sp = row_src.add(c);
-                let s3 = _mm256_loadu_si256(sp.add(3) as *const __m256i);
-                let s4 = _mm256_loadu_si256(sp.add(4) as *const __m256i);
+            let mut col = 0usize;
+            while col < w {
+                let s3 = _mm256_loadu_si256(p3.add(col) as *const __m256i);
+                let s4 = _mm256_loadu_si256(p4.add(col) as *const __m256i);
                 let acc_lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(s3, s4), c34);
                 let acc_hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(s3, s4), c34);
                 let packed = round_clip_pack_16(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_16::<COMPOUND>(row_dst.add(c), packed);
-                c += 16;
+                store_or_avg_16::<COMPOUND>(row_dst.add(col), packed);
+                col += 16;
             }
         }
     } else {
-        let c01 = pair_coeff_256(coeffs[0], coeffs[1]);
-        let c23 = pair_coeff_256(coeffs[2], coeffs[3]);
-        let c45 = pair_coeff_256(coeffs[4], coeffs[5]);
-        let c67 = pair_coeff_256(coeffs[6], coeffs[7]);
+        let c = [
+            pair_coeff_256(coeffs[0], coeffs[1]),
+            pair_coeff_256(coeffs[2], coeffs[3]),
+            pair_coeff_256(coeffs[4], coeffs[5]),
+            pair_coeff_256(coeffs[6], coeffs[7]),
+        ];
         for r in 0..rows {
             let row_src = src.add(r * src_stride);
+            let pt: [*const u16; 8] = std::array::from_fn(|t| row_src.add(t * tap_step));
             let row_dst = dst.add(r * dst_stride);
-            let mut c = 0usize;
-            while c < w {
-                let sp = row_src.add(c);
-                let s0 = _mm256_loadu_si256(sp as *const __m256i);
-                let s1 = _mm256_loadu_si256(sp.add(1) as *const __m256i);
-                let s2 = _mm256_loadu_si256(sp.add(2) as *const __m256i);
-                let s3 = _mm256_loadu_si256(sp.add(3) as *const __m256i);
-                let s4 = _mm256_loadu_si256(sp.add(4) as *const __m256i);
-                let s5 = _mm256_loadu_si256(sp.add(5) as *const __m256i);
-                let s6 = _mm256_loadu_si256(sp.add(6) as *const __m256i);
-                let s7 = _mm256_loadu_si256(sp.add(7) as *const __m256i);
-                let mut acc_lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(s0, s1), c01);
-                let mut acc_hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(s0, s1), c01);
-                acc_lo = _mm256_add_epi32(
-                    acc_lo,
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s2, s3), c23),
-                );
-                acc_hi = _mm256_add_epi32(
-                    acc_hi,
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s2, s3), c23),
-                );
-                acc_lo = _mm256_add_epi32(
-                    acc_lo,
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s4, s5), c45),
-                );
-                acc_hi = _mm256_add_epi32(
-                    acc_hi,
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s4, s5), c45),
-                );
-                acc_lo = _mm256_add_epi32(
-                    acc_lo,
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s6, s7), c67),
-                );
-                acc_hi = _mm256_add_epi32(
-                    acc_hi,
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s6, s7), c67),
-                );
+            let mut col = 0usize;
+            while col < w {
+                let s: [__m256i; 8] =
+                    std::array::from_fn(|t| _mm256_loadu_si256(pt[t].add(col) as *const __m256i));
+                let (acc_lo, acc_hi) = madd_8tap_256(s, c);
                 let packed = round_clip_pack_16(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_16::<COMPOUND>(row_dst.add(c), packed);
-                c += 16;
-            }
-        }
-    }
-}
-
-/// Vertical 1D subpel filter over `h` output rows reading from `src` (stride `src_stride`,
-/// where row `0` corresponds to tap `0` of output row `0`, i.e. `y0 - 3`), writing `w` (`4` or
-/// multiple of `8`) `u16` samples per row into `dst` (stride `dst_stride`), with optional compound
-/// averaging.
-///
-/// # Safety
-/// Caller must confirm `avx2_enabled()`, `w` is 4 or a multiple of 8, `src` valid for `h + 7`
-/// rows of `w` `u16` reads at `src_stride`, and `dst` valid for `h` rows of `w` `u16` writes at
-/// `dst_stride` (initialized when `COMPOUND`).
-#[target_feature(enable = "avx2")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn convolve_vert_u16_avx2<const COMPOUND: bool>(
-    src: *const u16,
-    src_stride: usize,
-    dst: *mut u16,
-    dst_stride: usize,
-    w: usize,
-    h: usize,
-    coeffs: &[i32; 8],
-    is_bilinear: bool,
-    max_val: i32,
-) {
-    if w == 4 {
-        let round_add = _mm_set1_epi32(64);
-        let zero = _mm_setzero_si128();
-        let max_clip = _mm_set1_epi32(max_val);
-        if is_bilinear {
-            let c34 = pair_coeff_128(coeffs[3], coeffs[4]);
-            for r in 0..h {
-                let s3 = _mm_loadl_epi64(src.add((r + 3) * src_stride) as *const __m128i);
-                let s4 = _mm_loadl_epi64(src.add((r + 4) * src_stride) as *const __m128i);
-                let acc = _mm_madd_epi16(_mm_unpacklo_epi16(s3, s4), c34);
-                let res = _mm_srai_epi32(_mm_add_epi32(acc, round_add), 7);
-                let clipped = _mm_min_epi32(_mm_max_epi32(res, zero), max_clip);
-                store_or_avg_4::<COMPOUND>(
-                    dst.add(r * dst_stride),
-                    _mm_packus_epi32(clipped, clipped),
-                );
-            }
-        } else {
-            let c01 = pair_coeff_128(coeffs[0], coeffs[1]);
-            let c23 = pair_coeff_128(coeffs[2], coeffs[3]);
-            let c45 = pair_coeff_128(coeffs[4], coeffs[5]);
-            let c67 = pair_coeff_128(coeffs[6], coeffs[7]);
-            for r in 0..h {
-                let s0 = _mm_loadl_epi64(src.add(r * src_stride) as *const __m128i);
-                let s1 = _mm_loadl_epi64(src.add((r + 1) * src_stride) as *const __m128i);
-                let s2 = _mm_loadl_epi64(src.add((r + 2) * src_stride) as *const __m128i);
-                let s3 = _mm_loadl_epi64(src.add((r + 3) * src_stride) as *const __m128i);
-                let s4 = _mm_loadl_epi64(src.add((r + 4) * src_stride) as *const __m128i);
-                let s5 = _mm_loadl_epi64(src.add((r + 5) * src_stride) as *const __m128i);
-                let s6 = _mm_loadl_epi64(src.add((r + 6) * src_stride) as *const __m128i);
-                let s7 = _mm_loadl_epi64(src.add((r + 7) * src_stride) as *const __m128i);
-                let mut acc = _mm_madd_epi16(_mm_unpacklo_epi16(s0, s1), c01);
-                acc = _mm_add_epi32(acc, _mm_madd_epi16(_mm_unpacklo_epi16(s2, s3), c23));
-                acc = _mm_add_epi32(acc, _mm_madd_epi16(_mm_unpacklo_epi16(s4, s5), c45));
-                acc = _mm_add_epi32(acc, _mm_madd_epi16(_mm_unpacklo_epi16(s6, s7), c67));
-                let res = _mm_srai_epi32(_mm_add_epi32(acc, round_add), 7);
-                let clipped = _mm_min_epi32(_mm_max_epi32(res, zero), max_clip);
-                store_or_avg_4::<COMPOUND>(
-                    dst.add(r * dst_stride),
-                    _mm_packus_epi32(clipped, clipped),
-                );
-            }
-        }
-        return;
-    }
-
-    if w == 8 {
-        let round_add = _mm_set1_epi32(64);
-        let zero = _mm_setzero_si128();
-        let max_clip = _mm_set1_epi32(max_val);
-        if is_bilinear {
-            let c34 = pair_coeff_128(coeffs[3], coeffs[4]);
-            for r in 0..h {
-                let s3 = _mm_loadu_si128(src.add((r + 3) * src_stride) as *const __m128i);
-                let s4 = _mm_loadu_si128(src.add((r + 4) * src_stride) as *const __m128i);
-                let acc_lo = _mm_madd_epi16(_mm_unpacklo_epi16(s3, s4), c34);
-                let acc_hi = _mm_madd_epi16(_mm_unpackhi_epi16(s3, s4), c34);
-                let packed = round_clip_pack_8(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_8::<COMPOUND>(dst.add(r * dst_stride), packed);
-            }
-        } else {
-            let c01 = pair_coeff_128(coeffs[0], coeffs[1]);
-            let c23 = pair_coeff_128(coeffs[2], coeffs[3]);
-            let c45 = pair_coeff_128(coeffs[4], coeffs[5]);
-            let c67 = pair_coeff_128(coeffs[6], coeffs[7]);
-            for r in 0..h {
-                let s0 = _mm_loadu_si128(src.add(r * src_stride) as *const __m128i);
-                let s1 = _mm_loadu_si128(src.add((r + 1) * src_stride) as *const __m128i);
-                let s2 = _mm_loadu_si128(src.add((r + 2) * src_stride) as *const __m128i);
-                let s3 = _mm_loadu_si128(src.add((r + 3) * src_stride) as *const __m128i);
-                let s4 = _mm_loadu_si128(src.add((r + 4) * src_stride) as *const __m128i);
-                let s5 = _mm_loadu_si128(src.add((r + 5) * src_stride) as *const __m128i);
-                let s6 = _mm_loadu_si128(src.add((r + 6) * src_stride) as *const __m128i);
-                let s7 = _mm_loadu_si128(src.add((r + 7) * src_stride) as *const __m128i);
-                let mut acc_lo = _mm_madd_epi16(_mm_unpacklo_epi16(s0, s1), c01);
-                let mut acc_hi = _mm_madd_epi16(_mm_unpackhi_epi16(s0, s1), c01);
-                acc_lo = _mm_add_epi32(acc_lo, _mm_madd_epi16(_mm_unpacklo_epi16(s2, s3), c23));
-                acc_hi = _mm_add_epi32(acc_hi, _mm_madd_epi16(_mm_unpackhi_epi16(s2, s3), c23));
-                acc_lo = _mm_add_epi32(acc_lo, _mm_madd_epi16(_mm_unpacklo_epi16(s4, s5), c45));
-                acc_hi = _mm_add_epi32(acc_hi, _mm_madd_epi16(_mm_unpackhi_epi16(s4, s5), c45));
-                acc_lo = _mm_add_epi32(acc_lo, _mm_madd_epi16(_mm_unpacklo_epi16(s6, s7), c67));
-                acc_hi = _mm_add_epi32(acc_hi, _mm_madd_epi16(_mm_unpackhi_epi16(s6, s7), c67));
-                let packed = round_clip_pack_8(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_8::<COMPOUND>(dst.add(r * dst_stride), packed);
-            }
-        }
-        return;
-    }
-
-    // w is 16, 32, or 64.
-    debug_assert_eq!(w % 16, 0);
-    let round_add = _mm256_set1_epi32(64);
-    let zero = _mm256_setzero_si256();
-    let max_clip = _mm256_set1_epi32(max_val);
-    if is_bilinear {
-        let c34 = pair_coeff_256(coeffs[3], coeffs[4]);
-        for r in 0..h {
-            let p3 = src.add((r + 3) * src_stride);
-            let p4 = src.add((r + 4) * src_stride);
-            let row_dst = dst.add(r * dst_stride);
-            let mut c = 0usize;
-            while c < w {
-                let s3 = _mm256_loadu_si256(p3.add(c) as *const __m256i);
-                let s4 = _mm256_loadu_si256(p4.add(c) as *const __m256i);
-                let acc_lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(s3, s4), c34);
-                let acc_hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(s3, s4), c34);
-                let packed = round_clip_pack_16(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_16::<COMPOUND>(row_dst.add(c), packed);
-                c += 16;
-            }
-        }
-    } else {
-        let c01 = pair_coeff_256(coeffs[0], coeffs[1]);
-        let c23 = pair_coeff_256(coeffs[2], coeffs[3]);
-        let c45 = pair_coeff_256(coeffs[4], coeffs[5]);
-        let c67 = pair_coeff_256(coeffs[6], coeffs[7]);
-        for r in 0..h {
-            let p0 = src.add(r * src_stride);
-            let p1 = src.add((r + 1) * src_stride);
-            let p2 = src.add((r + 2) * src_stride);
-            let p3 = src.add((r + 3) * src_stride);
-            let p4 = src.add((r + 4) * src_stride);
-            let p5 = src.add((r + 5) * src_stride);
-            let p6 = src.add((r + 6) * src_stride);
-            let p7 = src.add((r + 7) * src_stride);
-            let row_dst = dst.add(r * dst_stride);
-            let mut c = 0usize;
-            while c < w {
-                let s0 = _mm256_loadu_si256(p0.add(c) as *const __m256i);
-                let s1 = _mm256_loadu_si256(p1.add(c) as *const __m256i);
-                let s2 = _mm256_loadu_si256(p2.add(c) as *const __m256i);
-                let s3 = _mm256_loadu_si256(p3.add(c) as *const __m256i);
-                let s4 = _mm256_loadu_si256(p4.add(c) as *const __m256i);
-                let s5 = _mm256_loadu_si256(p5.add(c) as *const __m256i);
-                let s6 = _mm256_loadu_si256(p6.add(c) as *const __m256i);
-                let s7 = _mm256_loadu_si256(p7.add(c) as *const __m256i);
-                let mut acc_lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(s0, s1), c01);
-                let mut acc_hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(s0, s1), c01);
-                acc_lo = _mm256_add_epi32(
-                    acc_lo,
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s2, s3), c23),
-                );
-                acc_hi = _mm256_add_epi32(
-                    acc_hi,
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s2, s3), c23),
-                );
-                acc_lo = _mm256_add_epi32(
-                    acc_lo,
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s4, s5), c45),
-                );
-                acc_hi = _mm256_add_epi32(
-                    acc_hi,
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s4, s5), c45),
-                );
-                acc_lo = _mm256_add_epi32(
-                    acc_lo,
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s6, s7), c67),
-                );
-                acc_hi = _mm256_add_epi32(
-                    acc_hi,
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s6, s7), c67),
-                );
-                let packed = round_clip_pack_16(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_16::<COMPOUND>(row_dst.add(c), packed);
-                c += 16;
+                store_or_avg_16::<COMPOUND>(row_dst.add(col), packed);
+                col += 16;
             }
         }
     }
@@ -651,7 +444,7 @@ unsafe fn block_inter_predict_u16_ptr_avx2<const COMPOUND: bool>(
             let src = ref_data
                 .as_ptr()
                 .add((y0 as usize) * ref_width + ((x0 - 3) as usize));
-            convolve_horiz_u16_avx2::<COMPOUND>(
+            convolve_1d_u16_avx2::<COMPOUND, true>(
                 src,
                 ref_width,
                 dst,
@@ -667,7 +460,7 @@ unsafe fn block_inter_predict_u16_ptr_avx2<const COMPOUND: bool>(
             let src = ref_data
                 .as_ptr()
                 .add(((y0 - 3) as usize) * ref_width + (x0 as usize));
-            convolve_vert_u16_avx2::<COMPOUND>(
+            convolve_1d_u16_avx2::<COMPOUND, false>(
                 src,
                 ref_width,
                 dst,
@@ -689,7 +482,7 @@ unsafe fn block_inter_predict_u16_ptr_avx2<const COMPOUND: bool>(
             let src = ref_data
                 .as_ptr()
                 .add(((y0 - 3) as usize) * ref_width + ((x0 - 3) as usize));
-            convolve_horiz_u16_avx2::<false>(
+            convolve_1d_u16_avx2::<false, true>(
                 src,
                 ref_width,
                 tmp_ptr,
@@ -700,7 +493,7 @@ unsafe fn block_inter_predict_u16_ptr_avx2<const COMPOUND: bool>(
                 is_bilinear,
                 max_val,
             );
-            convolve_vert_u16_avx2::<COMPOUND>(
+            convolve_1d_u16_avx2::<COMPOUND, false>(
                 tmp_ptr,
                 w,
                 dst,
@@ -785,22 +578,19 @@ pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
         let mut line = [MaybeUninit::<u16>::uninit(); MAX_BLOCK_DIM + 8];
         let line_ptr = line.as_mut_ptr() as *mut u16;
 
-        match (fx == 0, fy == 0) {
-            (true, true) => {
-                for r in 0..h {
-                    let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
+        if fy == 0 {
+            for r in 0..h {
+                let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
+                let row_dst = dst.add(r * dst_width);
+                if fx == 0 {
                     fill_clamped_row(ref_y, x0, w, line_ptr);
-                    copy_u16_avx2::<COMPOUND>(line_ptr, w, dst.add(r * dst_width), dst_width, w, 1);
-                }
-            }
-            (false, true) => {
-                for r in 0..h {
-                    let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
+                    copy_u16_avx2::<COMPOUND>(line_ptr, w, row_dst, dst_width, w, 1);
+                } else {
                     fill_clamped_row(ref_y, x0 - 3, w + 7, line_ptr);
-                    convolve_horiz_u16_avx2::<COMPOUND>(
+                    convolve_1d_u16_avx2::<COMPOUND, true>(
                         line_ptr,
                         w + 7,
-                        dst.add(r * dst_width),
+                        row_dst,
                         dst_width,
                         w,
                         1,
@@ -810,32 +600,16 @@ pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
                     );
                 }
             }
-            (true, false) => {
-                let mut tmp = [MaybeUninit::<u16>::uninit(); (MAX_BLOCK_DIM + 7) * MAX_BLOCK_DIM];
-                let tmp_ptr = tmp.as_mut_ptr() as *mut u16;
-                for r in 0..(h + 7) {
-                    let ref_y = (y0 - 3 + r as i64).clamp(0, last_y) as usize;
+        } else {
+            let mut tmp = [MaybeUninit::<u16>::uninit(); (MAX_BLOCK_DIM + 7) * MAX_BLOCK_DIM];
+            let tmp_ptr = tmp.as_mut_ptr() as *mut u16;
+            for r in 0..(h + 7) {
+                let ref_y = (y0 - 3 + r as i64).clamp(0, last_y) as usize;
+                if fx == 0 {
                     fill_clamped_row(ref_y, x0, w, tmp_ptr.add(r * w));
-                }
-                convolve_vert_u16_avx2::<COMPOUND>(
-                    tmp_ptr,
-                    w,
-                    dst,
-                    dst_width,
-                    w,
-                    h,
-                    &filters[fy],
-                    is_bilinear,
-                    max_val,
-                );
-            }
-            (false, false) => {
-                let mut tmp = [MaybeUninit::<u16>::uninit(); (MAX_BLOCK_DIM + 7) * MAX_BLOCK_DIM];
-                let tmp_ptr = tmp.as_mut_ptr() as *mut u16;
-                for r in 0..(h + 7) {
-                    let ref_y = (y0 - 3 + r as i64).clamp(0, last_y) as usize;
+                } else {
                     fill_clamped_row(ref_y, x0 - 3, w + 7, line_ptr);
-                    convolve_horiz_u16_avx2::<false>(
+                    convolve_1d_u16_avx2::<false, true>(
                         line_ptr,
                         w + 7,
                         tmp_ptr.add(r * w),
@@ -847,18 +621,18 @@ pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
                         max_val,
                     );
                 }
-                convolve_vert_u16_avx2::<COMPOUND>(
-                    tmp_ptr,
-                    w,
-                    dst,
-                    dst_width,
-                    w,
-                    h,
-                    &filters[fy],
-                    is_bilinear,
-                    max_val,
-                );
             }
+            convolve_1d_u16_avx2::<COMPOUND, false>(
+                tmp_ptr,
+                w,
+                dst,
+                dst_width,
+                w,
+                h,
+                &filters[fy],
+                is_bilinear,
+                max_val,
+            );
         }
         return;
     }
@@ -927,7 +701,7 @@ pub unsafe fn block_inter_predict_avx2(
     max_val: i32,
     pred: &mut [i32],
 ) {
-    debug_assert_eq!(w % 8, 0);
+    debug_assert!(w == 4 || w.is_multiple_of(8));
     debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
     debug_assert!(intermediate_height <= MAX_INTERMEDIATE_HEIGHT);
     debug_assert_eq!(pred.len(), w * h);
@@ -974,30 +748,20 @@ pub unsafe fn block_inter_predict_avx2_w4(
     max_val: i32,
     pred: &mut [i32],
 ) {
-    debug_assert!(h <= MAX_BLOCK_DIM);
-    debug_assert!(intermediate_height <= MAX_INTERMEDIATE_HEIGHT);
-    debug_assert_eq!(pred.len(), 4 * h);
-    debug_assert!(src_row0 >= 0 && src_col0 >= 0);
-
-    let mut out_u16 = [MaybeUninit::<u16>::uninit(); MAX_BLOCK_DIM * 4];
-    let out_ptr = out_u16.as_mut_ptr().cast::<u16>();
-    block_inter_predict_u16_ptr_avx2::<false>(
+    block_inter_predict_avx2(
         ref_data,
         ref_width,
-        out_ptr,
-        4,
-        src_col0 + 3,
-        src_row0 + 3,
+        src_row0,
+        src_col0,
         fx,
         fy,
         4,
         h,
+        intermediate_height,
         interp_filter,
         max_val,
+        pred,
     );
-    for (i, dst) in pred.iter_mut().enumerate() {
-        *dst = *out_ptr.add(i) as i32;
-    }
 }
 
 /// General edge-clamping AVX2 mirror of `predict::block_inter_predict_scalar`'s two-pass

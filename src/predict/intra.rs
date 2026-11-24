@@ -71,6 +71,39 @@ pub fn predict_intra(
     );
 }
 
+/// Runs `f(dst_rows, dst_y, above)` borrowing the above row directly via `split_at_mut` when
+/// `have_above && x + size - 1 <= max_x`, or via a stack-clamped buffer otherwise.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn with_above_row<F: FnOnce(&mut [u16], usize, Option<&[u16]>)>(
+    plane: &mut Plane,
+    x: usize,
+    y: usize,
+    size: usize,
+    max_x: usize,
+    have_above: bool,
+    f: F,
+) {
+    let pw = plane.stride();
+    let local_x = x - plane.x0;
+    if have_above && x + size - 1 <= max_x {
+        let (above_rows, dst_rows) = plane.as_mut_slice().split_at_mut(y * pw);
+        let above_start = (y - 1) * pw + local_x;
+        f(
+            dst_rows,
+            0,
+            Some(&above_rows[above_start..above_start + size]),
+        );
+    } else if have_above {
+        let mut above_buf = [0u16; 32];
+        load_clamped_above(plane, x, y, max_x, &mut above_buf[..size]);
+        f(plane.as_mut_slice(), y, Some(&above_buf[..size]));
+    } else {
+        f(plane.as_mut_slice(), y, None);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 fn predict_intra_avx2(
@@ -109,28 +142,13 @@ fn predict_intra_avx2(
                         size,
                     );
                 }
-            } else if x + size - 1 <= max_x {
-                let (above_rows, dst_rows) = plane.as_mut_slice().split_at_mut(y * pw);
-                let above_start = (y - 1) * pw + local_x;
-                let above = &above_rows[above_start..above_start + size];
-                // SAFETY: avx2_enabled() confirmed; `above` has len `size` and `dst_rows` has `>= size` rows.
-                unsafe {
-                    crate::simd::intra_pred_v_avx2(dst_rows, pw, local_x, 0, above, size);
-                }
             } else {
-                let mut above_buf = [0u16; 32];
-                load_clamped_above(plane, x, y, max_x, &mut above_buf[..size]);
-                // SAFETY: avx2_enabled() confirmed; above_buf[..size] and block bounds hold.
-                unsafe {
-                    crate::simd::intra_pred_v_avx2(
-                        plane.as_mut_slice(),
-                        pw,
-                        local_x,
-                        y,
-                        &above_buf[..size],
-                        size,
-                    );
-                }
+                with_above_row(plane, x, y, size, max_x, true, |dst, dy, above| {
+                    // SAFETY: avx2_enabled() confirmed; `above` has len `size` and bounds hold.
+                    unsafe {
+                        crate::simd::intra_pred_v_avx2(dst, pw, local_x, dy, above.unwrap(), size);
+                    }
+                });
             }
         }
         H_PRED => {
@@ -164,57 +182,30 @@ fn predict_intra_avx2(
         }
         DC_PRED => {
             let mut left_buf = [0u16; 32];
-            let left_opt = if have_left {
+            let left_opt = have_left.then(|| {
                 load_clamped_left(plane, x, y, max_y, &mut left_buf[..size]);
-                Some(&left_buf[..size])
-            } else {
-                None
-            };
-
-            if have_above && x + size - 1 <= max_x {
-                let (above_rows, dst_rows) = plane.as_mut_slice().split_at_mut(y * pw);
-                let above_start = (y - 1) * pw + local_x;
-                let above = &above_rows[above_start..above_start + size];
-                // SAFETY: avx2_enabled() confirmed; neighbor slices have len `size` and bounds hold.
-                unsafe {
-                    crate::simd::intra_pred_dc_avx2(
-                        dst_rows,
-                        pw,
-                        local_x,
-                        0,
-                        Some(above),
-                        left_opt,
-                        log2_size,
-                        bit_depth,
-                    );
-                }
-            } else {
-                let mut above_buf = [0u16; 32];
-                let above_opt = if have_above {
-                    load_clamped_above(plane, x, y, max_x, &mut above_buf[..size]);
-                    Some(&above_buf[..size])
-                } else {
-                    None
-                };
-                // SAFETY: avx2_enabled() confirmed; neighbor slices and block bounds hold.
-                unsafe {
-                    crate::simd::intra_pred_dc_avx2(
-                        plane.as_mut_slice(),
-                        pw,
-                        local_x,
-                        y,
-                        above_opt,
-                        left_opt,
-                        log2_size,
-                        bit_depth,
-                    );
-                }
-            }
+                &left_buf[..size]
+            });
+            with_above_row(
+                plane,
+                x,
+                y,
+                size,
+                max_x,
+                have_above,
+                |dst, dy, above_opt| {
+                    // SAFETY: avx2_enabled() confirmed; neighbor slices and block bounds hold.
+                    unsafe {
+                        crate::simd::intra_pred_dc_avx2(
+                            dst, pw, local_x, dy, above_opt, left_opt, log2_size, bit_depth,
+                        );
+                    }
+                },
+            );
         }
         TM_PRED => {
             let top_left = if have_above && have_left {
-                let sx = x.saturating_sub(1).min(max_x);
-                plane.get(sx, y - 1)
+                plane.get(x.saturating_sub(1).min(max_x), y - 1)
             } else if have_above {
                 base + 1
             } else {
@@ -224,45 +215,32 @@ fn predict_intra_avx2(
             if have_left {
                 load_clamped_left(plane, x, y, max_y, &mut left_buf[..size]);
             }
-
-            if have_above && x + size - 1 <= max_x {
-                let (above_rows, dst_rows) = plane.as_mut_slice().split_at_mut(y * pw);
-                let above_start = (y - 1) * pw + local_x;
-                let above = &above_rows[above_start..above_start + size];
-                // SAFETY: avx2_enabled() confirmed; neighbor slices have len `size` and bounds hold.
-                unsafe {
-                    crate::simd::intra_pred_tm_avx2(
-                        dst_rows,
-                        pw,
-                        local_x,
-                        0,
-                        above,
-                        &left_buf[..size],
-                        top_left,
-                        size,
-                        bit_depth,
-                    );
-                }
-            } else {
-                let mut above_buf = [base - 1; 32];
-                if have_above {
-                    load_clamped_above(plane, x, y, max_x, &mut above_buf[..size]);
-                }
-                // SAFETY: avx2_enabled() confirmed; neighbor buffers and block bounds hold.
-                unsafe {
-                    crate::simd::intra_pred_tm_avx2(
-                        plane.as_mut_slice(),
-                        pw,
-                        local_x,
-                        y,
-                        &above_buf[..size],
-                        &left_buf[..size],
-                        top_left,
-                        size,
-                        bit_depth,
-                    );
-                }
-            }
+            let fallback_above = [base - 1; 32];
+            with_above_row(
+                plane,
+                x,
+                y,
+                size,
+                max_x,
+                have_above,
+                |dst, dy, above_opt| {
+                    let above = above_opt.unwrap_or(&fallback_above[..size]);
+                    // SAFETY: avx2_enabled() confirmed; neighbor slices and block bounds hold.
+                    unsafe {
+                        crate::simd::intra_pred_tm_avx2(
+                            dst,
+                            pw,
+                            local_x,
+                            dy,
+                            above,
+                            &left_buf[..size],
+                            top_left,
+                            size,
+                            bit_depth,
+                        );
+                    }
+                },
+            );
         }
         _ => unreachable!(),
     }

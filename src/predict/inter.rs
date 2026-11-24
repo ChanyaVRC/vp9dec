@@ -235,14 +235,11 @@ pub(crate) fn block_inter_predict_scalar(
                     let sx0 = (x0 - 3) as usize;
                     for c in 0..w {
                         let base = &row[sx0 + c..sx0 + c + 8];
-                        let s = hcoeffs[0] * base[0] as i32
-                            + hcoeffs[1] * base[1] as i32
-                            + hcoeffs[2] * base[2] as i32
-                            + hcoeffs[3] * base[3] as i32
-                            + hcoeffs[4] * base[4] as i32
-                            + hcoeffs[5] * base[5] as i32
-                            + hcoeffs[6] * base[6] as i32
-                            + hcoeffs[7] * base[7] as i32;
+                        let s: i32 = hcoeffs
+                            .iter()
+                            .zip(base.iter())
+                            .map(|(&k, &v)| k * v as i32)
+                            .sum();
                         pred[r * w + c] = clip3(0, max_val, round2(s, 7));
                     }
                 } else {
@@ -266,30 +263,11 @@ pub(crate) fn block_inter_predict_scalar(
                 let sx = x0 as usize;
                 for r in 0..h {
                     let ybase = (y0 - 3) as usize + r;
-                    let r0 = &ref_data[ybase * ref_stride + sx..ybase * ref_stride + sx + w];
-                    let r1 =
-                        &ref_data[(ybase + 1) * ref_stride + sx..(ybase + 1) * ref_stride + sx + w];
-                    let r2 =
-                        &ref_data[(ybase + 2) * ref_stride + sx..(ybase + 2) * ref_stride + sx + w];
-                    let r3 =
-                        &ref_data[(ybase + 3) * ref_stride + sx..(ybase + 3) * ref_stride + sx + w];
-                    let r4 =
-                        &ref_data[(ybase + 4) * ref_stride + sx..(ybase + 4) * ref_stride + sx + w];
-                    let r5 =
-                        &ref_data[(ybase + 5) * ref_stride + sx..(ybase + 5) * ref_stride + sx + w];
-                    let r6 =
-                        &ref_data[(ybase + 6) * ref_stride + sx..(ybase + 6) * ref_stride + sx + w];
-                    let r7 =
-                        &ref_data[(ybase + 7) * ref_stride + sx..(ybase + 7) * ref_stride + sx + w];
                     for c in 0..w {
-                        let s = vcoeffs[0] * r0[c] as i32
-                            + vcoeffs[1] * r1[c] as i32
-                            + vcoeffs[2] * r2[c] as i32
-                            + vcoeffs[3] * r3[c] as i32
-                            + vcoeffs[4] * r4[c] as i32
-                            + vcoeffs[5] * r5[c] as i32
-                            + vcoeffs[6] * r6[c] as i32
-                            + vcoeffs[7] * r7[c] as i32;
+                        let mut s = 0i32;
+                        for (t, &coeff) in vcoeffs.iter().enumerate() {
+                            s += coeff * ref_data[(ybase + t) * ref_stride + sx + c] as i32;
+                        }
                         pred[r * w + c] = clip3(0, max_val, round2(s, 7));
                     }
                 }

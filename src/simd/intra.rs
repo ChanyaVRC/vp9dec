@@ -31,37 +31,26 @@ pub unsafe fn intra_pred_fill_avx2(
     debug_assert!((start_y + size - 1) * plane_width + start_x + size <= plane_data.len());
 
     let base = plane_data.as_mut_ptr();
-    match size {
-        4 => {
-            let v = _mm_set1_epi16(val as i16);
-            for i in 0..4 {
-                let row = base.add((start_y + i) * plane_width + start_x);
+    if size <= 8 {
+        let v = _mm_set1_epi16(val as i16);
+        for i in 0..size {
+            let row = base.add((start_y + i) * plane_width + start_x);
+            if size == 4 {
                 _mm_storel_epi64(row as *mut __m128i, v);
-            }
-        }
-        8 => {
-            let v = _mm_set1_epi16(val as i16);
-            for i in 0..8 {
-                let row = base.add((start_y + i) * plane_width + start_x);
+            } else {
                 _mm_storeu_si128(row as *mut __m128i, v);
             }
         }
-        16 => {
-            let v = _mm256_set1_epi16(val as i16);
-            for i in 0..16 {
-                let row = base.add((start_y + i) * plane_width + start_x);
-                _mm256_storeu_si256(row as *mut __m256i, v);
+    } else {
+        let v = _mm256_set1_epi16(val as i16);
+        for i in 0..size {
+            let row = base.add((start_y + i) * plane_width + start_x);
+            let mut j = 0usize;
+            while j < size {
+                _mm256_storeu_si256(row.add(j) as *mut __m256i, v);
+                j += 16;
             }
         }
-        32 => {
-            let v = _mm256_set1_epi16(val as i16);
-            for i in 0..32 {
-                let row = base.add((start_y + i) * plane_width + start_x);
-                _mm256_storeu_si256(row as *mut __m256i, v);
-                _mm256_storeu_si256(row.add(16) as *mut __m256i, v);
-            }
-        }
-        _ => unreachable!("intra_pred_fill_avx2: invalid block size {size}"),
     }
 }
 
@@ -89,38 +78,34 @@ pub unsafe fn intra_pred_v_avx2(
 
     let base = plane_data.as_mut_ptr();
     let src = above.as_ptr();
-    match size {
-        4 => {
-            let v = _mm_loadl_epi64(src as *const __m128i);
-            for i in 0..4 {
-                let row = base.add((start_y + i) * plane_width + start_x);
+    if size <= 8 {
+        let v = if size == 4 {
+            _mm_loadl_epi64(src as *const __m128i)
+        } else {
+            _mm_loadu_si128(src as *const __m128i)
+        };
+        for i in 0..size {
+            let row = base.add((start_y + i) * plane_width + start_x);
+            if size == 4 {
                 _mm_storel_epi64(row as *mut __m128i, v);
-            }
-        }
-        8 => {
-            let v = _mm_loadu_si128(src as *const __m128i);
-            for i in 0..8 {
-                let row = base.add((start_y + i) * plane_width + start_x);
+            } else {
                 _mm_storeu_si128(row as *mut __m128i, v);
             }
         }
-        16 => {
-            let v = _mm256_loadu_si256(src as *const __m256i);
-            for i in 0..16 {
-                let row = base.add((start_y + i) * plane_width + start_x);
-                _mm256_storeu_si256(row as *mut __m256i, v);
-            }
-        }
-        32 => {
-            let v0 = _mm256_loadu_si256(src as *const __m256i);
-            let v1 = _mm256_loadu_si256(src.add(16) as *const __m256i);
-            for i in 0..32 {
-                let row = base.add((start_y + i) * plane_width + start_x);
-                _mm256_storeu_si256(row as *mut __m256i, v0);
+    } else {
+        let v0 = _mm256_loadu_si256(src as *const __m256i);
+        let v1 = if size == 32 {
+            _mm256_loadu_si256(src.add(16) as *const __m256i)
+        } else {
+            v0
+        };
+        for i in 0..size {
+            let row = base.add((start_y + i) * plane_width + start_x);
+            _mm256_storeu_si256(row as *mut __m256i, v0);
+            if size == 32 {
                 _mm256_storeu_si256(row.add(16) as *mut __m256i, v1);
             }
         }
-        _ => unreachable!("intra_pred_v_avx2: invalid block size {size}"),
     }
 }
 
@@ -147,37 +132,26 @@ pub unsafe fn intra_pred_h_avx2(
     debug_assert!((start_y + size - 1) * plane_width + start_x + size <= plane_data.len());
 
     let base = plane_data.as_mut_ptr();
-    match size {
-        4 => {
-            for (i, &lv) in left[..4].iter().enumerate() {
-                let v = _mm_set1_epi16(lv as i16);
-                let row = base.add((start_y + i) * plane_width + start_x);
+    if size <= 8 {
+        for (i, &lv) in left[..size].iter().enumerate() {
+            let v = _mm_set1_epi16(lv as i16);
+            let row = base.add((start_y + i) * plane_width + start_x);
+            if size == 4 {
                 _mm_storel_epi64(row as *mut __m128i, v);
-            }
-        }
-        8 => {
-            for (i, &lv) in left[..8].iter().enumerate() {
-                let v = _mm_set1_epi16(lv as i16);
-                let row = base.add((start_y + i) * plane_width + start_x);
+            } else {
                 _mm_storeu_si128(row as *mut __m128i, v);
             }
         }
-        16 => {
-            for (i, &lv) in left[..16].iter().enumerate() {
-                let v = _mm256_set1_epi16(lv as i16);
-                let row = base.add((start_y + i) * plane_width + start_x);
-                _mm256_storeu_si256(row as *mut __m256i, v);
+    } else {
+        for (i, &lv) in left[..size].iter().enumerate() {
+            let v = _mm256_set1_epi16(lv as i16);
+            let row = base.add((start_y + i) * plane_width + start_x);
+            let mut j = 0usize;
+            while j < size {
+                _mm256_storeu_si256(row.add(j) as *mut __m256i, v);
+                j += 16;
             }
         }
-        32 => {
-            for (i, &lv) in left[..32].iter().enumerate() {
-                let v = _mm256_set1_epi16(lv as i16);
-                let row = base.add((start_y + i) * plane_width + start_x);
-                _mm256_storeu_si256(row as *mut __m256i, v);
-                _mm256_storeu_si256(row.add(16) as *mut __m256i, v);
-            }
-        }
-        _ => unreachable!("intra_pred_h_avx2: invalid block size {size}"),
     }
 }
 
@@ -195,46 +169,28 @@ unsafe fn sum_u16_avx2(samples: &[u16], size: usize) -> i32 {
     debug_assert!(samples[..size].iter().all(|&v| v <= 4095));
 
     let ptr = samples.as_ptr();
-    match size {
-        4 => {
-            let v = _mm_loadl_epi64(ptr as *const __m128i);
-            let pairs = _mm_madd_epi16(v, _mm_set1_epi16(1));
-            let s = _mm_add_epi32(pairs, _mm_srli_si128(pairs, 4));
-            _mm_cvtsi128_si32(s)
-        }
-        8 => {
-            let v = _mm_loadu_si128(ptr as *const __m128i);
-            let pairs = _mm_madd_epi16(v, _mm_set1_epi16(1));
-            let s2 = _mm_add_epi32(pairs, _mm_srli_si128(pairs, 8));
-            let s1 = _mm_add_epi32(s2, _mm_srli_si128(s2, 4));
-            _mm_cvtsi128_si32(s1)
-        }
-        16 => {
-            let v = _mm256_loadu_si256(ptr as *const __m256i);
-            let pairs = _mm256_madd_epi16(v, _mm256_set1_epi16(1));
-            let s128 = _mm_add_epi32(
-                _mm256_castsi256_si128(pairs),
-                _mm256_extracti128_si256(pairs, 1),
-            );
-            let s2 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
-            let s1 = _mm_add_epi32(s2, _mm_srli_si128(s2, 4));
-            _mm_cvtsi128_si32(s1)
-        }
-        32 => {
-            let ones = _mm256_set1_epi16(1);
-            let v0 = _mm256_loadu_si256(ptr as *const __m256i);
-            let v1 = _mm256_loadu_si256(ptr.add(16) as *const __m256i);
-            let pairs = _mm256_add_epi32(_mm256_madd_epi16(v0, ones), _mm256_madd_epi16(v1, ones));
-            let s128 = _mm_add_epi32(
-                _mm256_castsi256_si128(pairs),
-                _mm256_extracti128_si256(pairs, 1),
-            );
-            let s2 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
-            let s1 = _mm_add_epi32(s2, _mm_srli_si128(s2, 4));
-            _mm_cvtsi128_si32(s1)
-        }
-        _ => unreachable!("sum_u16_avx2: invalid block size {size}"),
+    if size == 4 {
+        let pairs = _mm_madd_epi16(_mm_loadl_epi64(ptr as *const __m128i), _mm_set1_epi16(1));
+        return _mm_cvtsi128_si32(_mm_add_epi32(pairs, _mm_srli_si128(pairs, 4)));
     }
+    let s128 = if size == 8 {
+        _mm_madd_epi16(_mm_loadu_si128(ptr as *const __m128i), _mm_set1_epi16(1))
+    } else {
+        let ones = _mm256_set1_epi16(1);
+        let mut pairs = _mm256_madd_epi16(_mm256_loadu_si256(ptr as *const __m256i), ones);
+        if size == 32 {
+            pairs = _mm256_add_epi32(
+                pairs,
+                _mm256_madd_epi16(_mm256_loadu_si256(ptr.add(16) as *const __m256i), ones),
+            );
+        }
+        _mm_add_epi32(
+            _mm256_castsi256_si128(pairs),
+            _mm256_extracti128_si256(pairs, 1),
+        )
+    };
+    let s2 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+    _mm_cvtsi128_si32(_mm_add_epi32(s2, _mm_srli_si128(s2, 4)))
 }
 
 /// AVX2 `DC_PRED` (spec §8.5.1): handles all four neighbor-availability variants
@@ -318,63 +274,49 @@ pub unsafe fn intra_pred_tm_avx2(
 
     let base = plane_data.as_mut_ptr();
     let max_val = ((1i32 << bit_depth) - 1) as i16;
-    match size {
-        4 => {
-            let zero = _mm_setzero_si128();
-            let max_v = _mm_set1_epi16(max_val);
-            let tl = _mm_set1_epi16(top_left as i16);
-            let diff = _mm_sub_epi16(_mm_loadl_epi64(above.as_ptr() as *const __m128i), tl);
-            for (i, &lv) in left[..4].iter().enumerate() {
-                let sum = _mm_add_epi16(diff, _mm_set1_epi16(lv as i16));
-                let clipped = _mm_min_epi16(_mm_max_epi16(sum, zero), max_v);
-                let row = base.add((start_y + i) * plane_width + start_x);
+    if size <= 8 {
+        let zero = _mm_setzero_si128();
+        let max_v = _mm_set1_epi16(max_val);
+        let tl = _mm_set1_epi16(top_left as i16);
+        let above_v = if size == 4 {
+            _mm_loadl_epi64(above.as_ptr() as *const __m128i)
+        } else {
+            _mm_loadu_si128(above.as_ptr() as *const __m128i)
+        };
+        let diff = _mm_sub_epi16(above_v, tl);
+        for (i, &lv) in left[..size].iter().enumerate() {
+            let sum = _mm_add_epi16(diff, _mm_set1_epi16(lv as i16));
+            let clipped = _mm_min_epi16(_mm_max_epi16(sum, zero), max_v);
+            let row = base.add((start_y + i) * plane_width + start_x);
+            if size == 4 {
                 _mm_storel_epi64(row as *mut __m128i, clipped);
-            }
-        }
-        8 => {
-            let zero = _mm_setzero_si128();
-            let max_v = _mm_set1_epi16(max_val);
-            let tl = _mm_set1_epi16(top_left as i16);
-            let diff = _mm_sub_epi16(_mm_loadu_si128(above.as_ptr() as *const __m128i), tl);
-            for (i, &lv) in left[..8].iter().enumerate() {
-                let sum = _mm_add_epi16(diff, _mm_set1_epi16(lv as i16));
-                let clipped = _mm_min_epi16(_mm_max_epi16(sum, zero), max_v);
-                let row = base.add((start_y + i) * plane_width + start_x);
+            } else {
                 _mm_storeu_si128(row as *mut __m128i, clipped);
             }
         }
-        16 => {
-            let zero = _mm256_setzero_si256();
-            let max_v = _mm256_set1_epi16(max_val);
-            let tl = _mm256_set1_epi16(top_left as i16);
-            let diff = _mm256_sub_epi16(_mm256_loadu_si256(above.as_ptr() as *const __m256i), tl);
-            for (i, &lv) in left[..16].iter().enumerate() {
-                let sum = _mm256_add_epi16(diff, _mm256_set1_epi16(lv as i16));
-                let clipped = _mm256_min_epi16(_mm256_max_epi16(sum, zero), max_v);
-                let row = base.add((start_y + i) * plane_width + start_x);
-                _mm256_storeu_si256(row as *mut __m256i, clipped);
-            }
-        }
-        32 => {
-            let zero = _mm256_setzero_si256();
-            let max_v = _mm256_set1_epi16(max_val);
-            let tl = _mm256_set1_epi16(top_left as i16);
-            let diff0 = _mm256_sub_epi16(_mm256_loadu_si256(above.as_ptr() as *const __m256i), tl);
-            let diff1 = _mm256_sub_epi16(
+    } else {
+        let zero = _mm256_setzero_si256();
+        let max_v = _mm256_set1_epi16(max_val);
+        let tl = _mm256_set1_epi16(top_left as i16);
+        let diff0 = _mm256_sub_epi16(_mm256_loadu_si256(above.as_ptr() as *const __m256i), tl);
+        let diff1 = if size == 32 {
+            _mm256_sub_epi16(
                 _mm256_loadu_si256(above.as_ptr().add(16) as *const __m256i),
                 tl,
-            );
-            for (i, &lv) in left[..32].iter().enumerate() {
-                let lvec = _mm256_set1_epi16(lv as i16);
-                let c0 =
-                    _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(diff0, lvec), zero), max_v);
+            )
+        } else {
+            diff0
+        };
+        for (i, &lv) in left[..size].iter().enumerate() {
+            let lvec = _mm256_set1_epi16(lv as i16);
+            let c0 = _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(diff0, lvec), zero), max_v);
+            let row = base.add((start_y + i) * plane_width + start_x);
+            _mm256_storeu_si256(row as *mut __m256i, c0);
+            if size == 32 {
                 let c1 =
                     _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(diff1, lvec), zero), max_v);
-                let row = base.add((start_y + i) * plane_width + start_x);
-                _mm256_storeu_si256(row as *mut __m256i, c0);
                 _mm256_storeu_si256(row.add(16) as *mut __m256i, c1);
             }
         }
-        _ => unreachable!("intra_pred_tm_avx2: invalid block size {size}"),
     }
 }
