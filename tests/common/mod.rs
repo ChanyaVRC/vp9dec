@@ -19,7 +19,13 @@ use vp9dec::ivf::{IvfHeader, IvfReader};
 use vp9dec::{Frame, PlaneData};
 
 /// `tests/vectors/`, where downloaded conformance vectors live (see README.md).
+/// Can be overridden with `VP9DEC_VECTORS_DIR` (e.g. to share a local corpus across worktrees).
 pub fn vectors_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("VP9DEC_VECTORS_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("vectors")
