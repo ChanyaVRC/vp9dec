@@ -9,9 +9,8 @@
 //! scratch so small blocks never pay a 34 KB zero-fill. `predict.rs` owns the dispatch and the
 //! scalar fallback; this module owns only the vector kernels.
 
-use crate::predict::{MAX_BLOCK_DIM, MAX_INTERMEDIATE_HEIGHT};
 use crate::prob_tables::BILINEAR;
-use crate::subpel::SUBPEL_FILTERS;
+use crate::subpel::{MAX_BLOCK_DIM, MAX_INTERMEDIATE_HEIGHT, SUBPEL_FILTERS};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 

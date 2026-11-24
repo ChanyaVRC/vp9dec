@@ -96,3 +96,10 @@ pub const SUBPEL_SHIFTS: i32 = 16;
 pub const SUBPEL_MASK: i32 = 15;
 /// `INTERP_EXTEND` (spec §3). Used in motion vector clamping.
 pub const INTERP_EXTEND: i32 = 4;
+
+/// Max output block dimension for a single `predict_inter` call (64x64).
+pub(crate) const MAX_BLOCK_DIM: usize = 64;
+
+/// Max rows needed in the intermediate (horizontal-filter) buffer under spec §8.5.2.3's 2x
+/// reference-scaling bound: `(((MAX_BLOCK_DIM - 1) * 32 + 15) >> 4) + 8 == 134`.
+pub(crate) const MAX_INTERMEDIATE_HEIGHT: usize = 134;

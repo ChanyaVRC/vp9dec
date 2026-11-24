@@ -8,7 +8,8 @@ use crate::prob_tables::{
     BLOCK_8X8, INTRA_FRAME, NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP,
 };
 use crate::subpel::{
-    INTERP_EXTEND, REF_SCALE_SHIFT, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, SUBPEL_SHIFTS,
+    INTERP_EXTEND, MAX_BLOCK_DIM, MAX_INTERMEDIATE_HEIGHT, REF_SCALE_SHIFT, SUBPEL_BITS,
+    SUBPEL_FILTERS, SUBPEL_MASK, SUBPEL_SHIFTS,
 };
 use crate::tile::Mv;
 
@@ -169,13 +170,6 @@ fn scale_mv_for_plane(
     let start_y = (base_y << SUBPEL_BITS) + d_y;
     (start_x, start_y, step_x, step_y)
 }
-
-/// Max output block dimension for a single `predict_inter` call (64x64).
-pub(crate) const MAX_BLOCK_DIM: usize = 64;
-
-/// Max rows needed in the intermediate (horizontal-filter) buffer under spec §8.5.2.3's 2x
-/// reference-scaling bound: `(((MAX_BLOCK_DIM - 1) * 32 + 15) >> 4) + 8 == 134`.
-pub(crate) const MAX_INTERMEDIATE_HEIGHT: usize = 134;
 
 /// Scalar body of [`block_inter_predict_into_plane`] (spec §8.5.2.4 two-pass loops): the
 /// always-kept fallback and bit-exactness oracle `tests/unit/simd.rs` pins AVX2 against.

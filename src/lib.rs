@@ -488,6 +488,102 @@ impl Decoder {
         Ok(decoded)
     }
 
+    /// Resolves this frame's effective [`ColorConfig`] and remembers it when `frame_is_intra`.
+    ///
+    /// `header.color_config` is `Some` on key frames and intra-only frames; inter frames inherit
+    /// the most recent intra frame's config (falling back to a neutral 8-bit 4:2:0 placeholder if
+    /// an inter frame arrives before any intra frame).
+    fn resolve_color_config(&mut self, header: &header::NewFrameHeader) -> ColorConfig {
+        let color_config = header.color_config.unwrap_or_else(|| {
+            self.last_color_config.unwrap_or(ColorConfig {
+                bit_depth: 8,
+                color_space: CS_UNKNOWN,
+                color_range: false,
+                subsampling_x: 1,
+                subsampling_y: 1,
+            })
+        });
+        if header.frame_is_intra {
+            self.last_color_config = Some(color_config);
+        }
+        color_config
+    }
+
+    /// Runs `setup_past_independence()`'s `save_probs` context resets (spec §7.2) when
+    /// `FrameIsIntra || error_resilient_mode`.
+    fn reset_frame_contexts_if_needed(&mut self, header: &header::NewFrameHeader) {
+        if header.frame_is_intra || header.error_resilient_mode {
+            match frame_context_reset(
+                header.frame_type,
+                header.error_resilient_mode,
+                header.reset_frame_context,
+                header.frame_context_idx,
+            ) {
+                FrameContextReset::All => self.frame_contexts.reset_all(),
+                FrameContextReset::Slot(idx) => {
+                    self.frame_contexts.save(idx, FrameContext::default())
+                }
+                FrameContextReset::None => {}
+            }
+        }
+    }
+
+    /// Resolves the 3 DPB reference slots for an inter frame (cheap `Arc` bumps) and validates
+    /// that every present reference matches this frame's bit depth and chroma subsampling
+    /// (spec §8.5.1 / libvpx `valid_ref_frame_img_fmt`).
+    ///
+    /// Reference *sizes* are deliberately validated at block use time in `decode_block` rather
+    /// than here, because a conformant stream (e.g. 3-layer spatial SVC) may list an out-of-range
+    /// slot it never predicts from.
+    fn resolve_and_validate_refs(
+        &self,
+        header: &header::NewFrameHeader,
+        color_config: &ColorConfig,
+    ) -> Result<[Option<Arc<RefFrameData>>; 3], DecodeError> {
+        let resolved_refs: [Option<Arc<RefFrameData>>; 3] = if header.frame_is_intra {
+            [None, None, None]
+        } else {
+            std::array::from_fn(|i| self.dpb.get_arc(header.ref_frame_idx[i]))
+        };
+        for r in resolved_refs.iter().flatten() {
+            if r.bit_depth != color_config.bit_depth
+                || r.subsampling_x != color_config.subsampling_x as u32
+                || r.subsampling_y != color_config.subsampling_y as u32
+            {
+                return Err(DecodeError::Header(HeaderError::RefFrameFormatMismatch));
+            }
+        }
+        Ok(resolved_refs)
+    }
+
+    /// Updates cross-frame persistent state (dimensions, show flag, loop-filter deltas,
+    /// segmentation feature persistence, and `LastFrameType`) after a newly decoded frame.
+    fn update_persistent_state(&mut self, header: &header::NewFrameHeader) {
+        // compute_image_size is never called for show_existing_frame, so by the time we
+        // reach here it has always been called (spec §7.2.6). Recorded for UsePrevFrameMvs.
+        self.prev_frame_dims = Some((header.width, header.height));
+        self.prev_show_frame = Some(header.show_frame);
+        self.persist.loop_filter_deltas = LoopFilterDeltas {
+            ref_deltas: header.loop_filter.ref_deltas,
+            mode_deltas: header.loop_filter.mode_deltas,
+        };
+        self.persist.segmentation = SegFeaturePersist {
+            enabled: header.segmentation.feature_enabled,
+            data: header.segmentation.feature_data,
+            abs_or_delta: header.segmentation.abs_or_delta_update,
+        };
+        self.last_frame_type = Some(header.frame_type);
+    }
+
+    /// Stores `mi_grid` as `prev_mi_grid` and recycles the replaced allocation when unshared.
+    fn store_and_recycle_mi_grid(&mut self, mi_grid: MiGrid) {
+        if let Some(old_grid) = self.prev_mi_grid.replace(Arc::new(mi_grid)) {
+            if let Ok(owned) = Arc::try_unwrap(old_grid) {
+                self.mi_grid_pool = Some(owned);
+            }
+        }
+    }
+
     /// Decodes exactly one VP9 frame (not a container chunk -- see [`Decoder::decode_frame`],
     /// the public entry point, which splits a chunk into these via
     /// `superframe::split_superframe`).
@@ -517,28 +613,11 @@ impl Decoder {
             }
         };
 
-        // header.color_config is Some exactly when frame_is_intra (see header.rs); resolve it
-        // once, here, to the value that applies to this frame. Reproduces the old
-        // fabricate-then-patch behavior exactly, including its degenerate-case fallback (an
-        // inter frame appearing before any intra frame ever ran): the same fixed placeholder
-        // color config that header.rs used to fabricate for every non-intra frame.
-        let color_config = header.color_config.unwrap_or_else(|| {
-            self.last_color_config.unwrap_or(ColorConfig {
-                bit_depth: 8,
-                color_space: CS_UNKNOWN,
-                color_range: false,
-                subsampling_x: 1,
-                subsampling_y: 1,
-            })
-        });
-        if header.frame_is_intra {
-            self.last_color_config = Some(color_config);
-        }
+        let color_config = self.resolve_color_config(&header);
 
-        let header_size = header.header_size_in_bytes as usize;
         let compressed_start = consumed;
         let compressed_end = compressed_start
-            .checked_add(header_size)
+            .checked_add(header.header_size_in_bytes as usize)
             .ok_or(DecodeError::TruncatedFrame)?;
         if compressed_end > frame_data.len() {
             return Err(DecodeError::TruncatedFrame);
@@ -552,8 +631,7 @@ impl Decoder {
             && self.prev_show_frame == Some(true);
 
         // Reject an absurd frame size before it reaches the buffer allocations below (which
-        // use `vec![]` and would abort the process on failure, not return an error). A
-        // malformed header can signal up to 65536x65536; see `MAX_FRAME_LUMA_SAMPLES`.
+        // use `vec![]` and would abort the process on failure, not return an error).
         if header.width as u64 * header.height as u64 > header::MAX_FRAME_LUMA_SAMPLES {
             return Err(DecodeError::Header(HeaderError::FrameSizeTooLarge));
         }
@@ -564,27 +642,8 @@ impl Decoder {
             &image_size,
             header.frame_is_intra || header.error_resilient_mode,
         );
+        self.reset_frame_contexts_if_needed(&header);
 
-        // setup_past_independence() (spec §7.2): called only when FrameIsIntra ||
-        // error_resilient_mode. Its `save_probs` calls reset 0, 1, or all 4 stored
-        // frame context slots to defaults depending on reset_frame_context (see
-        // `frame_context_reset`). The load/save below use `effective_frame_context_idx()`,
-        // which is 0 in this branch; the raw `frame_context_idx` passed here is the
-        // pre-forcing value the `reset_frame_context == 2` `save_probs` targets.
-        if header.frame_is_intra || header.error_resilient_mode {
-            match frame_context_reset(
-                header.frame_type,
-                header.error_resilient_mode,
-                header.reset_frame_context,
-                header.frame_context_idx,
-            ) {
-                FrameContextReset::All => self.frame_contexts.reset_all(),
-                FrameContextReset::Slot(idx) => {
-                    self.frame_contexts.save(idx, FrameContext::default())
-                }
-                FrameContextReset::None => {}
-            }
-        }
         // The starting value equivalent to `load_probs`/`load_probs2` (spec §6.1, start of
         // `frame()`). Kept around after the compressed_header call because `refresh_probs()`
         // (spec §6.1.2) restores it to this pre-forward-update value before applying
@@ -598,32 +657,7 @@ impl Decoder {
             parse_compressed_header(compressed_bytes, &header, starting_probs.clone())?
         };
 
-        // Resolve the pixel data of the DPB slots this frame references, for motion
-        // compensation (spec §8.5.2.3-8.5.2.4). Not referenced when `FrameIsIntra == 1`.
-        // `get_arc` is a refcount bump, not a deep copy of the referenced frame's pixels.
-        let resolved_refs: [Option<Arc<RefFrameData>>; 3] = if header.frame_is_intra {
-            [None, None, None]
-        } else {
-            std::array::from_fn(|i| self.dpb.get_arc(header.ref_frame_idx[i]))
-        };
-
-        // Spec §8.5.1 / libvpx `valid_ref_frame_img_fmt`: an inter frame's references must share
-        // its bit depth and chroma subsampling. Reject a stream mixing sample formats (the
-        // `mixedrefcsp` vector) here rather than mis-predicting across them below.
-        for r in resolved_refs.iter().flatten() {
-            if r.bit_depth != color_config.bit_depth
-                || r.subsampling_x != color_config.subsampling_x as u32
-                || r.subsampling_y != color_config.subsampling_y as u32
-            {
-                return Err(DecodeError::Header(HeaderError::RefFrameFormatMismatch));
-            }
-        }
-        // NOTE: reference *sizes* are deliberately NOT validated here. Spec §8.5.2.3's 2x
-        // scaling bound applies per reference a block actually uses, and a conformant stream
-        // may list an out-of-range slot it never predicts from (3-layer spatial SVC: a base-
-        // layer frame's ref_frame_idx can point at a 4x-larger enhancement-layer frame --
-        // `vp90-2-22-svc_1280x720_3` does). The bound is enforced at use time in
-        // `decode_block` (`TileError::RefFrameSizeOutOfRange`).
+        let resolved_refs = self.resolve_and_validate_refs(&header, &color_config)?;
 
         let tile_data = &frame_data[compressed_end..];
         let prev_grid = if use_prev_frame_mvs {
@@ -658,10 +692,7 @@ impl Decoder {
             )?;
         }
         // Spec §8.1 step 2: "If loop_filter_level is not equal to 0, the loop filter
-        // process ... is invoked" -- the whole process (including §8.8.1's frame init,
-        // which can raise a per-block level above 0 via loop_filter_ref_deltas even when
-        // the frame-level loop_filter_level is 0) is gated on this frame-level value, not
-        // just the per-edge computed level.
+        // process ... is invoked" -- gated on the frame-level value, not per-edge deltas.
         if header.loop_filter.level != 0 {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::LoopFilter);
             tile_decoder.apply_loop_filter_with_pool(&header.loop_filter, &mut self.thread_pool);
@@ -686,34 +717,8 @@ impl Decoder {
                 .save(header.effective_frame_context_idx(), final_probs);
         }
 
-        // compute_image_size is never called for show_existing_frame, so by the time we
-        // reach here it has always been called (spec §7.2.6). Recorded for UsePrevFrameMvs.
-        self.prev_frame_dims = Some((header.width, header.height));
-        self.prev_show_frame = Some(header.show_frame);
-        self.persist.loop_filter_deltas = LoopFilterDeltas {
-            ref_deltas: header.loop_filter.ref_deltas,
-            mode_deltas: header.loop_filter.mode_deltas,
-        };
-        self.persist.segmentation = SegFeaturePersist {
-            enabled: header.segmentation.feature_enabled,
-            data: header.segmentation.feature_data,
-            abs_or_delta: header.segmentation.abs_or_delta_update,
-        };
-        self.last_frame_type = Some(header.frame_type);
-        let info = FrameDecodeInfo {
-            intra_only: header.intra_only,
-            frame_is_intra: header.frame_is_intra,
-            reset_frame_context: header.reset_frame_context,
-            segmentation_enabled: header.segmentation.enabled,
-            seg_features_active: std::array::from_fn(|level| {
-                header.segmentation.enabled
-                    && header
-                        .segmentation
-                        .feature_enabled
-                        .iter()
-                        .any(|seg| seg[level])
-            }),
-        };
+        self.update_persistent_state(&header);
+        let info = build_frame_decode_info(&header);
 
         let frame = if header.show_frame {
             Some(crop_to_frame(
@@ -730,15 +735,28 @@ impl Decoder {
         // buffers have strong count 1 and recycle cleanly into our pools with zero copy.
         let (planes, mi_grid) = tile_decoder.into_parts();
         self.refresh_reference_frames(&header, &color_config, planes);
-        if let Some(old_grid) = self.prev_mi_grid.replace(Arc::new(mi_grid)) {
-            if let Ok(owned) = Arc::try_unwrap(old_grid) {
-                self.mi_grid_pool = Some(owned);
-            }
-        }
+        self.store_and_recycle_mi_grid(mi_grid);
         Ok(DecodedFrame {
             info: Some(info),
             frame,
         })
+    }
+}
+
+fn build_frame_decode_info(header: &header::NewFrameHeader) -> FrameDecodeInfo {
+    FrameDecodeInfo {
+        intra_only: header.intra_only,
+        frame_is_intra: header.frame_is_intra,
+        reset_frame_context: header.reset_frame_context,
+        segmentation_enabled: header.segmentation.enabled,
+        seg_features_active: std::array::from_fn(|level| {
+            header.segmentation.enabled
+                && header
+                    .segmentation
+                    .feature_enabled
+                    .iter()
+                    .any(|seg| seg[level])
+        }),
     }
 }
 

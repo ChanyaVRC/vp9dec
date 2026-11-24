@@ -71,7 +71,7 @@ pub enum TileError {
     /// Spec §8.5.2.3's conformance bounds (`2 * FrameWidth >= RefFrameWidth[ refIdx ]` and the
     /// height analog) cap the motion-compensation scaling step at 32 (1/16-pel units), and
     /// every scaled inter-prediction scratch buffer (scalar and AVX2; see
-    /// `predict::MAX_INTERMEDIATE_HEIGHT`) is sized to exactly that bound -- a malformed
+    /// `subpel::MAX_INTERMEDIATE_HEIGHT`) is sized to exactly that bound -- a malformed
     /// stream using a larger ratio is rejected here instead of overflowing them. Checked per
     /// block, not at reference resolution: a conformant stream may *list* an out-of-range
     /// slot it never predicts from (3-layer SVC does; see `Decoder::decode_one_frame`).
@@ -853,7 +853,7 @@ impl TileDecoder {
                         None => return Err(TileError::MissingReference),
                         // Spec §8.5.2.3's conformance bound (2x per axis) caps the reference-
                         // scaling step at 32; the motion-compensation scratch buffers (scalar
-                        // and AVX2, `predict::MAX_INTERMEDIATE_HEIGHT`) are sized to exactly
+                        // and AVX2, `subpel::MAX_INTERMEDIATE_HEIGHT`) are sized to exactly
                         // that. A larger ratio would overflow the scalar scratch's slice
                         // bounds (panic), so reject the block's reference before predicting.
                         Some(r)

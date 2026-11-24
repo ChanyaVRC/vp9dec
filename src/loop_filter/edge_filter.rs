@@ -114,12 +114,43 @@ pub(super) fn adaptive_filter_strength(lvl: i32, sharpness: u8, bit_depth: u8) -
     )
 }
 
+/// Direction of a loop-filter pass (spec §8.8): vertical edges first, then horizontal edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FilterPass {
+    /// `pass == 0`: vertical block/transform edges (`dx = 1, dy = 0`).
+    Vertical,
+    /// `pass == 1`: horizontal block/transform edges (`dx = 0, dy = 1`).
+    Horizontal,
+}
+
+impl FilterPass {
+    #[inline]
+    pub(super) fn step(self) -> (i64, i64) {
+        match self {
+            FilterPass::Vertical => (1, 0),
+            FilterPass::Horizontal => (0, 1),
+        }
+    }
+}
+
+/// Parameters shared across [`compute_filter_mask`] and [`sample_filtering`] for one edge.
+#[derive(Clone, Copy)]
+pub(super) struct EdgeFilterParams {
+    pub(super) dx: i64,
+    pub(super) dy: i64,
+    pub(super) limit: i32,
+    pub(super) blimit: i32,
+    pub(super) thresh: i32,
+    pub(super) filter_size: u8,
+    pub(super) bit_depth: u8,
+}
+
 /// Spec §8.8.3 "Filter size process".
 #[allow(clippy::too_many_arguments)]
 pub(super) fn filter_size_process(
     tx_sz: u8,
     is_32_edge: bool,
-    pass: u32,
+    pass: FilterPass,
     x: u32,
     y: u32,
     sub_x: u32,
@@ -133,8 +164,10 @@ pub(super) fn filter_size_process(
         tx_sz.min(TX_16X16)
     };
 
-    let luma_boundary = (pass == 0 && sub_x == 1 && (x >> 3) == mi_cols - 1)
-        || (pass == 1 && sub_y == 1 && (y >> 3) == mi_rows - 1);
+    let luma_boundary = match pass {
+        FilterPass::Vertical => sub_x == 1 && (x >> 3) == mi_cols - 1,
+        FilterPass::Horizontal => sub_y == 1 && (y >> 3) == mi_rows - 1,
+    };
     if base_size == TX_16X16 && luma_boundary {
         TX_8X8
     } else {
@@ -157,20 +190,13 @@ fn set_off<P: PlaneAccess>(plane: &mut P, x: usize, y: usize, dx: i64, dy: i64, 
 }
 
 /// Spec §8.8.5.1 "Filter mask process". Returns `(hevMask, filterMask, flatMask, flatMask2)`.
-#[allow(clippy::too_many_arguments)]
 fn compute_filter_mask<P: PlaneAccess>(
     plane: &P,
     x: usize,
     y: usize,
-    dx: i64,
-    dy: i64,
-    limit: i32,
-    blimit: i32,
-    thresh: i32,
-    filter_size: u8,
-    bit_depth: u8,
+    p: EdgeFilterParams,
 ) -> (bool, bool, bool, bool) {
-    let g = |k: i64| get_off(plane, x, y, dx, dy, k);
+    let g = |k: i64| get_off(plane, x, y, p.dx, p.dy, k);
     let q0 = g(0);
     let q1 = g(1);
     let q2 = g(2);
@@ -180,21 +206,21 @@ fn compute_filter_mask<P: PlaneAccess>(
     let p2 = g(-3);
     let p3 = g(-4);
 
-    let hev_mask = (p1 - p0).abs() > thresh || (q1 - q0).abs() > thresh;
+    let hev_mask = (p1 - p0).abs() > p.thresh || (q1 - q0).abs() > p.thresh;
 
-    let mut mask = (p3 - p2).abs() > limit;
-    mask |= (p2 - p1).abs() > limit;
-    mask |= (p1 - p0).abs() > limit;
-    mask |= (q1 - q0).abs() > limit;
-    mask |= (q2 - q1).abs() > limit;
-    mask |= (q3 - q2).abs() > limit;
-    mask |= (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > blimit;
+    let mut mask = (p3 - p2).abs() > p.limit;
+    mask |= (p2 - p1).abs() > p.limit;
+    mask |= (p1 - p0).abs() > p.limit;
+    mask |= (q1 - q0).abs() > p.limit;
+    mask |= (q2 - q1).abs() > p.limit;
+    mask |= (q3 - q2).abs() > p.limit;
+    mask |= (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > p.blimit;
     let filter_mask = !mask;
 
-    let threshold = 1i32 << (bit_depth - 8);
+    let threshold = 1i32 << (p.bit_depth - 8);
 
     let mut flat_mask = false;
-    if filter_size >= TX_8X8 {
+    if p.filter_size >= TX_8X8 {
         let mut m = (p1 - p0).abs() > threshold;
         m |= (q1 - q0).abs() > threshold;
         m |= (p2 - p0).abs() > threshold;
@@ -205,7 +231,7 @@ fn compute_filter_mask<P: PlaneAccess>(
     }
 
     let mut flat_mask2 = false;
-    if filter_size >= TX_16X16 {
+    if p.filter_size >= TX_16X16 {
         let q4 = g(4);
         let q5 = g(5);
         let q6 = g(6);
@@ -305,40 +331,22 @@ fn wide_filter<P: PlaneAccess>(
 }
 
 /// Spec §8.8.5 "Sample filtering process".
-#[allow(clippy::too_many_arguments)]
 pub(super) fn sample_filtering<P: PlaneAccess>(
     plane: &mut P,
     x: usize,
     y: usize,
-    dx: i64,
-    dy: i64,
-    limit: i32,
-    blimit: i32,
-    thresh: i32,
-    filter_size: u8,
-    bit_depth: u8,
+    p: EdgeFilterParams,
 ) {
-    let (hev_mask, filter_mask, flat_mask, flat_mask2) = compute_filter_mask(
-        plane,
-        x,
-        y,
-        dx,
-        dy,
-        limit,
-        blimit,
-        thresh,
-        filter_size,
-        bit_depth,
-    );
+    let (hev_mask, filter_mask, flat_mask, flat_mask2) = compute_filter_mask(plane, x, y, p);
 
     if !filter_mask {
         return;
     }
-    if filter_size == TX_4X4 || !flat_mask {
-        narrow_filter(plane, x, y, dx, dy, hev_mask, bit_depth);
-    } else if filter_size == TX_8X8 || !flat_mask2 {
-        wide_filter(plane, x, y, dx, dy, 3);
+    if p.filter_size == TX_4X4 || !flat_mask {
+        narrow_filter(plane, x, y, p.dx, p.dy, hev_mask, p.bit_depth);
+    } else if p.filter_size == TX_8X8 || !flat_mask2 {
+        wide_filter(plane, x, y, p.dx, p.dy, 3);
     } else {
-        wide_filter(plane, x, y, dx, dy, 4);
+        wide_filter(plane, x, y, p.dx, p.dy, 4);
     }
 }

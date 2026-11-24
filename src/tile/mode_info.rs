@@ -35,6 +35,36 @@ pub(super) struct NeighborRefInfo {
     pub(super) above_single: bool,
 }
 
+/// Sentinel used by [`TileDecoder::interp_filter_ctx`] when a neighbor is unavailable, intra,
+/// or disagrees with the other neighbor (spec §9.3.2).
+const INTERP_FILTER_UNSET: u8 = 3;
+
+impl MiInfo {
+    fn new_intra(
+        skip: bool,
+        tx_size: u8,
+        mi_size: u8,
+        y_mode: u8,
+        uv_mode: u8,
+        sub_modes: [u8; 4],
+        segment_id: u8,
+    ) -> Self {
+        Self {
+            skip,
+            tx_size,
+            mi_size,
+            y_mode,
+            uv_mode,
+            sub_modes,
+            segment_id,
+            ref_frame: [INTRA_FRAME, REF_NONE],
+            mv: [[0, 0]; 2],
+            sub_mvs: [[[0, 0]; 4]; 2],
+            interp_filter: 0,
+        }
+    }
+}
+
 impl TileDecoder {
     /// `seg_feature_active( feature )` (spec §6.4.9).
     fn seg_feature_active(&self, segment_id: u8, feature: usize) -> bool {
@@ -254,19 +284,9 @@ impl TileDecoder {
             KF_UV_MODE_PROBS[y_mode as usize][node]
         }) as u8;
 
-        Ok(MiInfo {
-            skip,
-            tx_size,
-            mi_size,
-            y_mode,
-            uv_mode,
-            sub_modes,
-            segment_id,
-            ref_frame: [INTRA_FRAME, REF_NONE],
-            mv: [[0, 0]; 2],
-            sub_mvs: [[[0, 0]; 4]; 2],
-            interp_filter: 0,
-        })
+        Ok(MiInfo::new_intra(
+            skip, tx_size, mi_size, y_mode, uv_mode, sub_modes, segment_id,
+        ))
     }
 
     // =========================================================================
@@ -405,19 +425,9 @@ impl TileDecoder {
             self.counts.uv_mode[y_mode as usize][uv_mode as usize] += 1;
         }
 
-        Ok(MiInfo {
-            skip,
-            tx_size,
-            mi_size,
-            y_mode,
-            uv_mode,
-            sub_modes,
-            segment_id,
-            ref_frame: [INTRA_FRAME, REF_NONE],
-            mv: [[0, 0]; 2],
-            sub_mvs: [[[0, 0]; 4]; 2],
-            interp_filter: 0,
-        })
+        Ok(MiInfo::new_intra(
+            skip, tx_size, mi_size, y_mode, uv_mode, sub_modes, segment_id,
+        ))
     }
 
     /// `read_ref_frames( )` (spec §6.4.17).
@@ -481,28 +491,114 @@ impl TileDecoder {
         }
     }
 
-    /// Context derivation for `interp_filter` (spec §9.3.2). `3` is a sentinel value meaning
-    /// "at least one of the two neighboring blocks is intra, or the filters disagree".
+    /// Context derivation for `interp_filter` (spec §9.3.2). [`INTERP_FILTER_UNSET`] is a
+    /// sentinel value meaning "at least one of the two neighboring blocks is intra, or the
+    /// filters disagree".
     fn interp_filter_ctx(&self, row: u32, col: u32, n: &NeighborRefInfo) -> usize {
         let left_interp = if n.avail_l && n.left_ref_frame[0] > INTRA_FRAME {
             self.mi_grid.get(row, col - 1).interp_filter
         } else {
-            3
+            INTERP_FILTER_UNSET
         };
         let above_interp = if n.avail_u && n.above_ref_frame[0] > INTRA_FRAME {
             self.mi_grid.get(row - 1, col).interp_filter
         } else {
-            3
+            INTERP_FILTER_UNSET
         };
         if left_interp == above_interp {
             left_interp as usize
-        } else if left_interp == 3 && above_interp != 3 {
+        } else if left_interp == INTERP_FILTER_UNSET {
             above_interp as usize
-        } else if left_interp != 3 && above_interp == 3 {
+        } else if above_interp == INTERP_FILTER_UNSET {
             left_interp as usize
         } else {
-            3
+            INTERP_FILTER_UNSET as usize
         }
+    }
+
+    /// Reads the per-block `interp_filter` syntax element when the frame filter is `SWITCHABLE`.
+    fn read_interp_filter(
+        &mut self,
+        r: &mut BoolDecoder,
+        row: u32,
+        col: u32,
+        n: &NeighborRefInfo,
+    ) -> u8 {
+        if self.interpolation_filter != SWITCHABLE {
+            return self.interpolation_filter;
+        }
+        let ctx = self.interp_filter_ctx(row, col, n);
+        let f = r.read_tree(&INTERP_FILTER_TREE, |node| {
+            self.probs.interp_filter_probs[ctx][node]
+        }) as u8;
+        if self.collect_counts {
+            self.counts.interp_filter[ctx][f as usize] += 1;
+        }
+        f
+    }
+
+    /// Decodes per-subblock inter modes and MVs for a sub-8x8 inter block (`mi_size < BLOCK_8X8`),
+    /// returning `(last_y_mode, block_mvs)`.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_sub8x8_inter_mvs(
+        &mut self,
+        r: &mut BoolDecoder,
+        row: u32,
+        col: u32,
+        mi_size: u8,
+        ref_frame: [u8; 2],
+        n_refs: usize,
+        mode_context: &[u8; 4],
+        mut nearest_mv: [Mv; 2],
+        mut near_mv: [Mv; 2],
+        best_mv: [Mv; 2],
+    ) -> (u8, [[[i32; 2]; 4]; 2]) {
+        let mut block_mvs = [[[0i32; 2]; 4]; 2];
+        let mut y_mode = ZEROMV;
+        let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
+        let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
+        let mut idy = 0u32;
+        while idy < 2 {
+            let mut idx = 0u32;
+            while idx < 2 {
+                let ctx = mode_context[ref_frame[0] as usize] as usize;
+                let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
+                    self.probs.inter_mode_probs[ctx][node]
+                }) as u8;
+                if self.collect_counts {
+                    self.counts.inter_mode[ctx][inter_mode as usize] += 1;
+                }
+                y_mode = NEARESTMV + inter_mode;
+                let block = (idy * 2 + idx) as i32;
+                if y_mode == NEARESTMV || y_mode == NEARMV {
+                    for j in 0..n_refs {
+                        let (nm, nr) = self.append_sub8x8_mvs(
+                            row,
+                            col,
+                            mi_size,
+                            block,
+                            ref_frame[j],
+                            j,
+                            &block_mvs,
+                        );
+                        nearest_mv[j] = nm;
+                        near_mv[j] = nr;
+                    }
+                }
+                let mv = self.assign_mv(r, y_mode, n_refs, nearest_mv, near_mv, best_mv);
+                for y2 in 0..num4x4h {
+                    for x2 in 0..num4x4w {
+                        let b = ((idy + y2) * 2 + idx + x2) as usize;
+                        for (rl, block_mv) in mv.iter().enumerate().take(n_refs) {
+                            block_mvs[rl][b] = *block_mv;
+                        }
+                    }
+                }
+                idx += num4x4w;
+            }
+            idy += num4x4h;
+        }
+        (y_mode, block_mvs)
     }
 
     /// `inter_block_mode_info( )` (spec §6.4.16).
@@ -541,12 +637,10 @@ impl TileDecoder {
 
         // §6.4.16: when seg_feature_active(SEG_LVL_SKIP), y_mode is forced to ZEROMV without
         // reading inter_mode. Bitstream conformance guarantees MiSize >= BLOCK_8X8 whenever
-        // seg_feature_active(SEG_LVL_SKIP) is set here, so the MiSize < BLOCK_8X8 sub8x8 loop
+        // seg_feature_active(SEG_LVL_SKIP) is set here, so the MiSize < BLOCK_8X8 sub8x8 branch
         // below never runs in that case.
         let mut y_mode = ZEROMV;
-        if self.seg_feature_active(segment_id, SEG_LVL_SKIP) {
-            // y_mode stays ZEROMV.
-        } else if mi_size >= BLOCK_8X8 {
+        if !self.seg_feature_active(segment_id, SEG_LVL_SKIP) && mi_size >= BLOCK_8X8 {
             let ctx = mode_context[ref_frame[0] as usize] as usize;
             let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
                 self.probs.inter_mode_probs[ctx][node]
@@ -557,73 +651,31 @@ impl TileDecoder {
             y_mode = NEARESTMV + inter_mode;
         }
 
-        let interp_filter = if self.interpolation_filter == SWITCHABLE {
-            let ctx = self.interp_filter_ctx(row, col, n);
-            let f = r.read_tree(&INTERP_FILTER_TREE, |node| {
-                self.probs.interp_filter_probs[ctx][node]
-            }) as u8;
-            if self.collect_counts {
-                self.counts.interp_filter[ctx][f as usize] += 1;
-            }
-            f
-        } else {
-            self.interpolation_filter
-        };
+        let interp_filter = self.read_interp_filter(r, row, col, n);
 
-        let mut block_mvs = [[[0i32; 2]; 4]; 2];
-
-        if mi_size < BLOCK_8X8 {
-            let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
-            let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
-            let mut idy = 0u32;
-            while idy < 2 {
-                let mut idx = 0u32;
-                while idx < 2 {
-                    let ctx = mode_context[ref_frame[0] as usize] as usize;
-                    let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
-                        self.probs.inter_mode_probs[ctx][node]
-                    }) as u8;
-                    if self.collect_counts {
-                        self.counts.inter_mode[ctx][inter_mode as usize] += 1;
-                    }
-                    y_mode = NEARESTMV + inter_mode;
-                    let block = (idy * 2 + idx) as i32;
-                    if y_mode == NEARESTMV || y_mode == NEARMV {
-                        for j in 0..n_refs {
-                            let (nm, nr) = self.append_sub8x8_mvs(
-                                row,
-                                col,
-                                mi_size,
-                                block,
-                                ref_frame[j],
-                                j,
-                                &block_mvs,
-                            );
-                            nearest_mv[j] = nm;
-                            near_mv[j] = nr;
-                        }
-                    }
-                    let mv = self.assign_mv(r, y_mode, n_refs, nearest_mv, near_mv, best_mv);
-                    for y2 in 0..num4x4h {
-                        for x2 in 0..num4x4w {
-                            let b = ((idy + y2) * 2 + idx + x2) as usize;
-                            for (rl, block_mv) in mv.iter().enumerate().take(n_refs) {
-                                block_mvs[rl][b] = *block_mv;
-                            }
-                        }
-                    }
-                    idx += num4x4w;
-                }
-                idy += num4x4h;
-            }
+        let block_mvs = if mi_size < BLOCK_8X8 {
+            let (sub_y_mode, mvs) = self.decode_sub8x8_inter_mvs(
+                r,
+                row,
+                col,
+                mi_size,
+                ref_frame,
+                n_refs,
+                &mode_context,
+                nearest_mv,
+                near_mv,
+                best_mv,
+            );
+            y_mode = sub_y_mode;
+            mvs
         } else {
+            let mut mvs = [[[0i32; 2]; 4]; 2];
             let mv = self.assign_mv(r, y_mode, n_refs, nearest_mv, near_mv, best_mv);
             for (rl, block_mv) in mv.iter().enumerate().take(n_refs) {
-                for b in block_mvs[rl].iter_mut() {
-                    *b = *block_mv;
-                }
+                mvs[rl].fill(*block_mv);
             }
-        }
+            mvs
+        };
 
         Ok(MiInfo {
             skip,
