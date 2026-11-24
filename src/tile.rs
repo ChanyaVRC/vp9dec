@@ -370,6 +370,34 @@ impl TileDecoder {
         resolved_refs: [Option<Arc<RefFrameData>>; 3],
         prev_segment_ids: Arc<Vec<u8>>,
     ) -> Self {
+        Self::new_with_buffers(
+            header,
+            color_config,
+            compressed,
+            use_prev_frame_mvs,
+            prev_mi_grid,
+            resolved_refs,
+            prev_segment_ids,
+            None,
+            None,
+        )
+    }
+
+    /// Like [`TileDecoder::new_with_prev`], reusing caller-supplied pooled `planes` and/or
+    /// `mi_grid` allocations when their geometry matches this frame (avoiding ~9 MB/frame of
+    /// allocation + zeroing at 1080p).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_buffers(
+        header: &NewFrameHeader,
+        color_config: ColorConfig,
+        compressed: &CompressedHeader,
+        use_prev_frame_mvs: bool,
+        prev_mi_grid: Option<Arc<MiGrid>>,
+        resolved_refs: [Option<Arc<RefFrameData>>; 3],
+        prev_segment_ids: Arc<Vec<u8>>,
+        recycled_planes: Option<[Plane; 3]>,
+        recycled_mi_grid: Option<MiGrid>,
+    ) -> Self {
         let image_size = header::compute_image_size(header.width, header.height);
         let grid_cols = (image_size.sb64_cols * 8) as usize;
         let grid_rows = (image_size.sb64_rows * 8) as usize;
@@ -382,11 +410,30 @@ impl TileDecoder {
         let y_h = (image_size.sb64_rows * 64) as usize;
         let uv_w = y_w >> subsampling_x;
         let uv_h = y_h >> subsampling_y;
-        let planes = [
-            Plane::new(y_w, y_h),
-            Plane::new(uv_w, uv_h),
-            Plane::new(uv_w, uv_h),
-        ];
+        let planes = if let Some(mut p) = recycled_planes {
+            if p[0].try_reuse_as(y_w, y_h)
+                && p[1].try_reuse_as(uv_w, uv_h)
+                && p[2].try_reuse_as(uv_w, uv_h)
+            {
+                p
+            } else {
+                [
+                    Plane::new(y_w, y_h),
+                    Plane::new(uv_w, uv_h),
+                    Plane::new(uv_w, uv_h),
+                ]
+            }
+        } else {
+            [
+                Plane::new(y_w, y_h),
+                Plane::new(uv_w, uv_h),
+                Plane::new(uv_w, uv_h),
+            ]
+        };
+        let mi_grid = match recycled_mi_grid {
+            Some(g) if g.cols == grid_cols && g.rows == grid_rows && g.col0 == 0 => g,
+            _ => MiGrid::new(grid_cols, grid_rows),
+        };
         // AboveNonzeroContext persists across the whole frame width in 4x4 units (2x the 8x8 mi unit).
         let above_nz_len = grid_cols * 2;
         let above_nonzero_context = [
@@ -403,7 +450,7 @@ impl TileDecoder {
             mi_rows: image_size.mi_rows,
             tile_cols_log2: header.tile_cols_log2,
             tile_rows_log2: header.tile_rows_log2,
-            mi_grid: MiGrid::new(grid_cols, grid_rows),
+            mi_grid,
             above_partition_context: vec![0u8; grid_cols],
             left_partition_context: [0u8; 8],
             above_seg_pred_context: vec![0u8; grid_cols],
@@ -450,6 +497,13 @@ impl TileDecoder {
     /// Configures whether syntax-element counters are accumulated during tile decode.
     pub(crate) fn set_collect_counts(&mut self, collect: bool) {
         self.collect_counts = collect;
+    }
+
+    /// Consumes `self`, dropping its read-only reference-frame and previous-grid `Arc` handles
+    /// and handing back its decoded `(planes, mi_grid)` by value for zero-copy DPB storage and
+    /// buffer pooling.
+    pub(crate) fn into_parts(self) -> ([Plane; 3], MiGrid) {
+        (self.planes, self.mi_grid)
     }
 
     /// The collected syntax element counters (used for probability adaptation, spec §8.4).

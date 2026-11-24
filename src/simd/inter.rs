@@ -623,6 +623,7 @@ pub unsafe fn block_inter_predict_u16_avx2<const COMPOUND: bool>(
 pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
     ref_data: &[u16],
     ref_width: usize,
+    ref_stride: usize,
     ref_height: usize,
     dst_data: &mut [u16],
     dst_width: usize,
@@ -641,7 +642,8 @@ pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
     debug_assert!(w == 4 || w.is_multiple_of(8));
     debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
     debug_assert!(intermediate_height <= MAX_INTERMEDIATE_HEIGHT);
-    debug_assert!(ref_data.len() >= ref_width * ref_height);
+    debug_assert!(ref_stride >= ref_width);
+    debug_assert!(ref_data.len() >= ref_stride * ref_height);
     debug_assert!(x_step >= 0 && y_step >= 0);
 
     let dst = dst_data.as_mut_ptr().add(dst_y * dst_width + dst_x);
@@ -661,7 +663,7 @@ pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
         let ref_base = ref_data.as_ptr();
 
         let fill_clamped_row = |ref_y: usize, col_start: i64, len: usize, out: *mut u16| {
-            let row = ref_base.add(ref_y * ref_width);
+            let row = ref_base.add(ref_y * ref_stride);
             if col_start >= 0 && col_start + (len as i64) - 1 <= last_x {
                 std::ptr::copy_nonoverlapping(row.add(col_start as usize), out, len);
             } else {
@@ -765,9 +767,10 @@ pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
     let mut pred = [MaybeUninit::<i32>::uninit(); MAX_BLOCK_DIM * MAX_BLOCK_DIM];
     let pred_slice =
         std::slice::from_raw_parts_mut(pred.as_mut_ptr() as *mut i32, w * h);
-    block_inter_predict_scaled_avx2(
+    block_inter_predict_scaled_strided_avx2(
         ref_data,
         ref_width,
+        ref_stride,
         ref_height,
         x,
         y,
@@ -923,11 +926,49 @@ pub unsafe fn block_inter_predict_scaled_avx2(
     max_val: i32,
     pred: &mut [i32],
 ) {
+    block_inter_predict_scaled_strided_avx2(
+        ref_data,
+        ref_width,
+        ref_width,
+        ref_height,
+        x,
+        y,
+        x_step,
+        y_step,
+        w,
+        h,
+        intermediate_height,
+        interp_filter,
+        max_val,
+        pred,
+    );
+}
+
+/// Stride-aware implementation of [`block_inter_predict_scaled_avx2`] (`ref_stride >= ref_width`).
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn block_inter_predict_scaled_strided_avx2(
+    ref_data: &[u16],
+    ref_width: usize,
+    ref_stride: usize,
+    ref_height: usize,
+    x: i64,
+    y: i64,
+    x_step: i64,
+    y_step: i64,
+    w: usize,
+    h: usize,
+    intermediate_height: usize,
+    interp_filter: u8,
+    max_val: i32,
+    pred: &mut [i32],
+) {
     debug_assert!(w == 4 || w.is_multiple_of(8));
     debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
     debug_assert!(intermediate_height <= MAX_INTERMEDIATE_HEIGHT);
     debug_assert_eq!(pred.len(), w * h);
-    debug_assert!(ref_data.len() >= ref_width * ref_height);
+    debug_assert!(ref_stride >= ref_width);
+    debug_assert!(ref_data.len() >= ref_stride * ref_height);
     debug_assert!(x_step >= 0 && y_step >= 0);
 
     let filters = &SUBPEL_FILTERS[interp_filter as usize];
@@ -959,8 +1000,6 @@ pub unsafe fn block_inter_predict_scaled_avx2(
     let zero = _mm256_setzero_si256();
     let max_clip = _mm256_set1_epi32(max_val);
 
-    // Uninitialized scratch: only the first `intermediate_height * wp` entries are written by
-    // the horizontal pass and read by the vertical pass.
     let mut intermediate = [MaybeUninit::<i32>::uninit(); MAX_INTERMEDIATE_HEIGHT * MAX_BLOCK_DIM];
     let inter_ptr = intermediate.as_mut_ptr() as *mut i32;
     let mut scratch = [MaybeUninit::<i32>::uninit(); MAX_INTERMEDIATE_HEIGHT];
@@ -968,7 +1007,7 @@ pub unsafe fn block_inter_predict_scaled_avx2(
 
     for r in 0..intermediate_height {
         let ref_y = ((y >> 4) + r as i64 - 3).clamp(0, last_y) as usize;
-        let row = &ref_data[ref_y * ref_width..ref_y * ref_width + ref_width];
+        let row = &ref_data[ref_y * ref_stride..ref_y * ref_stride + ref_width];
         for (i, &sc) in src_col[..span].iter().enumerate() {
             *scratch_ptr.add(i) = row[sc] as i32;
         }

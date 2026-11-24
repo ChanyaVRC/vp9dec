@@ -385,7 +385,7 @@ impl TileDecoder {
 
         #[cfg(target_arch = "x86_64")]
         if crate::simd::avx2_enabled() {
-            let pw = self.planes[plane].width;
+            let pw = self.planes[plane].stride();
             let local_x = start_x - self.planes[plane].x0;
             // SAFETY: `avx2_enabled()` confirmed; `n0` is 4/8/16/32; `clamped_delta` fits i16
             // within `[-max_val, max_val]` (`max_val <= 4095`); block lies inside the plane strip.
@@ -403,7 +403,7 @@ impl TileDecoder {
             return;
         }
 
-        let pw = self.planes[plane].width;
+        let pw = self.planes[plane].stride();
         let local_x = start_x - self.planes[plane].x0;
         let data = self.planes[plane].as_mut_slice();
         let delta = clamped_delta as i32;
@@ -615,9 +615,10 @@ impl TileDecoder {
             );
             #[cfg(target_arch = "x86_64")]
             if fused {
-                let pw = self.planes[plane].width;
+                let pw = self.planes[plane].stride();
                 debug_assert!(
-                    start_x >= self.planes[plane].x0 && start_x - self.planes[plane].x0 + n0 <= pw,
+                    start_x >= self.planes[plane].x0
+                        && start_x - self.planes[plane].x0 + n0 <= self.planes[plane].width,
                     "fused-reconstruction block outside its plane strip's columns"
                 );
                 debug_assert!(
@@ -704,7 +705,7 @@ impl TileDecoder {
 
         if !fused {
             let max_val = (1i64 << self.bit_depth) - 1;
-            let pw = self.planes[plane].width;
+            let pw = self.planes[plane].stride();
             let local_x = start_x - self.planes[plane].x0;
             let data = self.planes[plane].as_mut_slice();
             for i in 0..n0 {

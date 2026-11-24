@@ -65,3 +65,37 @@ pub fn avx2_enabled() -> bool {
         std::env::var_os("VP9DEC_NO_SIMD").is_none() && is_x86_feature_detected!("avx2")
     })
 }
+
+/// Narrows `src` (`u16` samples, each known to be in `0..=255`) into `dst` (`u8`) using AVX2
+/// `_mm256_packus_epi16` (32 pixels per iteration) + SSE2 (16 pixels) + scalar tail.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `dst.len() >= src.len()`.
+#[target_feature(enable = "avx2")]
+pub unsafe fn narrow_u16_to_u8_avx2(src: &[u16], dst: *mut u8) {
+    use std::arch::x86_64::*;
+    let len = src.len();
+    let sp = src.as_ptr();
+    let mut i = 0usize;
+    while i + 32 <= len {
+        let lo = _mm256_loadu_si256(sp.add(i) as *const __m256i);
+        let hi = _mm256_loadu_si256(sp.add(i + 16) as *const __m256i);
+        // packus_epi16 operates per 128-bit lane: [lo_0..8, hi_0..8 | lo_8..16, hi_8..16].
+        // permute4x64(0xD8 = 0b11_01_10_00) restores contiguous order [lo_0..16, hi_0..16].
+        let packed = _mm256_packus_epi16(lo, hi);
+        let ordered = _mm256_permute4x64_epi64(packed, 0xD8);
+        _mm256_storeu_si256(dst.add(i) as *mut __m256i, ordered);
+        i += 32;
+    }
+    while i + 16 <= len {
+        let lo = _mm_loadu_si128(sp.add(i) as *const __m128i);
+        let hi = _mm_loadu_si128(sp.add(i + 8) as *const __m128i);
+        let packed = _mm_packus_epi16(lo, hi);
+        _mm_storeu_si128(dst.add(i) as *mut __m128i, packed);
+        i += 16;
+    }
+    while i < len {
+        *dst.add(i) = *sp.add(i) as u8;
+        i += 1;
+    }
+}

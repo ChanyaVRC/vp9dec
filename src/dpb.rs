@@ -74,4 +74,26 @@ impl Dpb {
             }
         }
     }
+
+    /// Same as [`Dpb::update`], additionally recycling the backing `[Plane; 3]` of any evicted
+    /// slot whose `Arc` refcount drops to 0 into `recycle_pool` (up to `max_pool` entries).
+    pub(crate) fn update_and_recycle(
+        &mut self,
+        refresh_frame_flags: u8,
+        data: &Arc<RefFrameData>,
+        recycle_pool: &mut Vec<[Plane; 3]>,
+        max_pool: usize,
+    ) {
+        for (slot, entry) in self.slots.iter_mut().enumerate() {
+            if (refresh_frame_flags >> slot) & 1 == 1 {
+                if let Some(old) = entry.replace(data.clone()) {
+                    if recycle_pool.len() < max_pool {
+                        if let Ok(owned) = Arc::try_unwrap(old) {
+                            recycle_pool.push([owned.y, owned.u, owned.v]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

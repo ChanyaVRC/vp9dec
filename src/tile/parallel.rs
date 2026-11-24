@@ -158,15 +158,15 @@ impl TileDecoder {
             let sub = if p == 0 { 0 } else { self.subsampling_x };
             let px0 = (c0 * 8) >> sub;
             let px1 = (c1 * 8) >> sub;
-            let width = plane.width;
+            let stride = plane.stride();
+            let height = plane.height;
             let dst = plane.as_mut_slice();
             let src = w.planes[p].as_slice();
-            let src_width = w.planes[p].width;
+            let src_stride = w.planes[p].stride();
             debug_assert_eq!(w.planes[p].x0, px0);
-            let height = dst.len() / width;
             for row in 0..height {
-                let base = row * width;
-                let src_base = row * src_width;
+                let base = row * stride;
+                let src_base = row * src_stride;
                 dst[base + px0..base + px1].copy_from_slice(&src[src_base..src_base + (px1 - px0)]);
             }
         }

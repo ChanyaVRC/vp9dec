@@ -117,7 +117,7 @@ impl PlaneAccess for Plane {
     }
     #[inline]
     fn lf_stride(&self) -> usize {
-        self.width
+        self.stride()
     }
 }
 
@@ -147,7 +147,7 @@ unsafe impl Sync for PlaneView {}
 
 impl PlaneView {
     fn new(plane: &mut Plane) -> Self {
-        let stride = plane.width;
+        let stride = plane.stride();
         let x0 = plane.x0;
         let height = plane.height;
         Self {

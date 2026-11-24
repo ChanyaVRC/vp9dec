@@ -57,9 +57,9 @@ pub fn predict_intra(
     if matches!(mode, V_PRED | H_PRED | DC_PRED | TM_PRED) && crate::simd::avx2_enabled() {
         let log2_size = (tx_size as u32) + 2;
         let size = 1usize << log2_size;
-        let pw = plane.width;
+        let pw = plane.stride();
         debug_assert!(
-            x >= plane.x0 && x - plane.x0 + size <= pw && y + size <= plane.height,
+            x >= plane.x0 && x - plane.x0 + size <= plane.width && y + size <= plane.height,
             "predict_intra block outside its plane bounds"
         );
         let local_x = x - plane.x0;
@@ -721,6 +721,7 @@ pub(crate) fn block_inter_predict_scalar(
     let filters = &SUBPEL_FILTERS[interp_filter as usize];
     let ref_data = ref_plane.as_slice();
     let ref_w = ref_plane.width;
+    let ref_stride = ref_plane.stride();
 
     // Fast unscaled scalar paths: avoid running zero taps when fx == 0 or fy == 0, and avoid
     // 34 KB stack zeroing on every small block.
@@ -734,7 +735,7 @@ pub(crate) fn block_inter_predict_scalar(
         if fx == 0 && fy == 0 {
             for r in 0..h {
                 let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
-                let row = &ref_data[ref_y * ref_w..ref_y * ref_w + ref_w];
+                let row = &ref_data[ref_y * ref_stride..ref_y * ref_stride + ref_w];
                 if x0 >= 0 && x0 + w as i64 - 1 <= last_x {
                     let sx = x0 as usize;
                     for c in 0..w {
@@ -754,7 +755,7 @@ pub(crate) fn block_inter_predict_scalar(
             let in_x = x0 - 3 >= 0 && x0 + w as i64 + 3 <= last_x;
             for r in 0..h {
                 let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
-                let row = &ref_data[ref_y * ref_w..ref_y * ref_w + ref_w];
+                let row = &ref_data[ref_y * ref_stride..ref_y * ref_stride + ref_w];
                 if in_x {
                     let sx0 = (x0 - 3) as usize;
                     for c in 0..w {
@@ -790,14 +791,21 @@ pub(crate) fn block_inter_predict_scalar(
                 let sx = x0 as usize;
                 for r in 0..h {
                     let ybase = (y0 - 3) as usize + r;
-                    let r0 = &ref_data[ybase * ref_w + sx..ybase * ref_w + sx + w];
-                    let r1 = &ref_data[(ybase + 1) * ref_w + sx..(ybase + 1) * ref_w + sx + w];
-                    let r2 = &ref_data[(ybase + 2) * ref_w + sx..(ybase + 2) * ref_w + sx + w];
-                    let r3 = &ref_data[(ybase + 3) * ref_w + sx..(ybase + 3) * ref_w + sx + w];
-                    let r4 = &ref_data[(ybase + 4) * ref_w + sx..(ybase + 4) * ref_w + sx + w];
-                    let r5 = &ref_data[(ybase + 5) * ref_w + sx..(ybase + 5) * ref_w + sx + w];
-                    let r6 = &ref_data[(ybase + 6) * ref_w + sx..(ybase + 6) * ref_w + sx + w];
-                    let r7 = &ref_data[(ybase + 7) * ref_w + sx..(ybase + 7) * ref_w + sx + w];
+                    let r0 = &ref_data[ybase * ref_stride + sx..ybase * ref_stride + sx + w];
+                    let r1 =
+                        &ref_data[(ybase + 1) * ref_stride + sx..(ybase + 1) * ref_stride + sx + w];
+                    let r2 =
+                        &ref_data[(ybase + 2) * ref_stride + sx..(ybase + 2) * ref_stride + sx + w];
+                    let r3 =
+                        &ref_data[(ybase + 3) * ref_stride + sx..(ybase + 3) * ref_stride + sx + w];
+                    let r4 =
+                        &ref_data[(ybase + 4) * ref_stride + sx..(ybase + 4) * ref_stride + sx + w];
+                    let r5 =
+                        &ref_data[(ybase + 5) * ref_stride + sx..(ybase + 5) * ref_stride + sx + w];
+                    let r6 =
+                        &ref_data[(ybase + 6) * ref_stride + sx..(ybase + 6) * ref_stride + sx + w];
+                    let r7 =
+                        &ref_data[(ybase + 7) * ref_stride + sx..(ybase + 7) * ref_stride + sx + w];
                     for c in 0..w {
                         let s = vcoeffs[0] * r0[c] as i32
                             + vcoeffs[1] * r1[c] as i32
@@ -819,7 +827,7 @@ pub(crate) fn block_inter_predict_scalar(
     let mut intermediate = [0i32; MAX_INTERMEDIATE_HEIGHT * MAX_BLOCK_DIM];
     for r in 0..intermediate_height {
         let ref_y = ((y >> 4) + r - 3).clamp(0, last_y) as usize;
-        let row = &ref_data[ref_y * ref_w..ref_y * ref_w + ref_w];
+        let row = &ref_data[ref_y * ref_stride..ref_y * ref_stride + ref_w];
         for c in 0..w {
             let p = x + x_step * (c as i64);
             let coeffs = &filters[(p & 15) as usize];
@@ -873,7 +881,8 @@ fn block_inter_predict_into_plane(
     if (w == 4 || w.is_multiple_of(8)) && crate::simd::avx2_enabled() {
         let max_val = (1i32 << bit_depth) - 1;
         let local_x = dst_x - dst.x0;
-        let dst_w = dst.width;
+        let dst_stride = dst.stride();
+        let ref_stride = ref_plane.stride();
         let last_x = ref_plane.width as i64 - 1;
         let last_y = ref_plane.height as i64 - 1;
 
@@ -899,9 +908,9 @@ fn block_inter_predict_into_plane(
                     if compound {
                         crate::simd::block_inter_predict_u16_avx2::<true>(
                             ref_plane.as_slice(),
-                            ref_plane.width,
+                            ref_stride,
                             dst.as_mut_slice(),
-                            dst_w,
+                            dst_stride,
                             local_x,
                             dst_y,
                             x0,
@@ -916,9 +925,9 @@ fn block_inter_predict_into_plane(
                     } else {
                         crate::simd::block_inter_predict_u16_avx2::<false>(
                             ref_plane.as_slice(),
-                            ref_plane.width,
+                            ref_stride,
                             dst.as_mut_slice(),
-                            dst_w,
+                            dst_stride,
                             local_x,
                             dst_y,
                             x0,
@@ -941,17 +950,18 @@ fn block_inter_predict_into_plane(
         if intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT
             && span as usize <= MAX_INTERMEDIATE_HEIGHT
         {
-            // SAFETY: `avx2_enabled()` confirmed; `ref_plane` has `width * height` samples,
-            // every source read is clamped inside it, scratch bounds were checked, and `dst`
-            // bounds hold.
+            // SAFETY: `avx2_enabled()` confirmed; `ref_plane` has `stride * height` samples,
+            // every source read is clamped inside `width x height`, scratch bounds were checked,
+            // and `dst` bounds hold.
             unsafe {
                 if compound {
                     crate::simd::block_inter_predict_scaled_u16_avx2::<true>(
                         ref_plane.as_slice(),
                         ref_plane.width,
+                        ref_stride,
                         ref_plane.height,
                         dst.as_mut_slice(),
-                        dst_w,
+                        dst_stride,
                         local_x,
                         dst_y,
                         x,
@@ -968,9 +978,10 @@ fn block_inter_predict_into_plane(
                     crate::simd::block_inter_predict_scaled_u16_avx2::<false>(
                         ref_plane.as_slice(),
                         ref_plane.width,
+                        ref_stride,
                         ref_plane.height,
                         dst.as_mut_slice(),
-                        dst_w,
+                        dst_stride,
                         local_x,
                         dst_y,
                         x,
@@ -1004,11 +1015,11 @@ fn block_inter_predict_into_plane(
         &mut pred[..w * h],
     );
     let local_x = dst_x - dst.x0;
-    let dst_w = dst.width;
+    let dst_stride = dst.stride();
     let dst_slice = dst.as_mut_slice();
     if compound {
         for i in 0..h {
-            let dst_row = &mut dst_slice[(dst_y + i) * dst_w + local_x..][..w];
+            let dst_row = &mut dst_slice[(dst_y + i) * dst_stride + local_x..][..w];
             let src_row = &pred[i * w..(i + 1) * w];
             for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
                 *d = round2(*d as i32 + s, 1) as u16;
@@ -1016,7 +1027,7 @@ fn block_inter_predict_into_plane(
         }
     } else {
         for i in 0..h {
-            let dst_row = &mut dst_slice[(dst_y + i) * dst_w + local_x..][..w];
+            let dst_row = &mut dst_slice[(dst_y + i) * dst_stride + local_x..][..w];
             let src_row = &pred[i * w..(i + 1) * w];
             for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
                 *d = s as u16;
