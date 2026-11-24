@@ -43,15 +43,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::common::{get_uv_tx_size, INTRA_FRAME};
 use crate::framebuffer::Plane;
+#[cfg(test)]
+use crate::header::SEG_LVL_ALT_L;
 use crate::header::{LoopFilterParams, SegmentationParams};
 use crate::prob_tables::{
     BLOCK_16X16, NEARESTMV, NEARMV, NEWMV, NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP,
 };
-use crate::tile::MiGrid;
-#[cfg(test)]
-use crate::header::SEG_LVL_ALT_L;
 #[cfg(test)]
 use crate::prob_tables::{TX_16X16, TX_4X4, TX_8X8};
+use crate::tile::MiGrid;
 #[cfg(test)]
 use edge_filter::{adaptive_filter_strength, narrow_filter};
 use edge_filter::{
@@ -233,13 +233,16 @@ fn edge_group_params(
     // For pass == 1, sub_x == 1, odd mi_cols, and the last 4 active lanes (`x + 8 >= 8 * mi_cols`
     // holds for all 4 active lanes simultaneously because `x` is a multiple of 16 and `8 * mi_cols`
     // is `16k + 8`, so `x + 8 == 8 * mi_cols` on lane 0 and `> 8 * mi_cols` on lanes 1..3).
-    let is_tx_edge =
-        if pass == 1 && sub_x == 1 && (mi_cols & 1) == 1 && (edge & 1) == 1 && (x + 8) >= mi_cols * 8
-        {
-            false
-        } else {
-            (edge & ((1u32 << tx_sz) - 1)) == 0
-        };
+    let is_tx_edge = if pass == 1
+        && sub_x == 1
+        && (mi_cols & 1) == 1
+        && (edge & 1) == 1
+        && (x + 8) >= mi_cols * 8
+    {
+        false
+    } else {
+        (edge & ((1u32 << tx_sz) - 1)) == 0
+    };
 
     let apply_filter = is_block_edge || (is_tx_edge && (is_intra || !skip));
     if !apply_filter {

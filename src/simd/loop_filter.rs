@@ -166,10 +166,7 @@ unsafe fn loop_filter_horiz8_core(
     let round2_3 = |t: __m256i| _mm256_srai_epi32(add(t, c4), 3);
 
     // Sliding base = 3*p3 + p2 + p1 + p0 + q0 (7 terms; each output adds its center sample).
-    let mut b8 = add(
-        add(add(p3, add(p3, p3)), add(p2, p1)),
-        add(p0, q0),
-    );
+    let mut b8 = add(add(add(p3, add(p3, p3)), add(p2, p1)), add(p0, q0));
     let op2_wide = round2_3(add(b8, p2));
     b8 = add(sub(b8, p3), q1);
     let op1_wide = round2_3(add(b8, p1));
@@ -507,7 +504,10 @@ unsafe fn loop_filter_vert8_core(
             }
             let out = transpose8x8_u16(&rows);
             for (r, &v) in out.iter().enumerate() {
-                _mm_storeu_si128(base.add((y0 + r) * plane_width + dst_col) as *mut __m128i, v);
+                _mm_storeu_si128(
+                    base.add((y0 + r) * plane_width + dst_col) as *mut __m128i,
+                    v,
+                );
             }
         }
         FilterWriteScope::Wide16 => {

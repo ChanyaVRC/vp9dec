@@ -14,14 +14,14 @@ mod adst;
 mod adst_hbd;
 mod dct;
 
+pub(super) use adst::iadst_simd;
 #[cfg(test)]
 pub(super) use adst::{sb_op_simd, sh_op_simd};
+use adst_hbd::xform_pass_i64;
 #[cfg(test)]
 pub(super) use adst_hbd::{iadst_i64, idct_i64};
 #[cfg(test)]
 pub(super) use dct::{b_op_simd, b_op_simd_hbd};
-pub(super) use adst::iadst_simd;
-use adst_hbd::xform_pass_i64;
 pub(super) use dct::{idct_permute_simd, idct_simd};
 
 use crate::transform::TxType;
@@ -120,10 +120,7 @@ unsafe fn xform_pass<const HBD: bool, const ADST: bool>(
         }
         for (k, tk) in t[..4].iter().enumerate() {
             let v = round_shift.map_or(*tk, |sh| round2_var(*tk, sh));
-            _mm_storeu_si128(
-                output.add(k * 4) as *mut __m128i,
-                _mm256_castsi256_si128(v),
-            );
+            _mm_storeu_si128(output.add(k * 4) as *mut __m128i, _mm256_castsi256_si128(v));
         }
         return;
     }
@@ -165,12 +162,7 @@ unsafe fn xform_pass<const HBD: bool, const ADST: bool>(
 
 /// The two separable passes of the AVX2 DCT_DCT 2D inverse transform (spec §8.7.2).
 #[target_feature(enable = "avx2")]
-unsafe fn idct_2d_dct<const HBD: bool>(
-    dequant: &[i64],
-    n: u32,
-    max_row: usize,
-    out: *mut i32,
-) {
+unsafe fn idct_2d_dct<const HBD: bool>(dequant: &[i64], n: u32, max_row: usize, out: *mut i32) {
     let n0 = 1usize << n;
     let count = n0 * n0;
     let mut buf = [MaybeUninit::<i32>::uninit(); 1024];
@@ -383,7 +375,15 @@ pub unsafe fn inverse_transform_adst_reconstruct_hbd_avx2(
         *o_ptr.add(i) = src as i32;
     }
     let max_val = (1i32 << bit_depth) - 1;
-    reconstruct_add_clip(plane_data, plane_width, start_x, start_y, o_ptr, n0, max_val);
+    reconstruct_add_clip(
+        plane_data,
+        plane_width,
+        start_x,
+        start_y,
+        o_ptr,
+        n0,
+        max_val,
+    );
 }
 
 /// Shared body of the fused DCT_DCT entries above.
@@ -403,7 +403,15 @@ unsafe fn idct_dct_reconstruct<const HBD: bool>(
     let mut o = [MaybeUninit::<i32>::uninit(); 1024];
     let o_ptr = o.as_mut_ptr() as *mut i32;
     idct_2d_dct::<HBD>(dequant, n, max_row, o_ptr);
-    reconstruct_add_clip(plane_data, plane_width, start_x, start_y, o_ptr, n0, max_val);
+    reconstruct_add_clip(
+        plane_data,
+        plane_width,
+        start_x,
+        start_y,
+        o_ptr,
+        n0,
+        max_val,
+    );
 }
 
 /// Adds a constant residual `delta` (clamped to `[-max_val, max_val]`, so `pred + delta` fits

@@ -7,8 +7,8 @@ mod intra;
 
 #[cfg(test)]
 pub(crate) use inter::block_inter_predict_scalar;
-pub(crate) use inter::{MAX_BLOCK_DIM, MAX_INTERMEDIATE_HEIGHT};
 pub use inter::{predict_inter, InterPredictParams, RefPlaneView};
+pub(crate) use inter::{MAX_BLOCK_DIM, MAX_INTERMEDIATE_HEIGHT};
 pub use intra::predict_intra;
 #[cfg(test)]
 pub(crate) use intra::predict_intra_scalar;

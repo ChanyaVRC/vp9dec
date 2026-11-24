@@ -265,18 +265,30 @@ unsafe fn convolve_horiz_u16_avx2<const COMPOUND: bool>(
                 let s7 = _mm256_loadu_si256(sp.add(7) as *const __m256i);
                 let mut acc_lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(s0, s1), c01);
                 let mut acc_hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(s0, s1), c01);
-                acc_lo =
-                    _mm256_add_epi32(acc_lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(s2, s3), c23));
-                acc_hi =
-                    _mm256_add_epi32(acc_hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(s2, s3), c23));
-                acc_lo =
-                    _mm256_add_epi32(acc_lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(s4, s5), c45));
-                acc_hi =
-                    _mm256_add_epi32(acc_hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(s4, s5), c45));
-                acc_lo =
-                    _mm256_add_epi32(acc_lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(s6, s7), c67));
-                acc_hi =
-                    _mm256_add_epi32(acc_hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(s6, s7), c67));
+                acc_lo = _mm256_add_epi32(
+                    acc_lo,
+                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s2, s3), c23),
+                );
+                acc_hi = _mm256_add_epi32(
+                    acc_hi,
+                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s2, s3), c23),
+                );
+                acc_lo = _mm256_add_epi32(
+                    acc_lo,
+                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s4, s5), c45),
+                );
+                acc_hi = _mm256_add_epi32(
+                    acc_hi,
+                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s4, s5), c45),
+                );
+                acc_lo = _mm256_add_epi32(
+                    acc_lo,
+                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s6, s7), c67),
+                );
+                acc_hi = _mm256_add_epi32(
+                    acc_hi,
+                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s6, s7), c67),
+                );
                 let packed = round_clip_pack_16(acc_lo, acc_hi, round_add, zero, max_clip);
                 store_or_avg_16::<COMPOUND>(row_dst.add(c), packed);
                 c += 16;
@@ -440,18 +452,30 @@ unsafe fn convolve_vert_u16_avx2<const COMPOUND: bool>(
                 let s7 = _mm256_loadu_si256(p7.add(c) as *const __m256i);
                 let mut acc_lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(s0, s1), c01);
                 let mut acc_hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(s0, s1), c01);
-                acc_lo =
-                    _mm256_add_epi32(acc_lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(s2, s3), c23));
-                acc_hi =
-                    _mm256_add_epi32(acc_hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(s2, s3), c23));
-                acc_lo =
-                    _mm256_add_epi32(acc_lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(s4, s5), c45));
-                acc_hi =
-                    _mm256_add_epi32(acc_hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(s4, s5), c45));
-                acc_lo =
-                    _mm256_add_epi32(acc_lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(s6, s7), c67));
-                acc_hi =
-                    _mm256_add_epi32(acc_hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(s6, s7), c67));
+                acc_lo = _mm256_add_epi32(
+                    acc_lo,
+                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s2, s3), c23),
+                );
+                acc_hi = _mm256_add_epi32(
+                    acc_hi,
+                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s2, s3), c23),
+                );
+                acc_lo = _mm256_add_epi32(
+                    acc_lo,
+                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s4, s5), c45),
+                );
+                acc_hi = _mm256_add_epi32(
+                    acc_hi,
+                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s4, s5), c45),
+                );
+                acc_lo = _mm256_add_epi32(
+                    acc_lo,
+                    _mm256_madd_epi16(_mm256_unpacklo_epi16(s6, s7), c67),
+                );
+                acc_hi = _mm256_add_epi32(
+                    acc_hi,
+                    _mm256_madd_epi16(_mm256_unpackhi_epi16(s6, s7), c67),
+                );
                 let packed = round_clip_pack_16(acc_lo, acc_hi, round_add, zero, max_clip);
                 store_or_avg_16::<COMPOUND>(row_dst.add(c), packed);
                 c += 16;
@@ -579,7 +603,8 @@ pub unsafe fn block_inter_predict_u16_avx2<const COMPOUND: bool>(
             // Uninitialized stack scratch sized for unscaled 2D max (71 * 64 u16 = 9 KB):
             // only the first `(h + 7) * w` entries are written by the horizontal pass and read
             // by the vertical pass.
-            let mut intermediate = [MaybeUninit::<u16>::uninit(); (MAX_BLOCK_DIM + 7) * MAX_BLOCK_DIM];
+            let mut intermediate =
+                [MaybeUninit::<u16>::uninit(); (MAX_BLOCK_DIM + 7) * MAX_BLOCK_DIM];
             let tmp_ptr = intermediate.as_mut_ptr() as *mut u16;
             let src = ref_data
                 .as_ptr()
@@ -682,14 +707,7 @@ pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
                 for r in 0..h {
                     let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
                     fill_clamped_row(ref_y, x0, w, line_ptr);
-                    copy_u16_avx2::<COMPOUND>(
-                        line_ptr,
-                        w,
-                        dst.add(r * dst_width),
-                        dst_width,
-                        w,
-                        1,
-                    );
+                    copy_u16_avx2::<COMPOUND>(line_ptr, w, dst.add(r * dst_width), dst_width, w, 1);
                 }
             }
             (false, true) => {
@@ -765,8 +783,7 @@ pub unsafe fn block_inter_predict_scaled_u16_avx2<const COMPOUND: bool>(
     // General scaled reference path (SVC / resize): gather horizontal pass, pack to `u16` into
     // `dst` (with optional compound average).
     let mut pred = [MaybeUninit::<i32>::uninit(); MAX_BLOCK_DIM * MAX_BLOCK_DIM];
-    let pred_slice =
-        std::slice::from_raw_parts_mut(pred.as_mut_ptr() as *mut i32, w * h);
+    let pred_slice = std::slice::from_raw_parts_mut(pred.as_mut_ptr() as *mut i32, w * h);
     block_inter_predict_scaled_strided_avx2(
         ref_data,
         ref_width,

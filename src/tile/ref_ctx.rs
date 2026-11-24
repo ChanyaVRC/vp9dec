@@ -118,8 +118,8 @@ impl TileDecoder {
             (true, true) => match (n.above_intra, n.left_intra) {
                 (true, true) => 2,
                 (false, true) => {
-                    1 + 2 * (var_ref(n.above_ref_frame, n.above_single, var_ref_idx) != var1)
-                        as usize
+                    1 + 2
+                        * (var_ref(n.above_ref_frame, n.above_single, var_ref_idx) != var1) as usize
                 }
                 (true, false) => {
                     1 + 2 * (var_ref(n.left_ref_frame, n.left_single, var_ref_idx) != var1) as usize

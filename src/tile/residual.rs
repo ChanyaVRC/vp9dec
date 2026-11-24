@@ -382,9 +382,8 @@ impl TileDecoder {
         n: u32,
         dq0: i64,
     ) {
-        let _t = crate::bench_timing::StageTimer::start(
-            crate::bench_timing::Stage::InverseTransform,
-        );
+        let _t =
+            crate::bench_timing::StageTimer::start(crate::bench_timing::Stage::InverseTransform);
         let n0 = 1usize << n;
         let shift = (n + 2).min(6);
         let v1 = (dq0 * 11585 + (1i64 << 13)) >> 14;
@@ -556,8 +555,8 @@ impl TileDecoder {
                 + self.token_cache_buf[nb0 as usize] as u32
                 + self.token_cache_buf[nb1 as usize] as u32)
                 >> 1) as usize;
-            let probs = self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][band]
-                [ctx];
+            let probs =
+                self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][band][ctx];
 
             if check_eob {
                 // Counted ONLY when EOB is actually read (check_eob == true), matching spec §8.4.3.
@@ -707,12 +706,7 @@ impl TileDecoder {
                 );
             }
             #[cfg(not(target_arch = "x86_64"))]
-            inverse_transform_block(
-                &mut self.dequant_buf[..seg_eob],
-                n,
-                tx_type,
-                self.lossless,
-            );
+            inverse_transform_block(&mut self.dequant_buf[..seg_eob], n, tx_type, self.lossless);
         }
 
         if !fused {
