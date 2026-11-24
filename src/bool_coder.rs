@@ -34,6 +34,8 @@
 //!   for i in 0..n: x = 2 * x + read_bool(128)
 //! ```
 
+use std::fmt;
+
 /// Errors that can occur when initializing the bool decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoolCoderError {
@@ -42,6 +44,19 @@ pub enum BoolCoderError {
     /// The marker bit read right after initialization must be 0 (spec §9.2.1).
     InvalidMarker,
 }
+
+impl fmt::Display for BoolCoderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BoolCoderError::EmptyBuffer => {
+                f.write_str("bool decoder initialized with empty buffer")
+            }
+            BoolCoderError::InvalidMarker => f.write_str("bool decoder marker bit is non-zero"),
+        }
+    }
+}
+
+impl std::error::Error for BoolCoderError {}
 
 /// VP9's arithmetic decoder (bool decoder).
 ///

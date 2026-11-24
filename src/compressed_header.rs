@@ -28,6 +28,7 @@
 //! The inter-related reads called only when `FrameIsIntra == 0`
 //! (`read_inter_mode_probs` onward, spec §6.3.9-6.3.18) were implemented in M3.
 
+use std::fmt;
 use std::sync::Arc;
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
@@ -49,6 +50,30 @@ use crate::prob_tables::{
 pub enum CompressedHeaderError {
     /// Bool decoder initialization failed (e.g. `header_size_in_bytes` is 0).
     BoolCoder(BoolCoderError),
+}
+
+impl From<BoolCoderError> for CompressedHeaderError {
+    fn from(e: BoolCoderError) -> Self {
+        CompressedHeaderError::BoolCoder(e)
+    }
+}
+
+impl fmt::Display for CompressedHeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompressedHeaderError::BoolCoder(e) => {
+                write!(f, "compressed header bool decoder error: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompressedHeaderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CompressedHeaderError::BoolCoder(e) => Some(e),
+        }
+    }
 }
 
 /// The full set of probability tables updated by `compressed_header()`.
@@ -501,7 +526,7 @@ pub fn parse_compressed_header(
     header: &NewFrameHeader,
     starting_probs: FrameContext,
 ) -> Result<CompressedHeader, CompressedHeaderError> {
-    let mut r = BoolDecoder::new(data).map_err(CompressedHeaderError::BoolCoder)?;
+    let mut r = BoolDecoder::new(data)?;
     let mut probs = starting_probs;
 
     let tx_mode = read_tx_mode(&mut r, header.quantization.lossless);

@@ -39,6 +39,7 @@ pub use mv_pred::Mv;
 #[cfg(feature = "test-support")]
 pub use parallel::{FORCE_SEQUENTIAL_TILES, FORCE_TILE_WORKERS};
 
+use std::fmt;
 use std::sync::Arc;
 
 use crate::bool_coder::{BoolCoderError, BoolDecoder};
@@ -81,6 +82,40 @@ pub enum TileError {
     /// coded bits for its blocks; running thousands of bits past the end means the decode
     /// desynced on corrupt data (libvpx rejects the same via its reader's `has_error`).
     CorruptTile,
+}
+
+impl From<BoolCoderError> for TileError {
+    fn from(e: BoolCoderError) -> Self {
+        TileError::BoolCoder(e)
+    }
+}
+
+impl fmt::Display for TileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TileError::BoolCoder(e) => write!(f, "tile bool decoder error: {e}"),
+            TileError::InvalidTileSize => f.write_str("invalid or truncated tile size"),
+            TileError::InvalidPartition => f.write_str("invalid block partition for subsampling"),
+            TileError::MissingReference => {
+                f.write_str("inter block references an uninitialized DPB slot")
+            }
+            TileError::RefFrameSizeOutOfRange => {
+                f.write_str("reference frame exceeds 2x scaling bound")
+            }
+            TileError::CorruptTile => {
+                f.write_str("corrupt tile data (arithmetic decoder out of sync)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TileError::BoolCoder(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 /// Over-read (bits requested past the tile buffer end) beyond which a tile is treated as
@@ -671,7 +706,7 @@ impl TileDecoder {
     /// checks. Both the sequential loop above and the tile-column workers use this exact
     /// lifecycle so malformed-tile handling cannot drift between the two paths.
     fn decode_tile_bytes(&mut self, tile_bytes: &[u8]) -> Result<(), TileError> {
-        let mut r = BoolDecoder::new(tile_bytes).map_err(TileError::BoolCoder)?;
+        let mut r = BoolDecoder::new(tile_bytes)?;
         self.decode_tile(&mut r)?;
         check_tile_read_bounds(&r, tile_bytes)?;
         r.exit_bool();

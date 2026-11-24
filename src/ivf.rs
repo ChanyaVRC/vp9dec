@@ -28,6 +28,8 @@
 //! | 0 | 4 | Size of the frame data (excluding this header) |
 //! | 4 | 8 | 64-bit presentation timestamp |
 
+use std::fmt;
+
 /// Size of the IVF file header (bytes).
 const IVF_FILE_HEADER_SIZE: usize = 32;
 /// Size of the IVF frame header (bytes).
@@ -49,6 +51,22 @@ pub enum IvfError {
     /// The buffer does not contain as many bytes as the frame header claims for the data size.
     TruncatedFrameData,
 }
+
+impl fmt::Display for IvfError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IvfError::TooShortForFileHeader => {
+                f.write_str("IVF buffer shorter than 32-byte header")
+            }
+            IvfError::BadSignature => f.write_str("invalid IVF signature (expected \"DKIF\")"),
+            IvfError::InvalidHeaderLength => f.write_str("invalid IVF header length"),
+            IvfError::TruncatedFrameHeader => f.write_str("truncated IVF frame header"),
+            IvfError::TruncatedFrameData => f.write_str("truncated IVF frame payload"),
+        }
+    }
+}
+
+impl std::error::Error for IvfError {}
 
 /// Contents of the IVF file header.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -126,15 +126,19 @@ unsafe fn loop_filter_horiz8_core(
         _mm_storeu_si128(row_ptr as *mut __m128i, u16x8);
     };
 
+    let store_narrow_only = || {
+        store_row(-2, _mm256_blendv_epi8(p1, op1_narrow, elig_and_fm));
+        store_row(-1, _mm256_blendv_epi8(p0, op0_narrow, elig_and_fm));
+        store_row(0, _mm256_blendv_epi8(q0, oq0_narrow, elig_and_fm));
+        store_row(1, _mm256_blendv_epi8(q1, oq1_narrow, elig_and_fm));
+    };
+
     let is_wide_v = _mm256_or_si256(is_tx8_v, is_tx16_v);
     let elig_wide = _mm256_and_si256(elig_and_fm, is_wide_v);
 
     // Fast path 1: no active lane is TX_8X8 or TX_16X16 -> store narrow p1..q1 and return.
     if _mm256_testz_si256(elig_wide, elig_wide) != 0 {
-        store_row(-2, _mm256_blendv_epi8(p1, op1_narrow, elig_and_fm));
-        store_row(-1, _mm256_blendv_epi8(p0, op0_narrow, elig_and_fm));
-        store_row(0, _mm256_blendv_epi8(q0, oq0_narrow, elig_and_fm));
-        store_row(1, _mm256_blendv_epi8(q1, oq1_narrow, elig_and_fm));
+        store_narrow_only();
         return FilterWriteScope::NarrowOrWide8;
     }
 
@@ -152,10 +156,7 @@ unsafe fn loop_filter_horiz8_core(
     // Fast path 1b: no active wide lane passed `flat_mask` -> every active lane takes narrow!
     // Avoids computing wide8, loading p4..q7, computing wide16, and writing p2/q2.
     if _mm256_testz_si256(elig_flat, elig_flat) != 0 {
-        store_row(-2, _mm256_blendv_epi8(p1, op1_narrow, elig_and_fm));
-        store_row(-1, _mm256_blendv_epi8(p0, op0_narrow, elig_and_fm));
-        store_row(0, _mm256_blendv_epi8(q0, oq0_narrow, elig_and_fm));
-        store_row(1, _mm256_blendv_epi8(q1, oq1_narrow, elig_and_fm));
+        store_narrow_only();
         return FilterWriteScope::NarrowOrWide8;
     }
 
@@ -179,9 +180,7 @@ unsafe fn loop_filter_horiz8_core(
     b8 = add(sub(b8, p1), q3);
     let oq2_wide = round2_3(add(b8, q2));
 
-    // Fast path 2: no active flat lane is TX_16X16 -> skip p4..q7 loads & wide16.
-    let elig_flat_tx16 = _mm256_and_si256(elig_flat, is_tx16_v);
-    if _mm256_testz_si256(elig_flat_tx16, elig_flat_tx16) != 0 {
+    let store_narrow_or_wide8 = || {
         let use_wide8 = elig_flat;
         let use_narrow = _mm256_andnot_si256(flat_mask, elig_and_fm);
         let blend3 = |orig: __m256i, narrow: __m256i, wide: __m256i| {
@@ -197,6 +196,12 @@ unsafe fn loop_filter_horiz8_core(
         store_row(0, blend3(q0, oq0_narrow, oq0_wide));
         store_row(1, blend3(q1, oq1_narrow, oq1_wide));
         store_row(2, _mm256_blendv_epi8(q2, oq2_wide, use_wide8));
+    };
+
+    // Fast path 2: no active flat lane is TX_16X16 -> skip p4..q7 loads & wide16.
+    let elig_flat_tx16 = _mm256_and_si256(elig_flat, is_tx16_v);
+    if _mm256_testz_si256(elig_flat_tx16, elig_flat_tx16) != 0 {
+        store_narrow_or_wide8();
         return FilterWriteScope::NarrowOrWide8;
     }
 
@@ -223,21 +228,7 @@ unsafe fn loop_filter_horiz8_core(
 
     // Fast path 2b: flat_mask2 failed on all active TX_16X16 lanes -> skip all 14 wide16 sums!
     if _mm256_testz_si256(use_wide16, use_wide16) != 0 {
-        let use_wide8 = elig_flat;
-        let use_narrow = _mm256_andnot_si256(flat_mask, elig_and_fm);
-        let blend3 = |orig: __m256i, narrow: __m256i, wide: __m256i| {
-            _mm256_blendv_epi8(
-                _mm256_blendv_epi8(orig, narrow, use_narrow),
-                wide,
-                use_wide8,
-            )
-        };
-        store_row(-3, _mm256_blendv_epi8(p2, op2_wide, use_wide8));
-        store_row(-2, blend3(p1, op1_narrow, op1_wide));
-        store_row(-1, blend3(p0, op0_narrow, op0_wide));
-        store_row(0, blend3(q0, oq0_narrow, oq0_wide));
-        store_row(1, blend3(q1, oq1_narrow, oq1_wide));
-        store_row(2, _mm256_blendv_epi8(q2, oq2_wide, use_wide8));
+        store_narrow_or_wide8();
         return FilterWriteScope::NarrowOrWide8;
     }
 
@@ -354,6 +345,25 @@ pub unsafe fn loop_filter_horiz8_avx2(
     );
 }
 
+/// Builds `(eligible_v, is_tx8_v, is_tx16_v)` lane masks for uniform-parameter 8-lane batches
+/// (`active_lanes` is 4 or 8; `filter_size` is `TX_4X4` (0), `TX_8X8` (1), or `TX_16X16` (2)).
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()`.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn uniform_lane_masks(active_lanes: u32, filter_size: u8) -> (__m256i, __m256i, __m256i) {
+    let eligible_v = if active_lanes == 8 {
+        _mm256_set1_epi32(-1)
+    } else {
+        _mm256_setr_epi32(-1, -1, -1, -1, 0, 0, 0, 0)
+    };
+    let zero = _mm256_setzero_si256();
+    let is_tx8_v = if filter_size == 1 { eligible_v } else { zero };
+    let is_tx16_v = if filter_size == 2 { eligible_v } else { zero };
+    (eligible_v, is_tx8_v, is_tx16_v)
+}
+
 /// Uniform-parameter horizontal 8-lane AVX2 loop filter: all active lanes (`active_lanes == 8`
 /// for the common interior case, or `4` for the odd-MI chroma edge case) share one `(filter_size,
 /// limit, blimit, thresh)` derived from a single MI lookup — no 6 stack `[i32; 8]` arrays.
@@ -375,21 +385,7 @@ pub unsafe fn loop_filter_horiz8_uniform_avx2(
     thresh: i32,
     bit_depth: u8,
 ) {
-    let eligible_v = if active_lanes == 8 {
-        _mm256_set1_epi32(-1)
-    } else {
-        _mm256_setr_epi32(-1, -1, -1, -1, 0, 0, 0, 0)
-    };
-    let is_tx8_v = if filter_size == 1 {
-        eligible_v
-    } else {
-        _mm256_setzero_si256()
-    };
-    let is_tx16_v = if filter_size == 2 {
-        eligible_v
-    } else {
-        _mm256_setzero_si256()
-    };
+    let (eligible_v, is_tx8_v, is_tx16_v) = uniform_lane_masks(active_lanes, filter_size);
     let _ = loop_filter_horiz8_core(
         plane_base,
         plane_width,
@@ -594,21 +590,7 @@ pub unsafe fn loop_filter_vert8_uniform_avx2(
     thresh: i32,
     bit_depth: u8,
 ) {
-    let eligible_v = if active_lanes == 8 {
-        _mm256_set1_epi32(-1)
-    } else {
-        _mm256_setr_epi32(-1, -1, -1, -1, 0, 0, 0, 0)
-    };
-    let is_tx8_v = if filter_size == 1 {
-        eligible_v
-    } else {
-        _mm256_setzero_si256()
-    };
-    let is_tx16_v = if filter_size == 2 {
-        eligible_v
-    } else {
-        _mm256_setzero_si256()
-    };
+    let (eligible_v, is_tx8_v, is_tx16_v) = uniform_lane_masks(active_lanes, filter_size);
     loop_filter_vert8_core(
         plane_base,
         plane_width,

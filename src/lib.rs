@@ -62,6 +62,7 @@ pub mod transform;
 #[path = "../tests/unit/support.rs"]
 mod unit_test_support;
 
+use std::fmt;
 use std::sync::Arc;
 
 use compressed_header::{
@@ -71,7 +72,7 @@ use counts::{adapt_coef_probs, adapt_noncoef_probs};
 use dpb::{Dpb, RefFrameData};
 use header::{
     parse_uncompressed_header, ColorConfig, FrameHeader, FrameType, HeaderError, LoopFilterDeltas,
-    PersistentState, SegFeaturePersist, CS_UNKNOWN,
+    PersistentState, SegFeaturePersist,
 };
 use tile::{MiGrid, TileDecoder, TileError};
 
@@ -109,6 +110,31 @@ impl From<CompressedHeaderError> for DecodeError {
 impl From<TileError> for DecodeError {
     fn from(e: TileError) -> Self {
         DecodeError::Tile(e)
+    }
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecodeError::Header(e) => write!(f, "uncompressed header error: {e}"),
+            DecodeError::CompressedHeader(e) => write!(f, "compressed header error: {e}"),
+            DecodeError::Tile(e) => write!(f, "tile decode error: {e}"),
+            DecodeError::TruncatedFrame => f.write_str("truncated VP9 frame data"),
+            DecodeError::MissingReferenceFrame => {
+                f.write_str("show_existing_frame references an empty DPB slot")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DecodeError::Header(e) => Some(e),
+            DecodeError::CompressedHeader(e) => Some(e),
+            DecodeError::Tile(e) => Some(e),
+            DecodeError::TruncatedFrame | DecodeError::MissingReferenceFrame => None,
+        }
     }
 }
 
@@ -495,13 +521,8 @@ impl Decoder {
     /// an inter frame arrives before any intra frame).
     fn resolve_color_config(&mut self, header: &header::NewFrameHeader) -> ColorConfig {
         let color_config = header.color_config.unwrap_or_else(|| {
-            self.last_color_config.unwrap_or(ColorConfig {
-                bit_depth: 8,
-                color_space: CS_UNKNOWN,
-                color_range: false,
-                subsampling_x: 1,
-                subsampling_y: 1,
-            })
+            self.last_color_config
+                .unwrap_or_else(ColorConfig::fallback_inter)
         });
         if header.frame_is_intra {
             self.last_color_config = Some(color_config);

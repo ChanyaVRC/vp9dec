@@ -11,6 +11,8 @@
 //! [`parse_uncompressed_header`] is designed to receive them from the caller
 //! (the caller holds the cross-frame state).
 
+use std::fmt;
+
 use crate::bit_reader::BitReader;
 // The values of `ref_frame`/`interpolation_filter` and the number of reference
 // frame slots are shared across multiple modules (motion vector prediction in
@@ -64,6 +66,26 @@ pub enum HeaderError {
     RefFrameFormatMismatch,
 }
 
+impl fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HeaderError::InvalidFrameMarker => f.write_str("invalid VP9 frame marker (expected 2)"),
+            HeaderError::InvalidSyncCode => f.write_str("invalid VP9 sync code"),
+            HeaderError::InvalidColorConfigForProfile => {
+                f.write_str("RGB color space is not permitted for VP9 profile 0 or 2")
+            }
+            HeaderError::FrameSizeTooLarge => {
+                f.write_str("frame dimensions exceed decoder allocation limit")
+            }
+            HeaderError::RefFrameFormatMismatch => {
+                f.write_str("reference frame bit depth or subsampling does not match current frame")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HeaderError {}
+
 /// Upper bound on `FrameWidth * FrameHeight` (luma samples) this decoder will allocate a frame
 /// buffer for; larger headers are rejected as [`HeaderError::FrameSizeTooLarge`]. Chosen to sit
 /// far above any real content (8K UHD is ~33M samples) yet far below the bitstream's pathological
@@ -104,6 +126,31 @@ pub struct ColorConfig {
     pub color_range: bool,
     pub subsampling_x: u8,
     pub subsampling_y: u8,
+}
+
+impl ColorConfig {
+    /// Spec §6.2.2 default color config for `intra_only` frames in profile 0 (8-bit, BT.601,
+    /// studio range, 4:2:0).
+    pub(crate) const fn default_intra_only_profile0() -> Self {
+        Self {
+            bit_depth: 8,
+            color_space: CS_BT_601,
+            color_range: false,
+            subsampling_x: 1,
+            subsampling_y: 1,
+        }
+    }
+
+    /// Fallback color config when a non-intra frame arrives before any key or intra-only frame.
+    pub(crate) const fn fallback_inter() -> Self {
+        Self {
+            bit_depth: 8,
+            color_space: CS_UNKNOWN,
+            color_range: false,
+            subsampling_x: 1,
+            subsampling_y: 1,
+        }
+    }
 }
 
 /// The loop filter's `ref_deltas`/`mode_deltas` (spec §7.2), persisted across frames by the
@@ -666,6 +713,17 @@ fn parse_tile_info(r: &mut BitReader, sb64_cols: u32) -> (u32, u32) {
     (tile_cols_log2, tile_rows_log2)
 }
 
+/// Spec §6.2.1 `frame_sync_code()`: the 3-byte magic sequence `0x49 0x83 0x42`.
+const VP9_SYNC_CODE: [u32; 3] = [0x49, 0x83, 0x42];
+
+fn verify_sync_code(r: &mut BitReader) -> Result<(), HeaderError> {
+    let sync = [r.f(8), r.f(8), r.f(8)];
+    if sync != VP9_SYNC_CODE {
+        return Err(HeaderError::InvalidSyncCode);
+    }
+    Ok(())
+}
+
 /// Parses `uncompressed_header()` (spec §6.2).
 ///
 /// `prev` carries the cross-frame state spec §7.2 requires (see [`PersistentState`]):
@@ -724,11 +782,7 @@ pub fn parse_uncompressed_header(
     let frame_is_intra;
 
     if frame_type == FrameType::KeyFrame {
-        // frame_sync_code()
-        let sync = [r.f(8), r.f(8), r.f(8)];
-        if sync != [0x49, 0x83, 0x42] {
-            return Err(HeaderError::InvalidSyncCode);
-        }
+        verify_sync_code(&mut r)?;
         color_config = Some(parse_color_config(&mut r, profile)?);
         let (w, h) = parse_frame_size(&mut r);
         let (rw, rh) = parse_render_size(&mut r, w, h);
@@ -749,23 +803,12 @@ pub fn parse_uncompressed_header(
         };
 
         if intra_only {
-            // frame_sync_code()
-            let sync = [r.f(8), r.f(8), r.f(8)];
-            if sync != [0x49, 0x83, 0x42] {
-                return Err(HeaderError::InvalidSyncCode);
-            }
+            verify_sync_code(&mut r)?;
             color_config = Some(if profile > 0 {
                 parse_color_config(&mut r, profile)?
             } else {
-                // Not read from the bitstream, but not a fabrication either: this is the
-                // spec-defined default for intra_only + profile 0 (spec §6.2.2).
-                ColorConfig {
-                    bit_depth: 8,
-                    color_space: CS_BT_601,
-                    color_range: false,
-                    subsampling_x: 1,
-                    subsampling_y: 1,
-                }
+                // Spec-defined default for intra_only + profile 0 (spec §6.2.2).
+                ColorConfig::default_intra_only_profile0()
             });
             refresh_frame_flags = r.f(8) as u8;
             let (w, h) = parse_frame_size(&mut r);
