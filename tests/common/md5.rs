@@ -40,8 +40,8 @@ const K: [u32; 64] = [
 /// Processes one block (64 bytes) and updates `state` (`A,B,C,D`) (RFC 1321 §3.4).
 fn process_block(state: &mut [u32; 4], block: &[u8; 64]) {
     let mut m = [0u32; 16];
-    for (i, chunk) in block.chunks_exact(4).enumerate() {
-        m[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+        m[i] = u32::from_le_bytes(*chunk);
     }
 
     let [mut a, mut b, mut c, mut d] = *state;
@@ -83,8 +83,7 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
     padded.extend_from_slice(&bit_len.to_le_bytes());
     debug_assert_eq!(padded.len() % 64, 0);
 
-    for block in padded.chunks_exact(64) {
-        let block: &[u8; 64] = block.try_into().unwrap();
+    for block in padded.as_chunks::<64>().0 {
         process_block(&mut state, block);
     }
 

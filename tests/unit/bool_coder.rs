@@ -168,5 +168,5 @@ fn exit_bool_does_not_panic_and_advances_to_end() {
     let mut dec = BoolDecoder::new(&buf).expect("valid bitstream");
     let _ = dec.read_literal(4);
     dec.exit_bool();
-    assert_eq!(dec.bit_pos, buf.len() * 8);
+    assert_eq!(dec.bit_position(), buf.len() * 8);
 }

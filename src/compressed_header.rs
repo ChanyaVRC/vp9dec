@@ -484,14 +484,13 @@ fn mv_probs(r: &mut BoolDecoder, allow_high_precision_mv: bool, probs: &mut Comp
         }
     }
     for i in 0..2 {
-        for j in 0..2 {
-            for k in 0..probs.mv_class0_fr_probs[i][j].len() {
-                probs.mv_class0_fr_probs[i][j][k] =
-                    update_mv_prob(r, probs.mv_class0_fr_probs[i][j][k]);
+        for class0_fr in &mut probs.mv_class0_fr_probs[i] {
+            for prob in class0_fr.iter_mut() {
+                *prob = update_mv_prob(r, *prob);
             }
         }
-        for k in 0..probs.mv_fr_probs[i].len() {
-            probs.mv_fr_probs[i][k] = update_mv_prob(r, probs.mv_fr_probs[i][k]);
+        for prob in probs.mv_fr_probs[i].iter_mut() {
+            *prob = update_mv_prob(r, *prob);
         }
     }
     if allow_high_precision_mv {

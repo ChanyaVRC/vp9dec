@@ -125,7 +125,7 @@ impl TileDecoder {
             ctx += 1;
         }
         let skip = r.read_bool(self.probs.skip_prob[ctx]);
-        if !self.frame_is_intra {
+        if self.collect_counts && !self.frame_is_intra {
             self.counts.skip[ctx][skip as usize] += 1;
         }
         skip
@@ -171,7 +171,7 @@ impl TileDecoder {
                 TX_16X16 => r.read_tree(&TX_SIZE_16_TREE, |node| probs[node]) as u8,
                 _ => r.read_tree(&TX_SIZE_8_TREE, |node| probs[node]) as u8,
             };
-            if !self.frame_is_intra {
+            if self.collect_counts && !self.frame_is_intra {
                 self.counts.tx_size[max_tx_size as usize][ctx][tx_size as usize] += 1;
             }
             tx_size
@@ -344,7 +344,9 @@ impl TileDecoder {
             0
         };
         let is_inter = r.read_bool(self.probs.is_inter_prob[ctx]);
-        self.counts.is_inter[ctx][is_inter as usize] += 1;
+        if self.collect_counts {
+            self.counts.is_inter[ctx][is_inter as usize] += 1;
+        }
         is_inter
     }
 
@@ -363,7 +365,9 @@ impl TileDecoder {
             let ctx = SIZE_GROUP_LOOKUP[mi_size as usize] as usize;
             let mode =
                 r.read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[ctx][node]) as u8;
-            self.counts.intra_mode[ctx][mode as usize] += 1;
+            if self.collect_counts {
+                self.counts.intra_mode[ctx][mode as usize] += 1;
+            }
             y_mode = mode;
             sub_modes = [mode; 4];
         } else {
@@ -378,7 +382,9 @@ impl TileDecoder {
                     let mode = r
                         .read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[0][node])
                         as u8;
-                    self.counts.intra_mode[0][mode as usize] += 1;
+                    if self.collect_counts {
+                        self.counts.intra_mode[0][mode as usize] += 1;
+                    }
                     for y2 in 0..num4x4h {
                         for x2 in 0..num4x4w {
                             sub_modes[((idy + y2) * 2 + idx + x2) as usize] = mode;
@@ -395,7 +401,9 @@ impl TileDecoder {
         let uv_mode = r.read_tree(&INTRA_MODE_TREE, |node| {
             self.probs.uv_mode_probs[y_mode as usize][node]
         }) as u8;
-        self.counts.uv_mode[y_mode as usize][uv_mode as usize] += 1;
+        if self.collect_counts {
+            self.counts.uv_mode[y_mode as usize][uv_mode as usize] += 1;
+        }
 
         Ok(MiInfo {
             skip,
@@ -428,7 +436,9 @@ impl TileDecoder {
         let comp_mode = if self.reference_mode == REFERENCE_MODE_SELECT {
             let ctx = self.comp_mode_ctx(n);
             let bit = r.read_bool(self.probs.comp_mode_prob[ctx]);
-            self.counts.comp_mode[ctx][bit as usize] += 1;
+            if self.collect_counts {
+                self.counts.comp_mode[ctx][bit as usize] += 1;
+            }
             (bit as u8) + SINGLE_REFERENCE
         } else {
             self.reference_mode
@@ -438,7 +448,9 @@ impl TileDecoder {
             let idx = self.ref_frame_sign_bias[self.comp_fixed_ref as usize] as usize;
             let ctx = self.comp_ref_ctx(n);
             let comp_ref = r.read_bool(self.probs.comp_ref_prob[ctx]) as usize;
-            self.counts.comp_ref[ctx][comp_ref] += 1;
+            if self.collect_counts {
+                self.counts.comp_ref[ctx][comp_ref] += 1;
+            }
             let mut ref_frame = [0u8; 2];
             ref_frame[idx] = self.comp_fixed_ref;
             ref_frame[1 - idx] = self.comp_var_ref[comp_ref];
@@ -446,11 +458,15 @@ impl TileDecoder {
         } else {
             let ctx1 = self.single_ref_p1_ctx(n);
             let single_ref_p1 = r.read_bool(self.probs.single_ref_prob[ctx1][0]);
-            self.counts.single_ref[ctx1][0][single_ref_p1 as usize] += 1;
+            if self.collect_counts {
+                self.counts.single_ref[ctx1][0][single_ref_p1 as usize] += 1;
+            }
             if single_ref_p1 {
                 let ctx2 = self.single_ref_p2_ctx(n);
                 let single_ref_p2 = r.read_bool(self.probs.single_ref_prob[ctx2][1]);
-                self.counts.single_ref[ctx2][1][single_ref_p2 as usize] += 1;
+                if self.collect_counts {
+                    self.counts.single_ref[ctx2][1][single_ref_p2 as usize] += 1;
+                }
                 [
                     if single_ref_p2 {
                         ALTREF_FRAME
@@ -535,7 +551,9 @@ impl TileDecoder {
             let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
                 self.probs.inter_mode_probs[ctx][node]
             }) as u8;
-            self.counts.inter_mode[ctx][inter_mode as usize] += 1;
+            if self.collect_counts {
+                self.counts.inter_mode[ctx][inter_mode as usize] += 1;
+            }
             y_mode = NEARESTMV + inter_mode;
         }
 
@@ -544,7 +562,9 @@ impl TileDecoder {
             let f = r.read_tree(&INTERP_FILTER_TREE, |node| {
                 self.probs.interp_filter_probs[ctx][node]
             }) as u8;
-            self.counts.interp_filter[ctx][f as usize] += 1;
+            if self.collect_counts {
+                self.counts.interp_filter[ctx][f as usize] += 1;
+            }
             f
         } else {
             self.interpolation_filter
@@ -563,7 +583,9 @@ impl TileDecoder {
                     let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
                         self.probs.inter_mode_probs[ctx][node]
                     }) as u8;
-                    self.counts.inter_mode[ctx][inter_mode as usize] += 1;
+                    if self.collect_counts {
+                        self.counts.inter_mode[ctx][inter_mode as usize] += 1;
+                    }
                     y_mode = NEARESTMV + inter_mode;
                     let block = (idy * 2 + idx) as i32;
                     if y_mode == NEARESTMV || y_mode == NEARMV {
@@ -644,7 +666,9 @@ impl TileDecoder {
     fn read_mv(&mut self, r: &mut BoolDecoder, best_mv: Mv) -> Mv {
         let use_hp = self.allow_high_precision_mv && use_mv_hp(best_mv);
         let mv_joint = r.read_tree(&MV_JOINT_TREE, |node| self.probs.mv_joint_probs[node]) as u8;
-        self.counts.mv_joint[mv_joint as usize] += 1;
+        if self.collect_counts {
+            self.counts.mv_joint[mv_joint as usize] += 1;
+        }
         let mut diff = ZERO_MV;
         if mv_joint == MV_JOINT_HZVNZ || mv_joint == MV_JOINT_HNZVNZ {
             diff[0] = self.read_mv_component(r, 0, use_hp);
@@ -657,41 +681,58 @@ impl TileDecoder {
 
     /// `read_mv_component( comp )` (spec §6.4.20).
     fn read_mv_component(&mut self, r: &mut BoolDecoder, comp: usize, use_hp: bool) -> i32 {
+        let collect = self.collect_counts;
         let sign = r.read_bool(self.probs.mv_sign_prob[comp]);
-        self.counts.mv_sign[comp][sign as usize] += 1;
+        if collect {
+            self.counts.mv_sign[comp][sign as usize] += 1;
+        }
         let mv_class =
             r.read_tree(&MV_CLASS_TREE, |node| self.probs.mv_class_probs[comp][node]) as usize;
-        self.counts.mv_class[comp][mv_class] += 1;
+        if collect {
+            self.counts.mv_class[comp][mv_class] += 1;
+        }
         let mag: u32 = if mv_class == 0 {
             let class0_bit = r.read_bool(self.probs.mv_class0_bit_prob[comp]) as u32;
-            self.counts.mv_class0_bit[comp][class0_bit as usize] += 1;
+            if collect {
+                self.counts.mv_class0_bit[comp][class0_bit as usize] += 1;
+            }
             let class0_fr = r.read_tree(&MV_FR_TREE, |node| {
                 self.probs.mv_class0_fr_probs[comp][class0_bit as usize][node]
             }) as u32;
-            self.counts.mv_class0_fr[comp][class0_bit as usize][class0_fr as usize] += 1;
+            if collect {
+                self.counts.mv_class0_fr[comp][class0_bit as usize][class0_fr as usize] += 1;
+            }
             let class0_hp = if use_hp {
                 r.read_bool(self.probs.mv_class0_hp_prob[comp]) as u32
             } else {
                 1
             };
-            self.counts.mv_class0_hp[comp][class0_hp as usize] += 1;
+            if collect {
+                self.counts.mv_class0_hp[comp][class0_hp as usize] += 1;
+            }
             ((class0_bit << 3) | (class0_fr << 1) | class0_hp) + 1
         } else {
             let mut d: u32 = 0;
             for i in 0..mv_class {
                 let bit = r.read_bool(self.probs.mv_bits_prob[comp][i]) as u32;
-                self.counts.mv_bits[comp][i][bit as usize] += 1;
+                if collect {
+                    self.counts.mv_bits[comp][i][bit as usize] += 1;
+                }
                 d |= bit << i;
             }
             let mut mag = 2u32 << (mv_class + 2); // CLASS0_SIZE(2) << (mv_class+2)
             let fr = r.read_tree(&MV_FR_TREE, |node| self.probs.mv_fr_probs[comp][node]) as u32;
-            self.counts.mv_fr[comp][fr as usize] += 1;
+            if collect {
+                self.counts.mv_fr[comp][fr as usize] += 1;
+            }
             let hp = if use_hp {
                 r.read_bool(self.probs.mv_hp_prob[comp]) as u32
             } else {
                 1
             };
-            self.counts.mv_hp[comp][hp as usize] += 1;
+            if collect {
+                self.counts.mv_hp[comp][hp as usize] += 1;
+            }
             mag += ((d << 3) | (fr << 1) | hp) + 1;
             mag
         };

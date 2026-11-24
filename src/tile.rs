@@ -198,6 +198,16 @@ impl MiGrid {
         }
     }
 
+    /// Reuses a pooled column-strip `MiGrid` for `(cols, rows, col0)` if its allocation matches.
+    pub(super) fn try_reuse_as_strip(&mut self, cols: usize, rows: usize, col0: u32) -> bool {
+        if self.cols == cols && self.rows == rows && self.data.len() == cols * rows {
+            self.col0 = col0;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn cols(&self) -> usize {
         self.cols
     }
@@ -206,12 +216,26 @@ impl MiGrid {
         self.rows
     }
 
+    #[inline]
     pub fn get(&self, row: u32, col: u32) -> &MiInfo {
         &self.data[row as usize * self.cols + (col - self.col0) as usize]
     }
 
+    #[cfg(test)]
     fn get_mut(&mut self, row: u32, col: u32) -> &mut MiInfo {
         &mut self.data[row as usize * self.cols + (col - self.col0) as usize]
+    }
+
+    #[inline]
+    fn fill_rect(&mut self, row: u32, col: u32, bw: u32, bh: u32, info: MiInfo) {
+        let c = (col - self.col0) as usize;
+        let bw = bw as usize;
+        let stride = self.cols;
+        let mut base = row as usize * stride + c;
+        for _ in 0..bh {
+            self.data[base..base + bw].fill(info);
+            base += stride;
+        }
     }
 }
 
@@ -312,6 +336,14 @@ pub struct TileDecoder {
 
     // --- Counter collection for probability adaptation (spec §8.4, spec §9.3.4). ---
     counts: Counts,
+    /// Whether this frame will actually use `counts` for backward adaptation. Defaults to `true`
+    /// for standalone `TileDecoder` callers/tests; `Decoder` disables it when
+    /// `!refresh_frame_context || error_resilient_mode || frame_parallel_decoding_mode`.
+    collect_counts: bool,
+
+    // --- Reusable per-block scratch for `tokens_and_reconstruct` (avoids 9 KB stack zeroing). ---
+    dequant_buf: [i64; 1024],
+    token_cache_buf: [u8; 1024],
 }
 
 impl TileDecoder {
@@ -362,6 +394,34 @@ impl TileDecoder {
         resolved_refs: [Option<Arc<RefFrameData>>; 3],
         prev_segment_ids: Arc<Vec<u8>>,
     ) -> Self {
+        Self::new_with_buffers(
+            header,
+            color_config,
+            compressed,
+            use_prev_frame_mvs,
+            prev_mi_grid,
+            resolved_refs,
+            prev_segment_ids,
+            None,
+            None,
+        )
+    }
+
+    /// Like [`TileDecoder::new_with_prev`], reusing caller-supplied pooled `planes` and/or
+    /// `mi_grid` allocations when their geometry matches this frame (avoiding ~9 MB/frame of
+    /// allocation + zeroing at 1080p).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_buffers(
+        header: &NewFrameHeader,
+        color_config: ColorConfig,
+        compressed: &CompressedHeader,
+        use_prev_frame_mvs: bool,
+        prev_mi_grid: Option<Arc<MiGrid>>,
+        resolved_refs: [Option<Arc<RefFrameData>>; 3],
+        prev_segment_ids: Arc<Vec<u8>>,
+        recycled_planes: Option<[Plane; 3]>,
+        recycled_mi_grid: Option<MiGrid>,
+    ) -> Self {
         let image_size = header::compute_image_size(header.width, header.height);
         let grid_cols = (image_size.sb64_cols * 8) as usize;
         let grid_rows = (image_size.sb64_rows * 8) as usize;
@@ -374,11 +434,30 @@ impl TileDecoder {
         let y_h = (image_size.sb64_rows * 64) as usize;
         let uv_w = y_w >> subsampling_x;
         let uv_h = y_h >> subsampling_y;
-        let planes = [
-            Plane::new(y_w, y_h),
-            Plane::new(uv_w, uv_h),
-            Plane::new(uv_w, uv_h),
-        ];
+        let planes = if let Some(mut p) = recycled_planes {
+            if p[0].try_reuse_as(y_w, y_h)
+                && p[1].try_reuse_as(uv_w, uv_h)
+                && p[2].try_reuse_as(uv_w, uv_h)
+            {
+                p
+            } else {
+                [
+                    Plane::new(y_w, y_h),
+                    Plane::new(uv_w, uv_h),
+                    Plane::new(uv_w, uv_h),
+                ]
+            }
+        } else {
+            [
+                Plane::new(y_w, y_h),
+                Plane::new(uv_w, uv_h),
+                Plane::new(uv_w, uv_h),
+            ]
+        };
+        let mi_grid = match recycled_mi_grid {
+            Some(g) if g.cols == grid_cols && g.rows == grid_rows && g.col0 == 0 => g,
+            _ => MiGrid::new(grid_cols, grid_rows),
+        };
         // AboveNonzeroContext persists across the whole frame width in 4x4 units (2x the 8x8 mi unit).
         let above_nz_len = grid_cols * 2;
         let above_nonzero_context = [
@@ -395,7 +474,7 @@ impl TileDecoder {
             mi_rows: image_size.mi_rows,
             tile_cols_log2: header.tile_cols_log2,
             tile_rows_log2: header.tile_rows_log2,
-            mi_grid: MiGrid::new(grid_cols, grid_rows),
+            mi_grid,
             above_partition_context: vec![0u8; grid_cols],
             left_partition_context: [0u8; 8],
             above_seg_pred_context: vec![0u8; grid_cols],
@@ -433,7 +512,22 @@ impl TileDecoder {
             frame_height: header.height,
             resolved_refs,
             counts: Counts::new(),
+            collect_counts: true,
+            dequant_buf: [0i64; 1024],
+            token_cache_buf: [0u8; 1024],
         }
+    }
+
+    /// Configures whether syntax-element counters are accumulated during tile decode.
+    pub(crate) fn set_collect_counts(&mut self, collect: bool) {
+        self.collect_counts = collect;
+    }
+
+    /// Consumes `self`, dropping its read-only reference-frame and previous-grid `Arc` handles
+    /// and handing back its decoded `(planes, mi_grid)` by value for zero-copy DPB storage and
+    /// buffer pooling.
+    pub(crate) fn into_parts(self) -> ([Plane; 3], MiGrid) {
+        (self.planes, self.mi_grid)
     }
 
     /// The collected syntax element counters (used for probability adaptation, spec §8.4).
@@ -479,6 +573,26 @@ impl TileDecoder {
         );
     }
 
+    /// Like [`Self::apply_loop_filter`], reusing `pool`'s persistent worker threads.
+    pub(crate) fn apply_loop_filter_with_pool(
+        &mut self,
+        lf: &header::LoopFilterParams,
+        pool: &mut crate::thread_pool::ThreadPool,
+    ) {
+        crate::loop_filter::loop_filter_frame_with_pool(
+            &mut self.planes,
+            &self.mi_grid,
+            self.mi_cols,
+            self.mi_rows,
+            self.subsampling_x,
+            self.subsampling_y,
+            lf,
+            &self.segmentation,
+            self.bit_depth,
+            Some(pool),
+        );
+    }
+
     /// `clear_above_context( )` (spec §7.4.1): also clears `AboveSegPredContext`.
     fn clear_above_context(&mut self) {
         self.above_partition_context.iter_mut().for_each(|v| *v = 0);
@@ -498,6 +612,26 @@ impl TileDecoder {
     /// `decode_tiles( sz )` (spec §6.4). `data` is the entire tile data following the
     /// uncompressed header, excluding the compressed header (the rest of the frame data).
     pub fn decode_tiles(&mut self, data: &[u8]) -> Result<(), TileError> {
+        self.decode_tiles_inner(data, None, None)
+    }
+
+    /// Like [`Self::decode_tiles`], reusing persistent worker threads and pooled column-worker
+    /// `TileDecoder` strip buffers across frames.
+    pub(crate) fn decode_tiles_with_pool(
+        &mut self,
+        data: &[u8],
+        pool: &mut crate::thread_pool::ThreadPool,
+        worker_pool: &mut Vec<TileDecoder>,
+    ) -> Result<(), TileError> {
+        self.decode_tiles_inner(data, Some(pool), Some(worker_pool))
+    }
+
+    fn decode_tiles_inner(
+        &mut self,
+        data: &[u8],
+        pool: Option<&mut crate::thread_pool::ThreadPool>,
+        worker_pool: Option<&mut Vec<TileDecoder>>,
+    ) -> Result<(), TileError> {
         let tile_cols = 1u32 << self.tile_cols_log2;
         let tile_rows = 1u32 << self.tile_rows_log2;
 
@@ -513,7 +647,7 @@ impl TileDecoder {
         if use_parallel {
             let max_workers = parallel::available_tile_workers();
             if max_workers > 1 {
-                return self.decode_tiles_parallel(data, tile_cols, max_workers);
+                return self.decode_tiles_parallel(data, tile_cols, max_workers, pool, worker_pool);
             }
         }
 
@@ -606,9 +740,10 @@ impl TileDecoder {
         if bsize == BLOCK_8X8 || partition != PARTITION_SPLIT {
             let above_val = 15u8 >> B_WIDTH_LOG2_LOOKUP[subsize as usize];
             let left_val = 15u8 >> B_HEIGHT_LOG2_LOOKUP[subsize as usize];
+            let c0 = col as usize;
+            self.above_partition_context[c0..c0 + num8x8 as usize].fill(above_val);
             for i in 0..num8x8 {
-                self.above_partition_context[(col + i) as usize] = above_val;
-                self.left_partition_context[((row + i) % 8) as usize] = left_val;
+                self.left_partition_context[((row + i) & 7) as usize] = left_val;
             }
         }
         Ok(())
@@ -674,7 +809,7 @@ impl TileDecoder {
         } else {
             PARTITION_SPLIT
         };
-        if !self.frame_is_intra {
+        if self.collect_counts && !self.frame_is_intra {
             self.counts.partition[ctx][partition as usize] += 1;
         }
         partition
@@ -742,11 +877,7 @@ impl TileDecoder {
 
         let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize] as u32;
         let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[subsize as usize] as u32;
-        for y in 0..bh {
-            for x in 0..bw {
-                *self.mi_grid.get_mut(row + y, col + x) = info;
-            }
-        }
+        self.mi_grid.fill_rect(row, col, bw, bh, info);
         Ok(())
     }
 }

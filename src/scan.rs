@@ -184,6 +184,74 @@ pub enum TxSize {
     Tx32x32,
 }
 
+/// Precomputes the `(nb0, nb1)` token-cache neighbor indices (spec §9.3.2) for every scan
+/// position `c` of a transform scan table of side length `nn`. Entry 0 is unused (`c == 0` uses
+/// the block's above/left nonzero context instead).
+///
+/// `mode`: 0 = default/both (`DctDct` / `AdstAdst`), 1 = col-only (`DctAdst`), 2 = row-only (`AdstDct`).
+const fn build_nb<const N: usize>(scan: &[u16; N], nn: usize, mode: u8) -> [[u16; 2]; N] {
+    let mut out = [[0u16; 2]; N];
+    let mut c = 1;
+    while c < N {
+        let pos = scan[c] as usize;
+        let i = pos / nn;
+        let j = pos % nn;
+        let (nb0, nb1) = if i > 0 && j > 0 {
+            let a = (i - 1) * nn + j;
+            let a2 = i * nn + j - 1;
+            match mode {
+                1 => (a, a),
+                2 => (a2, a2),
+                _ => (a, a2),
+            }
+        } else if i > 0 {
+            let a = (i - 1) * nn + j;
+            (a, a)
+        } else {
+            let a = i * nn + j - 1;
+            (a, a)
+        };
+        out[c] = [nb0 as u16, nb1 as u16];
+        c += 1;
+    }
+    out
+}
+
+const DEFAULT_NB_4X4: [[u16; 2]; 16] = build_nb(&DEFAULT_SCAN_4X4, 4, 0);
+const COL_NB_4X4: [[u16; 2]; 16] = build_nb(&COL_SCAN_4X4, 4, 1);
+const ROW_NB_4X4: [[u16; 2]; 16] = build_nb(&ROW_SCAN_4X4, 4, 2);
+const DEFAULT_NB_8X8: [[u16; 2]; 64] = build_nb(&DEFAULT_SCAN_8X8, 8, 0);
+const COL_NB_8X8: [[u16; 2]; 64] = build_nb(&COL_SCAN_8X8, 8, 1);
+const ROW_NB_8X8: [[u16; 2]; 64] = build_nb(&ROW_SCAN_8X8, 8, 2);
+const DEFAULT_NB_16X16: [[u16; 2]; 256] = build_nb(&DEFAULT_SCAN_16X16, 16, 0);
+const COL_NB_16X16: [[u16; 2]; 256] = build_nb(&COL_SCAN_16X16, 16, 1);
+const ROW_NB_16X16: [[u16; 2]; 256] = build_nb(&ROW_SCAN_16X16, 16, 2);
+const DEFAULT_NB_32X32: [[u16; 2]; 1024] = build_nb(&DEFAULT_SCAN_32X32, 32, 0);
+
+/// Returns both the scan-order table and its precomputed `(nb0, nb1)` neighbor-context table
+/// for `(tx_size, tx_type)`, avoiding per-coefficient division/modulo/branching in token decode.
+#[inline]
+pub fn get_scan_and_nb(tx_size: TxSize, tx_type: TxType) -> (&'static [u16], &'static [[u16; 2]]) {
+    match tx_size {
+        TxSize::Tx4x4 => match tx_type {
+            TxType::AdstDct => (&ROW_SCAN_4X4, &ROW_NB_4X4),
+            TxType::DctAdst => (&COL_SCAN_4X4, &COL_NB_4X4),
+            TxType::DctDct | TxType::AdstAdst => (&DEFAULT_SCAN_4X4, &DEFAULT_NB_4X4),
+        },
+        TxSize::Tx8x8 => match tx_type {
+            TxType::AdstDct => (&ROW_SCAN_8X8, &ROW_NB_8X8),
+            TxType::DctAdst => (&COL_SCAN_8X8, &COL_NB_8X8),
+            TxType::DctDct | TxType::AdstAdst => (&DEFAULT_SCAN_8X8, &DEFAULT_NB_8X8),
+        },
+        TxSize::Tx16x16 => match tx_type {
+            TxType::AdstDct => (&ROW_SCAN_16X16, &ROW_NB_16X16),
+            TxType::DctAdst => (&COL_SCAN_16X16, &COL_NB_16X16),
+            TxType::DctDct | TxType::AdstAdst => (&DEFAULT_SCAN_16X16, &DEFAULT_NB_16X16),
+        },
+        TxSize::Tx32x32 => (&DEFAULT_SCAN_32X32, &DEFAULT_NB_32X32),
+    }
+}
+
 /// Implements the later stage of spec §6.4.25 `get_scan()` — the scan table
 /// selection — once `TxType` is already known. The branch that determines
 /// `TxType` via `mode2txfm_map` (the part that depends on the intra
@@ -191,24 +259,7 @@ pub enum TxSize {
 /// prediction implementation; here we only handle "which scan table to use,
 /// given a known `TxSize` and `TxType`".
 pub fn get_scan(tx_size: TxSize, tx_type: TxType) -> &'static [u16] {
-    match tx_size {
-        TxSize::Tx4x4 => match tx_type {
-            TxType::AdstDct => &ROW_SCAN_4X4,
-            TxType::DctAdst => &COL_SCAN_4X4,
-            TxType::DctDct | TxType::AdstAdst => &DEFAULT_SCAN_4X4,
-        },
-        TxSize::Tx8x8 => match tx_type {
-            TxType::AdstDct => &ROW_SCAN_8X8,
-            TxType::DctAdst => &COL_SCAN_8X8,
-            TxType::DctDct | TxType::AdstAdst => &DEFAULT_SCAN_8X8,
-        },
-        TxSize::Tx16x16 => match tx_type {
-            TxType::AdstDct => &ROW_SCAN_16X16,
-            TxType::DctAdst => &COL_SCAN_16X16,
-            TxType::DctDct | TxType::AdstAdst => &DEFAULT_SCAN_16X16,
-        },
-        TxSize::Tx32x32 => &DEFAULT_SCAN_32X32,
-    }
+    get_scan_and_nb(tx_size, tx_type).0
 }
 
 #[cfg(test)]

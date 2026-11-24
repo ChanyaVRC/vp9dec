@@ -115,7 +115,12 @@ fn assert_exact_split(plane: &PlaneData, name: &str) {
         (WIDTH * HEIGHT) as usize,
         "{name}: unexpected 4:4:4 plane size"
     );
-    for (y, row) in samples.chunks_exact(WIDTH as usize).enumerate() {
+    for (y, row) in samples
+        .as_chunks::<{ WIDTH as usize }>()
+        .0
+        .iter()
+        .enumerate()
+    {
         assert!(
             row[..TILE_BOUNDARY_X]
                 .iter()

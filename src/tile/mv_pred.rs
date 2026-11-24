@@ -100,23 +100,8 @@ impl TileDecoder {
             && c < self.mi_col_end as i32
     }
 
-    /// `get_block_mv( candidateR, candidateC, refList, usePrev )` (spec §6.5.10).
-    /// The return value is `(CandidateMv, CandidateFrame)`.
-    fn get_block_mv(&self, row: u32, col: u32, ref_list: usize, use_prev: bool) -> (Mv, u8) {
-        if use_prev {
-            let grid = self
-                .prev_mi_grid
-                .as_ref()
-                .expect("prev_mi_grid must be Some when use_prev_frame_mvs is true");
-            let info = grid.get(row, col);
-            (info.mv[ref_list], info.ref_frame[ref_list])
-        } else {
-            let info = self.mi_grid.get(row, col);
-            (info.mv[ref_list], info.ref_frame[ref_list])
-        }
-    }
-
     /// `if_same_ref_frame_add_mv( candidateR, candidateC, refFrame, usePrev )` (spec §6.5.7).
+    #[inline]
     fn if_same_ref_frame_add_mv(
         &self,
         row: u32,
@@ -126,16 +111,23 @@ impl TileDecoder {
         ref_list_mv: &mut [Mv; 2],
         ref_mv_count: &mut usize,
     ) {
-        for j in 0..2 {
-            let (cand_mv, cand_frame) = self.get_block_mv(row, col, j, use_prev);
-            if cand_frame == ref_frame {
-                add_mv_ref_list(ref_list_mv, ref_mv_count, cand_mv);
-                return;
-            }
+        let info = if use_prev {
+            self.prev_mi_grid
+                .as_ref()
+                .expect("prev_mi_grid must be Some when use_prev_frame_mvs is true")
+                .get(row, col)
+        } else {
+            self.mi_grid.get(row, col)
+        };
+        if info.ref_frame[0] == ref_frame {
+            add_mv_ref_list(ref_list_mv, ref_mv_count, info.mv[0]);
+        } else if info.ref_frame[1] == ref_frame {
+            add_mv_ref_list(ref_list_mv, ref_mv_count, info.mv[1]);
         }
     }
 
     /// `if_diff_ref_frame_add_mv( candidateR, candidateC, refFrame, usePrev )` (spec §6.5.8).
+    #[inline]
     fn if_diff_ref_frame_add_mv(
         &self,
         row: u32,
@@ -145,8 +137,18 @@ impl TileDecoder {
         ref_list_mv: &mut [Mv; 2],
         ref_mv_count: &mut usize,
     ) {
-        let (mv0, frame0) = self.get_block_mv(row, col, 0, use_prev);
-        let (mv1, frame1) = self.get_block_mv(row, col, 1, use_prev);
+        let info = if use_prev {
+            self.prev_mi_grid
+                .as_ref()
+                .expect("prev_mi_grid must be Some when use_prev_frame_mvs is true")
+                .get(row, col)
+        } else {
+            self.mi_grid.get(row, col)
+        };
+        let frame0 = info.ref_frame[0];
+        let frame1 = info.ref_frame[1];
+        let mv0 = info.mv[0];
+        let mv1 = info.mv[1];
         let mvs_same = mv0 == mv1;
         if frame0 > INTRA_FRAME && frame0 != ref_frame {
             let scaled = scale_mv(mv0, frame0, ref_frame, &self.ref_frame_sign_bias);
@@ -195,23 +197,31 @@ impl TileDecoder {
             }
         }
 
-        for &(dr, dc) in search.iter().skip(2).take(MVREF_NEIGHBOURS - 2) {
-            let cr = row as i32 + dr;
-            let cc = col as i32 + dc;
-            if self.is_inside(cr, cc) {
-                different_ref_found = true;
-                self.if_same_ref_frame_add_mv(
-                    cr as u32,
-                    cc as u32,
-                    ref_frame,
-                    false,
-                    &mut ref_list_mv,
-                    &mut ref_mv_count,
-                );
+        // Once `ref_mv_count == 2`, `add_mv_ref_list` is a no-op and `context_counter` is already
+        // final (only the first 2 neighbors contribute to it), so all remaining spatial and
+        // temporal (`prev_mi_grid`) lookups can be skipped without changing any output.
+        if ref_mv_count < 2 {
+            for &(dr, dc) in search.iter().skip(2).take(MVREF_NEIGHBOURS - 2) {
+                let cr = row as i32 + dr;
+                let cc = col as i32 + dc;
+                if self.is_inside(cr, cc) {
+                    different_ref_found = true;
+                    self.if_same_ref_frame_add_mv(
+                        cr as u32,
+                        cc as u32,
+                        ref_frame,
+                        false,
+                        &mut ref_list_mv,
+                        &mut ref_mv_count,
+                    );
+                    if ref_mv_count >= 2 {
+                        break;
+                    }
+                }
             }
         }
 
-        if self.use_prev_frame_mvs {
+        if ref_mv_count < 2 && self.use_prev_frame_mvs {
             self.if_same_ref_frame_add_mv(
                 row,
                 col,
@@ -222,7 +232,7 @@ impl TileDecoder {
             );
         }
 
-        if different_ref_found {
+        if ref_mv_count < 2 && different_ref_found {
             for &(dr, dc) in search.iter().take(MVREF_NEIGHBOURS) {
                 let cr = row as i32 + dr;
                 let cc = col as i32 + dc;
@@ -235,11 +245,14 @@ impl TileDecoder {
                         &mut ref_list_mv,
                         &mut ref_mv_count,
                     );
+                    if ref_mv_count >= 2 {
+                        break;
+                    }
                 }
             }
         }
 
-        if self.use_prev_frame_mvs {
+        if ref_mv_count < 2 && self.use_prev_frame_mvs {
             self.if_diff_ref_frame_add_mv(
                 row,
                 col,

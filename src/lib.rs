@@ -53,6 +53,7 @@ pub mod subpel;
 pub mod superframe;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub(crate) mod thread_pool;
 #[doc(hidden)]
 pub mod tile;
 #[doc(hidden)]
@@ -199,10 +200,11 @@ fn crop_to_frame(
     }
 }
 
-/// Builds a [`RefFrameData`] for DPB storage using the same crop calculation as
-/// [`crop_to_frame`] (spec §8.10 "Reference frame update process" step 1).
-fn build_ref_frame_data(
-    planes: &[framebuffer::Plane; 3],
+/// Builds a [`RefFrameData`] for DPB storage by taking ownership of the decoded `planes` and
+/// cropping their logical dimensions in-place (zero allocation, zero copy; the backing buffers
+/// keep their superblock-aligned stride and are recycled when evicted from the DPB).
+fn build_ref_frame_data_in_place(
+    mut planes: [framebuffer::Plane; 3],
     width: u32,
     height: u32,
     color_config: &ColorConfig,
@@ -212,15 +214,20 @@ fn build_ref_frame_data(
     let uv_width = ((width + sub_x) >> sub_x) as usize;
     let uv_height = ((height + sub_y) >> sub_y) as usize;
 
+    planes[0].crop_in_place(width as usize, height as usize);
+    planes[1].crop_in_place(uv_width, uv_height);
+    planes[2].crop_in_place(uv_width, uv_height);
+    let [y, u, v] = planes;
+
     RefFrameData {
         width,
         height,
         subsampling_x: sub_x,
         subsampling_y: sub_y,
         bit_depth: color_config.bit_depth,
-        y: planes[0].crop_to_plane(width as usize, height as usize),
-        u: planes[1].crop_to_plane(uv_width, uv_height),
-        v: planes[2].crop_to_plane(uv_width, uv_height),
+        y,
+        u,
+        v,
     }
 }
 
@@ -319,7 +326,22 @@ pub struct Decoder {
     prev_segment_ids: Arc<Vec<u8>>,
     /// `LastFrameType` (spec §7.2). Not updated on `show_existing_frame` frames.
     last_frame_type: Option<FrameType>,
+    /// Recycled whole-frame `[Plane; 3]` buffers returned from unrefreshed frames and evicted
+    /// DPB slots, avoiding per-frame 6+ MB allocation/free cycles on 1080p video.
+    plane_pool: Vec<[framebuffer::Plane; 3]>,
+    /// Recycled `MiGrid` allocation from the replaced `prev_mi_grid` (3+ MB at 1080p).
+    mi_grid_pool: Option<MiGrid>,
+    /// Persistent pure-`std` worker pool shared between tile-parallel decode and wavefront loop
+    /// filtering (lazily spawned on first parallel frame, joined cleanly on drop).
+    thread_pool: thread_pool::ThreadPool,
+    /// Pooled per-tile-column worker `TileDecoder`s (reusing their column-strip `Plane`/`MiGrid`
+    /// allocations across multi-tile frames).
+    tile_worker_pool: Vec<TileDecoder>,
 }
+
+/// Cap on pooled frame-buffer sets held by [`Decoder`] so resolution changes never retain stale
+/// allocations unboundedly.
+const MAX_POOLED_PLANE_SETS: usize = 3;
 
 impl Default for Decoder {
     fn default() -> Self {
@@ -339,6 +361,10 @@ impl Decoder {
             dpb: Dpb::new(),
             prev_segment_ids: Arc::new(Vec::new()),
             last_frame_type: None,
+            plane_pool: Vec::new(),
+            mi_grid_pool: None,
+            thread_pool: thread_pool::ThreadPool::new(),
+            tile_worker_pool: Vec::new(),
         }
     }
 
@@ -386,27 +412,36 @@ impl Decoder {
         }
     }
 
-    /// Reference frame update process (spec §8.10). A zero refresh mask changes no DPB slot,
-    /// so avoid cropping/copying all three planes only to discard them.
+    /// Reference frame update process (spec §8.10). Consumes `planes` by value: if any DPB slot
+    /// refreshes, crops `planes` in-place with zero copy and recycles any evicted slot buffers;
+    /// otherwise returns `planes` straight to `self.plane_pool`.
     fn refresh_reference_frames(
         &mut self,
         header: &header::NewFrameHeader,
         color_config: &ColorConfig,
-        planes: &[framebuffer::Plane; 3],
+        planes: [framebuffer::Plane; 3],
     ) {
         if header.refresh_frame_flags == 0 {
+            if self.plane_pool.len() < MAX_POOLED_PLANE_SETS {
+                self.plane_pool.push(planes);
+            }
             return;
         }
 
-        // Arc-wrapped so `Dpb::update` shares this frame's pixel data across every refreshed
-        // slot instead of deep-cloning it per slot (up to 8x on a keyframe).
-        let ref_data = Arc::new(build_ref_frame_data(
+        // Arc-wrapped so `Dpb::update_and_recycle` shares this frame's pixel data across every
+        // refreshed slot instead of deep-cloning it per slot (up to 8x on a keyframe).
+        let ref_data = Arc::new(build_ref_frame_data_in_place(
             planes,
             header.width,
             header.height,
             color_config,
         ));
-        self.dpb.update(header.refresh_frame_flags, &ref_data);
+        self.dpb.update_and_recycle(
+            header.refresh_frame_flags,
+            &ref_data,
+            &mut self.plane_pool,
+            MAX_POOLED_PLANE_SETS,
+        );
         for (slot, size) in self.persist.ref_frame_sizes.iter_mut().enumerate() {
             if (header.refresh_frame_flags >> slot) & 1 == 1 {
                 *size = (header.width, header.height);
@@ -596,7 +631,9 @@ impl Decoder {
         } else {
             None
         };
-        let mut tile_decoder = TileDecoder::new_with_prev(
+        let recycled_planes = self.plane_pool.pop();
+        let recycled_mi_grid = self.mi_grid_pool.take();
+        let mut tile_decoder = TileDecoder::new_with_buffers(
             &header,
             color_config,
             &compressed,
@@ -604,10 +641,21 @@ impl Decoder {
             prev_grid,
             resolved_refs,
             self.prev_segment_ids.clone(),
+            recycled_planes,
+            recycled_mi_grid,
+        );
+        tile_decoder.set_collect_counts(
+            header.refresh_frame_context
+                && !header.error_resilient_mode
+                && !header.frame_parallel_decoding_mode,
         );
         {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::TileDecode);
-            tile_decoder.decode_tiles(tile_data)?;
+            tile_decoder.decode_tiles_with_pool(
+                tile_data,
+                &mut self.thread_pool,
+                &mut self.tile_worker_pool,
+            )?;
         }
         // Spec §8.1 step 2: "If loop_filter_level is not equal to 0, the loop filter
         // process ... is invoked" -- the whole process (including §8.8.1's frame init,
@@ -616,7 +664,7 @@ impl Decoder {
         // just the per-edge computed level.
         if header.loop_filter.level != 0 {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::LoopFilter);
-            tile_decoder.apply_loop_filter(&header.loop_filter);
+            tile_decoder.apply_loop_filter_with_pool(&header.loop_filter, &mut self.thread_pool);
         }
         // Remainder of decode_one_frame (PrevSegmentIds refresh, probability adaptation,
         // DPB update, output Frame construction) is timed as one "DpbOutput" bucket; this
@@ -625,20 +673,18 @@ impl Decoder {
 
         self.refresh_prev_segment_ids(&header, &image_size, tile_decoder.mi_grid());
 
-        // refresh_probs() (spec §6.1.2).
-        let final_probs = refresh_probs(
-            &header,
-            starting_probs,
-            &compressed,
-            tile_decoder.counts(),
-            self.last_frame_type,
-        );
+        // refresh_probs() (spec §6.1.2): only run when the frame context will actually be saved.
         if header.refresh_frame_context {
+            let final_probs = refresh_probs(
+                &header,
+                starting_probs,
+                &compressed,
+                tile_decoder.counts(),
+                self.last_frame_type,
+            );
             self.frame_contexts
                 .save(header.effective_frame_context_idx(), final_probs);
         }
-
-        self.refresh_reference_frames(&header, &color_config, tile_decoder.planes());
 
         // compute_image_size is never called for show_existing_frame, so by the time we
         // reach here it has always been called (spec §7.2.6). Recorded for UsePrevFrameMvs.
@@ -679,9 +725,16 @@ impl Decoder {
         } else {
             None
         };
-        // Last use of tile_decoder: hand back its finished MiGrid by value (no clone-out)
-        // now that every other accessor (planes(), counts(), mi_grid() above) has run.
-        self.prev_mi_grid = Some(Arc::new(tile_decoder.into_mi_grid()));
+        // Last use of tile_decoder: consume it to drop its read-only `Arc`s to DPB slots and
+        // `prev_mi_grid` BEFORE refreshing DPB / replacing `self.prev_mi_grid`, so evicted
+        // buffers have strong count 1 and recycle cleanly into our pools with zero copy.
+        let (planes, mi_grid) = tile_decoder.into_parts();
+        self.refresh_reference_frames(&header, &color_config, planes);
+        if let Some(old_grid) = self.prev_mi_grid.replace(Arc::new(mi_grid)) {
+            if let Ok(owned) = Arc::try_unwrap(old_grid) {
+                self.mi_grid_pool = Some(owned);
+            }
+        }
         Ok(DecodedFrame {
             info: Some(info),
             frame,
