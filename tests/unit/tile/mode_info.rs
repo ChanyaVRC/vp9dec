@@ -123,7 +123,7 @@ fn read_skip_seg_lvl_skip_forces_without_reading_bit() {
     let mut r = BoolDecoder::new(&[0x00]).expect("valid bitstream");
     let skip = decoder.read_skip(&mut r, 0, 0, false, false, 2);
     assert!(skip);
-    assert_eq!(decoder.counts.skip, Counts::new().skip);
+    assert_eq!(decoder.counts().skip, Counts::new().skip);
 }
 
 /// `read_is_inter()` (spec §6.4.13): when `seg_feature_active( SEG_LVL_REF_FRAME )`,
@@ -149,7 +149,7 @@ fn read_is_inter_seg_lvl_ref_frame_forces_without_reading_bit() {
 
     let mut r = BoolDecoder::new(&[0x00]).expect("valid bitstream");
     assert!(decoder.read_is_inter(&mut r, &n, 1));
-    assert_eq!(decoder.counts.is_inter, Counts::new().is_inter);
+    assert_eq!(decoder.counts().is_inter, Counts::new().is_inter);
 }
 
 /// `read_ref_frames()` (spec §6.4.17): when `seg_feature_active( SEG_LVL_REF_FRAME )`,
@@ -178,8 +178,8 @@ fn read_ref_frames_seg_lvl_ref_frame_returns_feature_value() {
         decoder.read_ref_frames(&mut r, &n, 4),
         [GOLDEN_FRAME, REF_NONE]
     );
-    assert_eq!(decoder.counts.comp_mode, Counts::new().comp_mode);
-    assert_eq!(decoder.counts.single_ref, Counts::new().single_ref);
+    assert_eq!(decoder.counts().comp_mode, Counts::new().comp_mode);
+    assert_eq!(decoder.counts().single_ref, Counts::new().single_ref);
 }
 
 // =========================================================================

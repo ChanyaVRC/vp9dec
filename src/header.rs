@@ -175,21 +175,11 @@ impl Default for LoopFilterDeltas {
 /// (spec §7.2.10), persisted across frames by the caller and reset only by
 /// `setup_past_independence()`. Replaces the former `(SegFeatureEnabled, SegFeatureData,
 /// bool)` tuple threaded through [`parse_uncompressed_header`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SegFeaturePersist {
     pub enabled: SegFeatureEnabled,
     pub data: SegFeatureData,
     pub abs_or_delta: bool,
-}
-
-impl Default for SegFeaturePersist {
-    fn default() -> Self {
-        Self {
-            enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
-            data: [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
-            abs_or_delta: false,
-        }
-    }
 }
 
 /// All of the cross-frame state [`parse_uncompressed_header`] needs from the caller (spec
@@ -197,7 +187,7 @@ impl Default for SegFeaturePersist {
 /// `frame_size_with_refs()`, spec §6.2.5), and the loop filter/segmentation state that
 /// `setup_past_independence()` would otherwise reset. Callers (`Decoder`) keep one instance of
 /// this across frames instead of three separate fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PersistentState {
     pub ref_frame_sizes: [(u32, u32); NUM_REF_FRAMES],
     pub loop_filter_deltas: LoopFilterDeltas,
@@ -206,17 +196,7 @@ pub struct PersistentState {
 
 impl PersistentState {
     pub fn new() -> Self {
-        Self {
-            ref_frame_sizes: [(0, 0); NUM_REF_FRAMES],
-            loop_filter_deltas: LoopFilterDeltas::default(),
-            segmentation: SegFeaturePersist::default(),
-        }
-    }
-}
-
-impl Default for PersistentState {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 
@@ -495,18 +475,10 @@ fn parse_loop_filter_params(
         (prev_deltas.ref_deltas, prev_deltas.mode_deltas)
     };
 
-    if delta_enabled {
-        let delta_update = r.flag();
-        if delta_update {
-            for delta in ref_deltas.iter_mut() {
-                if r.flag() {
-                    *delta = r.s(6) as i8;
-                }
-            }
-            for delta in mode_deltas.iter_mut() {
-                if r.flag() {
-                    *delta = r.s(6) as i8;
-                }
+    if delta_enabled && r.flag() {
+        for delta in ref_deltas.iter_mut().chain(mode_deltas.iter_mut()) {
+            if r.flag() {
+                *delta = r.s(6) as i8;
             }
         }
     }
@@ -629,14 +601,10 @@ fn parse_segmentation_params(
 
     if !enabled {
         return SegmentationParams {
-            enabled: false,
-            update_map: false,
-            tree_probs: [255; 7],
-            pred_prob: [255; 3],
-            temporal_update: false,
             abs_or_delta_update,
             feature_enabled,
             feature_data,
+            ..SegmentationParams::default()
         };
     }
 
@@ -778,67 +746,43 @@ pub fn parse_uncompressed_header(
     let mut intra_only = false;
     let mut reset_frame_context = 0u8;
 
-    let (color_config, width, height, render_width, render_height, refresh_frame_flags);
-    let frame_is_intra;
-
-    if frame_type == FrameType::KeyFrame {
+    let (color_config, width, height, refresh_frame_flags, frame_is_intra) = if frame_type
+        == FrameType::KeyFrame
+    {
         verify_sync_code(&mut r)?;
-        color_config = Some(parse_color_config(&mut r, profile)?);
+        let cc = Some(parse_color_config(&mut r, profile)?);
         let (w, h) = parse_frame_size(&mut r);
-        let (rw, rh) = parse_render_size(&mut r, w, h);
-        width = w;
-        height = h;
-        render_width = rw;
-        render_height = rh;
         // refresh_frame_flags is not read from the bitstream and is always 0xFF for key frames.
-        refresh_frame_flags = 0xFFu8;
-        frame_is_intra = true;
+        (cc, w, h, 0xFFu8, true)
     } else {
-        intra_only = if !show_frame { r.flag() } else { false };
-        frame_is_intra = intra_only;
-        reset_frame_context = if !error_resilient_mode {
-            r.f(2) as u8
-        } else {
-            0
-        };
-
+        intra_only = !show_frame && r.flag();
+        if !error_resilient_mode {
+            reset_frame_context = r.f(2) as u8;
+        }
         if intra_only {
             verify_sync_code(&mut r)?;
-            color_config = Some(if profile > 0 {
+            let cc = Some(if profile > 0 {
                 parse_color_config(&mut r, profile)?
             } else {
-                // Spec-defined default for intra_only + profile 0 (spec §6.2.2).
                 ColorConfig::default_intra_only_profile0()
             });
-            refresh_frame_flags = r.f(8) as u8;
+            let rff = r.f(8) as u8;
             let (w, h) = parse_frame_size(&mut r);
-            let (rw, rh) = parse_render_size(&mut r, w, h);
-            width = w;
-            height = h;
-            render_width = rw;
-            render_height = rh;
+            (cc, w, h, rff, true)
         } else {
-            refresh_frame_flags = r.f(8) as u8;
+            let rff = r.f(8) as u8;
             for i in 0..3 {
                 ref_frame_idx[i] = r.f(3) as u8;
                 ref_frame_sign_bias[LAST_FRAME as usize + i] = r.flag();
             }
             let (w, h) = parse_frame_size_with_refs(&mut r, ref_frame_idx, &prev.ref_frame_sizes);
-            width = w;
-            height = h;
-            let (rw, rh) = parse_render_size(&mut r, w, h);
-            render_width = rw;
-            render_height = rh;
-            allow_high_precision_mv = r.flag();
-            interpolation_filter = parse_interpolation_filter(&mut r);
-            // Profile, bit depth, and color space are not read from an inter
-            // frame's bitstream (they are required to match the reference
-            // frame, spec §7.2). This parser has no access to prior frames'
-            // state, so it honestly reports None here; `Decoder` (which does
-            // carry color config across frames, see `last_color_config`)
-            // resolves it from the preceding key/intra-only frame before use.
-            color_config = None;
+            (None, w, h, rff, false)
         }
+    };
+    let (render_width, render_height) = parse_render_size(&mut r, width, height);
+    if !frame_is_intra {
+        allow_high_precision_mv = r.flag();
+        interpolation_filter = parse_interpolation_filter(&mut r);
     }
 
     let (refresh_frame_context, frame_parallel_decoding_mode) = if !error_resilient_mode {

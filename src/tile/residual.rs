@@ -4,10 +4,9 @@
 //! builder (`build_dequant_table`, added W4b) since its only caller is `TileDecoder::new_with_prev`
 //! and its only reason to exist is feeding this pipeline's dequantization step.
 
-use super::{MiInfo, TileDecoder};
+use super::{MiInfo, Mv, TileDecoder};
 use crate::bool_coder::BoolDecoder;
 use crate::common::{get_uv_tx_size as common_get_uv_tx_size, INTRA_FRAME};
-use crate::dpb::RefFrameData;
 use crate::header::{SegmentationParams, MAX_SEGMENTS};
 use crate::predict::predict_intra as predict_intra_block;
 use crate::predict::{predict_inter, InterPredictParams, RefPlaneView};
@@ -69,22 +68,26 @@ impl TileDecoder {
         row: u32,
         col: u32,
         info: &MiInfo,
+        block_mvs: Option<&[[Mv; 4]; 2]>,
         avail_u: bool,
         avail_l: bool,
         is_inter: bool,
     ) -> u32 {
-        let bsize = if info.mi_size < BLOCK_8X8 {
-            BLOCK_8X8
-        } else {
-            info.mi_size
-        };
+        let mi_size = info.mi_size();
+        let tx_size = info.tx_size();
+        let skip = info.skip();
+        let y_mode = info.y_mode();
+        let uv_mode = info.uv_mode();
+        let sub_modes = info.sub_modes();
+        let segment_id = info.segment_id();
+        let bsize = mi_size.max(BLOCK_8X8);
         let mut eob_total = 0u32;
 
         for plane in 0..3usize {
             let tx_sz = if plane > 0 {
-                self.get_uv_tx_size(info.mi_size, info.tx_size)
+                self.get_uv_tx_size(mi_size, tx_size)
             } else {
-                info.tx_size
+                tx_size
             };
             let step = 1u32 << tx_sz;
             let plane_sz = self.get_plane_block_size(bsize, plane);
@@ -96,21 +99,16 @@ impl TileDecoder {
             let base_y = (row * 8) >> sub_y;
             let maxx = (self.mi_cols * 8) >> sub_x;
             let maxy = (self.mi_rows * 8) >> sub_y;
-            // Note that maxX/maxY passed to predict_intra (spec §8.5.1) are the clip bounds
-            // in whole-plane coordinates, which is a different meaning from maxx/maxy above
-            // (used for in-block clipping in residual).
             let pred_max_x = ((self.mi_cols * 8) >> sub_x).saturating_sub(1) as usize;
             let pred_max_y = ((self.mi_rows * 8) >> sub_y).saturating_sub(1) as usize;
 
             if is_inter {
                 self.predict_inter_for_plane(
-                    plane, row, col, info, base_x, base_y, num4x4w, num4x4h,
+                    plane, row, col, info, block_mvs, base_x, base_y, num4x4w, num4x4h,
                 );
-                if info.skip {
-                    // Skipped inter block: no intra prediction and no residual tokens; just clear
-                    // the block's nonzero contexts in bulk.
+                if skip {
                     let bx = (base_x >> 2) as usize;
-                    self.above_nonzero_context[plane][bx..bx + num4x4w as usize].fill(0);
+                    self.above_ctx.nonzero[plane][bx..bx + num4x4w as usize].fill(0);
                     let by = (base_y >> 2) as usize;
                     let left = &mut self.left_nonzero_context[plane];
                     for i in 0..num4x4h as usize {
@@ -132,11 +130,11 @@ impl TileDecoder {
                     if start_x < maxx && start_y < maxy {
                         if !is_inter {
                             let mode = if plane > 0 {
-                                info.uv_mode
-                            } else if info.mi_size >= BLOCK_8X8 {
-                                info.y_mode
+                                uv_mode
+                            } else if mi_size >= BLOCK_8X8 {
+                                y_mode
                             } else {
-                                info.sub_modes[block_idx as usize]
+                                sub_modes[block_idx as usize]
                             };
                             let have_left = avail_l || x > 0;
                             let have_above = avail_u || y > 0;
@@ -159,13 +157,13 @@ impl TileDecoder {
                             );
                         }
 
-                        if !info.skip {
+                        if !skip {
                             let tx_type = self.compute_tx_type(
                                 plane,
                                 tx_sz,
-                                info.mi_size,
-                                info.y_mode,
-                                &info.sub_modes,
+                                mi_size,
+                                y_mode,
+                                &sub_modes,
                                 block_idx as usize,
                                 is_inter,
                             );
@@ -180,14 +178,14 @@ impl TileDecoder {
                                 tx_sz,
                                 tx_type,
                                 is_inter,
-                                info.segment_id,
+                                segment_id,
                             );
                         }
                     }
 
                     eob_total += nonzero as u32;
                     for i in 0..step {
-                        self.above_nonzero_context[plane][((start_x >> 2) + i) as usize] =
+                        self.above_ctx.nonzero[plane][((start_x >> 2) + i) as usize] =
                             nonzero as u8;
                         let left_idx = (((start_y >> 2) + i) % 16) as usize;
                         self.left_nonzero_context[plane][left_idx] = nonzero as u8;
@@ -214,30 +212,22 @@ impl TileDecoder {
         row: u32,
         col: u32,
         info: &MiInfo,
+        block_mvs: Option<&[[Mv; 4]; 2]>,
         base_x: u32,
         base_y: u32,
         num4x4w: u32,
         num4x4h: u32,
     ) {
-        // SIMD measurement infrastructure (M5 in docs/history.md): times the whole
-        // per-plane inter-predict section below (all sub-4x4 predict_inter calls when
-        // MiSize < BLOCK_8X8 included), not per-call -- see bench_timing module docs.
         let _t = crate::bench_timing::StageTimer::start(crate::bench_timing::Stage::InterPredict);
-        // `predict_inter()` (spec §8.5.2): motion compensation / sub-pixel interpolation.
-        let refs: [Option<&RefFrameData>; 2] = [
-            if info.ref_frame[0] > INTRA_FRAME {
-                self.resolved_refs[(info.ref_frame[0] - LAST_FRAME) as usize].as_deref()
-            } else {
-                None
-            },
-            if info.ref_frame[1] > INTRA_FRAME {
-                self.resolved_refs[(info.ref_frame[1] - LAST_FRAME) as usize].as_deref()
-            } else {
-                None
-            },
-        ];
+        let ref_frame = info.ref_frame();
+        let mi_size = info.mi_size();
         let ref_views: [Option<RefPlaneView>; 2] = std::array::from_fn(|i| {
-            refs[i].map(|r| RefPlaneView {
+            let rf = ref_frame[i];
+            if rf == INTRA_FRAME {
+                return None;
+            }
+            let r = self.resolved_refs[(rf - LAST_FRAME) as usize].as_deref()?;
+            Some(RefPlaneView {
                 plane: match plane {
                     0 => &r.y,
                     1 => &r.u,
@@ -247,15 +237,14 @@ impl TileDecoder {
                 height: r.height,
             })
         });
-        let ref_view_refs: [Option<&RefPlaneView>; 2] =
-            [ref_views[0].as_ref(), ref_views[1].as_ref()];
+        let uniform_mvs = [[info.mv[0]; 4], [info.mv[1]; 4]];
         let inter_params = InterPredictParams {
-            ref_frame: info.ref_frame,
-            block_mvs: &info.sub_mvs,
-            interp_filter: info.interp_filter,
+            ref_frame,
+            block_mvs: block_mvs.unwrap_or(&uniform_mvs),
+            interp_filter: info.interp_filter(),
             mi_row: row,
             mi_col: col,
-            mi_size: info.mi_size,
+            mi_size,
             mi_rows: self.mi_rows,
             mi_cols: self.mi_cols,
             subsampling_x: self.subsampling_x,
@@ -263,10 +252,10 @@ impl TileDecoder {
             frame_width: self.frame_width,
             frame_height: self.frame_height,
             bit_depth: self.bit_depth,
-            refs: ref_view_refs,
+            refs: [ref_views[0].as_ref(), ref_views[1].as_ref()],
         };
 
-        if info.mi_size < BLOCK_8X8 {
+        if mi_size < BLOCK_8X8 {
             let mut y = 0u32;
             while y < num4x4h {
                 let mut x = 0u32;
@@ -402,7 +391,7 @@ impl TileDecoder {
             // within `[-max_val, max_val]` (`max_val <= 4095`); block lies inside the plane strip.
             unsafe {
                 crate::simd::reconstruct_add_const_avx2(
-                    self.planes[plane].as_mut_slice(),
+                    self.planes[plane].base_ptr_mut(),
                     pw,
                     local_x,
                     start_y,
@@ -414,13 +403,11 @@ impl TileDecoder {
             return;
         }
 
-        let pw = self.planes[plane].stride();
         let local_x = start_x - self.planes[plane].x0;
-        let data = self.planes[plane].as_mut_slice();
         let delta = clamped_delta as i32;
         let max_i32 = max_val as i32;
         for i in 0..n0 {
-            let row = &mut data[(start_y + i) * pw + local_x..][..n0];
+            let row = &mut self.planes[plane].row_mut(start_y + i)[local_x..local_x + n0];
             for px in row {
                 *px = (*px as i32 + delta).clamp(0, max_i32) as u16;
             }
@@ -463,7 +450,7 @@ impl TileDecoder {
             let mut left = 0u32;
             for i in 0..numpts {
                 if x4 + i < max_x_ctx {
-                    above |= self.above_nonzero_context[plane][(x4 + i) as usize] as u32;
+                    above |= self.above_ctx.nonzero[plane][(x4 + i) as usize] as u32;
                 }
                 if y4 + i < max_y_ctx {
                     left |= self.left_nonzero_context[plane][((y4 + i) % 16) as usize] as u32;
@@ -472,14 +459,13 @@ impl TileDecoder {
             (above + left) as usize
         };
 
-        let probs_table = &self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize];
-        let collect = self.collect_counts;
-        let first_probs = probs_table[0][first_ctx];
+        let first_probs =
+            self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][0][first_ctx];
         let more_coefs = r.read_bool(first_probs[0]);
-        if collect {
-            self.counts.more_coefs[tx_sz as usize][plane_type][is_inter as usize][0][first_ctx]
+        self.count(|cnt| {
+            cnt.more_coefs[tx_sz as usize][plane_type][is_inter as usize][0][first_ctx]
                 [more_coefs as usize] += 1;
-        }
+        });
         if !more_coefs {
             return false;
         }
@@ -491,39 +477,34 @@ impl TileDecoder {
         // c = 1, a DCT_DCT block can take the 2-multiply DC-only path without zeroing either
         // scratch buffer or running a full 2D inverse transform.
         let tok0 = Self::decode_token(r, first_probs);
-        if collect {
-            self.counts.token[tx_sz as usize][plane_type][is_inter as usize][0][first_ctx]
+        self.count(|cnt| {
+            cnt.token[tx_sz as usize][plane_type][is_inter as usize][0][first_ctx]
                 [(tok0 as usize).min(2)] += 1;
-        }
+        });
         let energy0 = ENERGY_CLASS[tok0 as usize];
 
         let dq0 = if tok0 == ZERO_TOKEN {
             0i64
         } else {
-            let coef = if tok0 == ONE_TOKEN {
-                1i32
-            } else {
-                self.read_coef(r, tok0)
-            };
-            let signed = if r.flag() { -coef } else { coef };
-            let prod = signed as i64 * dc_quant;
-            let dq0 = if is_32x32 { prod / 2 } else { prod };
+            let dq0 = self.dequant_nonzero_token(r, tok0, dc_quant, is_32x32);
 
             // At c = 1, band is always 1 and nb[1] is always [0, 0] for every scan table,
             // so ctx1 == (1 + 2 * energy0) >> 1 == energy0.
             let ctx1 = energy0 as usize;
-            let more_coefs_1 = r.read_bool(probs_table[1][ctx1][0]);
-            if collect {
-                self.counts.more_coefs[tx_sz as usize][plane_type][is_inter as usize][1][ctx1]
+            let p1 =
+                self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][1][ctx1][0];
+            let more_coefs_1 = r.read_bool(p1);
+            self.count(|cnt| {
+                cnt.more_coefs[tx_sz as usize][plane_type][is_inter as usize][1][ctx1]
                     [more_coefs_1 as usize] += 1;
-            }
+            });
             if !more_coefs_1 {
                 if tx_type == TxType::DctDct && !self.lossless {
                     self.reconstruct_dc_only(plane, start_x, start_y, n, dq0);
                     return true;
                 }
-                self.dequant_buf[..seg_eob].fill(0);
-                self.dequant_buf[0] = dq0;
+                self.scratch.dequant_buf[..seg_eob].fill(0);
+                self.scratch.dequant_buf[0] = dq0;
                 self.transform_reconstruct(plane, start_x, start_y, tx_sz, tx_type, 0);
                 return true;
             }
@@ -533,10 +514,10 @@ impl TileDecoder {
         // Non-DC-only block: zero only the active `..seg_eob` slice of our reusable scratch
         // buffers, seed c = 0, and continue from c = 1 (with check_eob == false because either
         // tok0 == ZERO_TOKEN or we already consumed more_coefs_1 == true above).
-        self.dequant_buf[..seg_eob].fill(0);
-        self.token_cache_buf[..seg_eob].fill(0);
-        self.dequant_buf[0] = dq0;
-        self.token_cache_buf[0] = energy0;
+        self.scratch.dequant_buf[..seg_eob].fill(0);
+        self.scratch.token_cache_buf[..seg_eob].fill(0);
+        self.scratch.dequant_buf[0] = dq0;
+        self.scratch.token_cache_buf[0] = energy0;
 
         let mut check_eob = false;
         let mut max_row = 0usize;
@@ -552,8 +533,8 @@ impl TileDecoder {
             };
             let [nb0, nb1] = nb[c];
             let ctx = ((1
-                + self.token_cache_buf[nb0 as usize] as u32
-                + self.token_cache_buf[nb1 as usize] as u32)
+                + self.scratch.token_cache_buf[nb0 as usize] as u32
+                + self.scratch.token_cache_buf[nb1 as usize] as u32)
                 >> 1) as usize;
             let probs =
                 self.probs.coef_probs[tx_sz as usize][plane_type][is_inter as usize][band][ctx];
@@ -561,33 +542,27 @@ impl TileDecoder {
             if check_eob {
                 // Counted ONLY when EOB is actually read (check_eob == true), matching spec §8.4.3.
                 let more_coefs = r.read_bool(probs[0]);
-                if collect {
-                    self.counts.more_coefs[tx_sz as usize][plane_type][is_inter as usize][band]
-                        [ctx][more_coefs as usize] += 1;
-                }
+                self.count(|cnt| {
+                    cnt.more_coefs[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
+                        [more_coefs as usize] += 1;
+                });
                 if !more_coefs {
                     break;
                 }
             }
 
             let token = Self::decode_token(r, probs);
-            if collect {
-                self.counts.token[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
+            self.count(|cnt| {
+                cnt.token[tx_sz as usize][plane_type][is_inter as usize][band][ctx]
                     [(token as usize).min(2)] += 1;
-            }
-            self.token_cache_buf[pos] = ENERGY_CLASS[token as usize];
+            });
+            self.scratch.token_cache_buf[pos] = ENERGY_CLASS[token as usize];
 
             if token == ZERO_TOKEN {
                 check_eob = false;
             } else {
-                let coef = if token == ONE_TOKEN {
-                    1i32
-                } else {
-                    self.read_coef(r, token)
-                };
-                let signed = if r.flag() { -coef } else { coef };
-                let prod = signed as i64 * ac_quant;
-                self.dequant_buf[pos] = if is_32x32 { prod / 2 } else { prod };
+                self.scratch.dequant_buf[pos] =
+                    self.dequant_nonzero_token(r, token, ac_quant, is_32x32);
                 max_row = max_row.max(pos >> n);
                 check_eob = true;
             }
@@ -599,8 +574,31 @@ impl TileDecoder {
         true
     }
 
+    /// Reads the magnitude + sign for a non-zero coefficient token and applies dequantization.
+    #[inline]
+    fn dequant_nonzero_token(
+        &self,
+        r: &mut BoolDecoder,
+        token: u8,
+        quant: i64,
+        is_32x32: bool,
+    ) -> i64 {
+        let coef = if token == ONE_TOKEN {
+            1i32
+        } else {
+            self.read_coef(r, token)
+        };
+        let signed = if r.flag() { -coef } else { coef };
+        let prod = signed as i64 * quant;
+        if is_32x32 {
+            prod / 2
+        } else {
+            prod
+        }
+    }
+
     /// Inverse transform + reconstruction (spec §8.6.2) of one transform block whose dequantized
-    /// coefficients are already in `self.dequant_buf[..seg_eob]`.
+    /// coefficients are already in `self.scratch.dequant_buf[..seg_eob]`.
     #[allow(clippy::too_many_arguments)]
     fn transform_reconstruct(
         &mut self,
@@ -615,111 +613,51 @@ impl TileDecoder {
         let n0 = 1usize << n;
         let seg_eob = n0 * n0;
 
+        let _t =
+            crate::bench_timing::StageTimer::start(crate::bench_timing::Stage::InverseTransform);
+        let _ = max_row;
+        let local_x = start_x - self.planes[plane].x0;
         #[cfg(target_arch = "x86_64")]
-        let fused = crate::simd::avx2_enabled();
-        #[cfg(not(target_arch = "x86_64"))]
-        let fused = false;
-
-        {
-            let _t = crate::bench_timing::StageTimer::start(
-                crate::bench_timing::Stage::InverseTransform,
+        if crate::simd::avx2_enabled() {
+            let pw = self.planes[plane].stride();
+            debug_assert!(
+                start_x >= self.planes[plane].x0
+                    && local_x + n0 <= self.planes[plane].width
+                    && start_y + n0 <= self.planes[plane].height,
+                "fused-reconstruction block outside its plane strip"
             );
-            #[cfg(target_arch = "x86_64")]
-            if fused {
-                let pw = self.planes[plane].stride();
-                debug_assert!(
-                    start_x >= self.planes[plane].x0
-                        && start_x - self.planes[plane].x0 + n0 <= self.planes[plane].width,
-                    "fused-reconstruction block outside its plane strip's columns"
-                );
-                debug_assert!(
-                    start_y + n0 <= self.planes[plane].height,
-                    "fused-reconstruction block outside its plane's rows"
-                );
-                let local_x = start_x - self.planes[plane].x0;
-                // SAFETY: avx2_enabled() checked; dequant_buf[..seg_eob] is n0*n0; block is in
-                // bounds of the plane strip; lossless forces TX_4X4; ADST runs with n <= 4;
-                // every row strictly below `max_row` in `dequant_buf` is zero.
-                unsafe {
-                    if self.lossless {
-                        debug_assert_eq!(n, 2, "lossless transform (WHT) only supports 4x4");
-                        crate::simd::inverse_transform_wht_reconstruct_avx2(
-                            self.planes[plane].as_mut_slice(),
-                            pw,
-                            local_x,
-                            start_y,
-                            &self.dequant_buf[..seg_eob],
-                            self.bit_depth,
-                        );
-                    } else if tx_type != TxType::DctDct {
-                        if self.bit_depth == 8 {
-                            crate::simd::inverse_transform_adst_reconstruct_avx2(
-                                self.planes[plane].as_mut_slice(),
-                                pw,
-                                local_x,
-                                start_y,
-                                &self.dequant_buf[..seg_eob],
-                                n,
-                                tx_type,
-                            );
-                        } else {
-                            crate::simd::inverse_transform_adst_reconstruct_hbd_avx2(
-                                self.planes[plane].as_mut_slice(),
-                                pw,
-                                local_x,
-                                start_y,
-                                &self.dequant_buf[..seg_eob],
-                                n,
-                                tx_type,
-                                self.bit_depth,
-                            );
-                        }
-                    } else if self.bit_depth == 8 {
-                        crate::simd::inverse_transform_dct_dct_reconstruct_eob_avx2(
-                            self.planes[plane].as_mut_slice(),
-                            pw,
-                            local_x,
-                            start_y,
-                            &self.dequant_buf[..seg_eob],
-                            n,
-                            max_row,
-                        );
-                    } else {
-                        crate::simd::inverse_transform_dct_dct_reconstruct_hbd_eob_avx2(
-                            self.planes[plane].as_mut_slice(),
-                            pw,
-                            local_x,
-                            start_y,
-                            &self.dequant_buf[..seg_eob],
-                            n,
-                            max_row,
-                            self.bit_depth,
-                        );
-                    }
-                }
-            } else {
-                inverse_transform_block(
-                    &mut self.dequant_buf[..seg_eob],
+            // SAFETY: avx2_enabled() checked; dequant_buf[..seg_eob] is n0*n0; block is in
+            // bounds of the plane strip; lossless forces TX_4X4; ADST runs with n <= 4;
+            // every row strictly below `max_row` in `dequant_buf` is zero.
+            unsafe {
+                crate::simd::inverse_transform_reconstruct_avx2(
+                    self.planes[plane].base_ptr_mut(),
+                    pw,
+                    local_x,
+                    start_y,
+                    &self.scratch.dequant_buf[..seg_eob],
                     n,
                     tx_type,
+                    max_row,
                     self.lossless,
+                    self.bit_depth,
                 );
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            inverse_transform_block(&mut self.dequant_buf[..seg_eob], n, tx_type, self.lossless);
+            return;
         }
 
-        if !fused {
-            let max_val = (1i64 << self.bit_depth) - 1;
-            let pw = self.planes[plane].stride();
-            let local_x = start_x - self.planes[plane].x0;
-            let data = self.planes[plane].as_mut_slice();
-            for i in 0..n0 {
-                let row = &mut data[(start_y + i) * pw + local_x..][..n0];
-                let dq_row = &self.dequant_buf[i * n0..(i + 1) * n0];
-                for (px, &dq) in row.iter_mut().zip(dq_row.iter()) {
-                    *px = (*px as i64 + dq).clamp(0, max_val) as u16;
-                }
+        inverse_transform_block(
+            &mut self.scratch.dequant_buf[..seg_eob],
+            n,
+            tx_type,
+            self.lossless,
+        );
+        let max_val = (1i64 << self.bit_depth) - 1;
+        for i in 0..n0 {
+            let row = &mut self.planes[plane].row_mut(start_y + i)[local_x..local_x + n0];
+            let dq_row = &self.scratch.dequant_buf[i * n0..(i + 1) * n0];
+            for (px, &dq) in row.iter_mut().zip(dq_row.iter()) {
+                *px = (*px as i64 + dq).clamp(0, max_val) as u16;
             }
         }
     }

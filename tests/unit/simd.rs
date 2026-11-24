@@ -280,7 +280,7 @@ fn inverse_transform_dct_dct_reconstruct_simd_matches_scalar() {
                 let mut plane_simd = pred.clone();
                 unsafe {
                     inverse_transform_dct_dct_reconstruct_avx2(
-                        &mut plane_simd,
+                        plane_simd.as_mut_ptr(),
                         plane_width,
                         start_x,
                         start_y,
@@ -416,7 +416,7 @@ fn inverse_transform_dct_dct_reconstruct_hbd_simd_matches_scalar() {
                     let mut plane_simd = pred.clone();
                     unsafe {
                         inverse_transform_dct_dct_reconstruct_hbd_avx2(
-                            &mut plane_simd,
+                            plane_simd.as_mut_ptr(),
                             plane_width,
                             start_x,
                             start_y,
@@ -891,7 +891,7 @@ fn inverse_transform_adst_reconstruct_hbd_simd_matches_scalar() {
                         let mut plane_simd = pred.clone();
                         unsafe {
                             inverse_transform_adst_reconstruct_hbd_avx2(
-                                &mut plane_simd,
+                                plane_simd.as_mut_ptr(),
                                 plane_width,
                                 start_x,
                                 start_y,
@@ -966,7 +966,7 @@ fn inverse_transform_adst_reconstruct_simd_matches_scalar() {
                     let mut plane_simd = pred.clone();
                     unsafe {
                         inverse_transform_adst_reconstruct_avx2(
-                            &mut plane_simd,
+                            plane_simd.as_mut_ptr(),
                             plane_width,
                             start_x,
                             start_y,
@@ -1138,7 +1138,7 @@ fn inverse_transform_wht_reconstruct_simd_matches_scalar() {
                 // SAFETY: avx2_enabled() confirmed; dq has len 16; block lies within plane_simd.
                 unsafe {
                     inverse_transform_wht_reconstruct_avx2(
-                        &mut plane_simd,
+                        plane_simd.as_mut_ptr(),
                         plane_width,
                         start_x,
                         start_y,
@@ -1394,7 +1394,9 @@ fn intra_pred_direct_kernels_match_reference_on_corners_and_random() {
                         exp[(start_y + i) * pw + start_x + j] = above[j];
                     }
                 }
-                unsafe { intra_pred_v_avx2(&mut got, pw, start_x, start_y, &above[..size], size) };
+                unsafe {
+                    intra_pred_v_avx2(got.as_mut_ptr(), pw, start_x, start_y, &above[..size], size)
+                };
                 assert_eq!(got, exp, "V_PRED bd={bit_depth} size={size} trial={trial}");
 
                 // H_PRED
@@ -1405,7 +1407,9 @@ fn intra_pred_direct_kernels_match_reference_on_corners_and_random() {
                         exp[(start_y + i) * pw + start_x + j] = left[i];
                     }
                 }
-                unsafe { intra_pred_h_avx2(&mut got, pw, start_x, start_y, &left[..size], size) };
+                unsafe {
+                    intra_pred_h_avx2(got.as_mut_ptr(), pw, start_x, start_y, &left[..size], size)
+                };
                 assert_eq!(got, exp, "H_PRED bd={bit_depth} size={size} trial={trial}");
 
                 // DC_PRED (all 4 variants)
@@ -1436,7 +1440,7 @@ fn intra_pred_direct_kernels_match_reference_on_corners_and_random() {
                     }
                     unsafe {
                         intra_pred_dc_avx2(
-                            &mut got,
+                            got.as_mut_ptr(),
                             pw,
                             start_x,
                             start_y,
@@ -1464,7 +1468,7 @@ fn intra_pred_direct_kernels_match_reference_on_corners_and_random() {
                 }
                 unsafe {
                     intra_pred_tm_avx2(
-                        &mut got,
+                        got.as_mut_ptr(),
                         pw,
                         start_x,
                         start_y,

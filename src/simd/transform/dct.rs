@@ -159,102 +159,16 @@ pub(super) unsafe fn h_op_simd(t: &mut [__m256i], a: usize, b: usize, flip: bool
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn idct_permute_simd(t: &mut [__m256i], n: u32) {
-    let n0 = 1usize << n;
-    let mut copy_t = [_mm256_setzero_si256(); 32];
-    copy_t[..n0].copy_from_slice(&t[..n0]);
-    for (i, dst) in t[..n0].iter_mut().enumerate() {
-        *dst = copy_t[crate::transform::brev(n, i)];
-    }
+    crate::transform::idct_permute(t, n);
 }
 
-/// Vector inverse-DCT butterfly network -- a verbatim mirror of `transform.rs::idct` (spec
-/// §8.7.1.3), operating on 8-row i32 element vectors. Assumes `idct_permute_simd` ran first.
-/// `HBD` selects the butterfly's multiply width (see [`b_op_simd_depth`]); the network
-/// structure is identical either way.
+/// Vector inverse-DCT butterfly network -- shares [`crate::transform::idct_body!`] with the
+/// scalar `i64` network, operating on 8-row `i32` element vectors. Assumes `idct_permute_simd`
+/// ran first. `HBD` selects the butterfly's multiply width (`b_op_simd_depth`).
 ///
 /// # Safety
 /// Caller must confirm `avx2_enabled()`, `2 <= n <= 5`, and `t.len() >= (1 << n)`.
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn idct_simd<const HBD: bool>(t: &mut [__m256i], n: u32) {
-    let n0 = 1i64 << n;
-    let n1 = 1i64 << (n - 1);
-    let n2 = 1i64 << (n - 2);
-
-    if n == 2 {
-        b_op_simd_depth::<HBD>(t, 0, 1, 16, true);
-    } else {
-        idct_simd::<HBD>(t, n - 1);
-    }
-
-    for i in 0..n2 {
-        let a = (n1 + i) as usize;
-        let b = (n0 - 1 - i) as usize;
-        let angle = 32 - crate::transform::brev(5, a) as i32;
-        b_op_simd_depth::<HBD>(t, a, b, angle, false);
-    }
-
-    if n >= 3 {
-        let n3 = 1i64 << (n - 3);
-        for i in 0..n3 {
-            for j in 0..2i64 {
-                let a = (n1 + 4 * i + 2 * j) as usize;
-                let b = (n1 + 1 + 4 * i + 2 * j) as usize;
-                h_op_simd(t, a, b, j == 1);
-            }
-        }
-    }
-
-    if n == 5 {
-        for i in 0..2i64 {
-            for j in 0..2i64 {
-                let a = (n0 - n as i64 + 3 - n2 * j - 4 * i) as usize;
-                let b = (n1 + n as i64 - 4 + n2 * j + 4 * i) as usize;
-                let angle = 28 - 16 * i as i32 + 56 * j as i32;
-                b_op_simd_depth::<HBD>(t, a, b, angle, true);
-            }
-        }
-        let n3 = 1i64 << (n - 3);
-        for i in 0..2i64 {
-            for j in 0..4i64 {
-                let a = (n1 + n3 * j + i) as usize;
-                let b = (n1 + n2 - 5 + n3 * j - i) as usize;
-                h_op_simd(t, a, b, (j & 1) == 1);
-            }
-        }
-    }
-
-    if n >= 4 {
-        let imax_a: i64 = if n == 5 { 1 } else { 0 };
-        for i in 0..=imax_a {
-            for j in 0..2i64 {
-                let a = (n0 - n as i64 + 2 - i - n2 * j) as usize;
-                let b = (n1 + n as i64 - 3 + i + n2 * j) as usize;
-                let angle = 24 + 48 * j as i32;
-                b_op_simd_depth::<HBD>(t, a, b, angle, true);
-            }
-        }
-        let imax_b: i64 = 2 * n as i64 - 7;
-        for j in 0..2i64 {
-            for i in 0..=imax_b {
-                let a = (n1 + n2 * j + i) as usize;
-                let b = (n1 + n2 - 1 + n2 * j - i) as usize;
-                h_op_simd(t, a, b, (j & 1) == 1);
-            }
-        }
-    }
-
-    if n >= 3 {
-        let n3 = 1i64 << (n - 3);
-        for i in 0..n3 {
-            let a = (n0 - n3 - 1 - i) as usize;
-            let b = (n1 + n3 + i) as usize;
-            b_op_simd_depth::<HBD>(t, a, b, 16, true);
-        }
-    }
-
-    for i in 0..n1 {
-        let a = i as usize;
-        let b = (n0 - 1 - i) as usize;
-        h_op_simd(t, a, b, false);
-    }
+    crate::transform::idct_body!(t, n, b_op_simd_depth::<HBD>, h_op_simd, idct_simd::<HBD>);
 }

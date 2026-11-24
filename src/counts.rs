@@ -84,7 +84,7 @@ fn add_counter_6d<
 }
 
 /// All counter arrays enumerated by the "Clear counts process" in spec §8.3.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Counts {
     pub intra_mode: [[u32; 10]; 4],
     pub uv_mode: [[u32; 10]; 10],
@@ -112,38 +112,14 @@ pub struct Counts {
     pub more_coefs: MoreCoefsCounts,
 }
 
-impl Default for Counts {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Counts {
     pub fn new() -> Self {
-        Self {
-            intra_mode: [[0; 10]; 4],
-            uv_mode: [[0; 10]; 10],
-            partition: [[0; 4]; 16],
-            interp_filter: [[0; 3]; 4],
-            inter_mode: [[0; 4]; 7],
-            tx_size: [[[0; 4]; 2]; 4],
-            is_inter: [[0; 2]; 4],
-            comp_mode: [[0; 2]; 5],
-            single_ref: [[[0; 2]; 2]; 5],
-            comp_ref: [[0; 2]; 5],
-            skip: [[0; 2]; 3],
-            mv_joint: [0; 4],
-            mv_sign: [[0; 2]; 2],
-            mv_class: [[0; 11]; 2],
-            mv_class0_bit: [[0; 2]; 2],
-            mv_class0_fr: [[[0; 4]; 2]; 2],
-            mv_class0_hp: [[0; 2]; 2],
-            mv_bits: [[[0; 2]; 10]; 2],
-            mv_fr: [[0; 4]; 2],
-            mv_hp: [[0; 2]; 2],
-            token: [[[[[[0; 3]; 6]; 6]; 2]; 2]; 4],
-            more_coefs: [[[[[[0; 2]; 6]; 6]; 2]; 2]; 4],
-        }
+        Self::default()
+    }
+
+    /// Resets every counter back to zero in place for cross-frame `Box<Counts>` reuse.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
     }
 
     /// Adds every counter in `other` into `self`, element-wise. Used to merge the per-tile-column
@@ -314,6 +290,22 @@ pub fn adapt_coef_probs(coef_probs: &mut CoefProbs, counts: &Counts, update_fact
     }
 }
 
+fn adapt_prob_slice(probs: &mut [u8], counts: &[[u32; 2]]) {
+    for (p, &c) in probs.iter_mut().zip(counts) {
+        *p = adapt_prob(*p, c);
+    }
+}
+
+fn adapt_probs_rows<const P: usize, const C: usize>(
+    tree: &[i32],
+    probs: &mut [[u8; P]],
+    counts: &[[u32; C]],
+) {
+    for (p, c) in probs.iter_mut().zip(counts) {
+        adapt_probs(tree, p, c);
+    }
+}
+
 /// `adapt_noncoef_probs( )` (spec §8.4.4).
 pub fn adapt_noncoef_probs(
     probs: &mut CompressedHeaderProbs,
@@ -322,77 +314,47 @@ pub fn adapt_noncoef_probs(
     tx_mode: u8,
     allow_high_precision_mv: bool,
 ) {
-    for i in 0..4 {
-        probs.is_inter_prob[i] = adapt_prob(probs.is_inter_prob[i], counts.is_inter[i]);
-    }
-    for i in 0..5 {
-        probs.comp_mode_prob[i] = adapt_prob(probs.comp_mode_prob[i], counts.comp_mode[i]);
-    }
-    for i in 0..5 {
-        probs.comp_ref_prob[i] = adapt_prob(probs.comp_ref_prob[i], counts.comp_ref[i]);
-    }
-    for i in 0..5 {
-        for j in 0..2 {
-            probs.single_ref_prob[i][j] =
-                adapt_prob(probs.single_ref_prob[i][j], counts.single_ref[i][j]);
-        }
-    }
-    for i in 0..7 {
-        adapt_probs(
-            &INTER_MODE_TREE,
-            &mut probs.inter_mode_probs[i],
-            &counts.inter_mode[i],
-        );
-    }
-    for i in 0..4 {
-        adapt_probs(
-            &INTRA_MODE_TREE,
-            &mut probs.y_mode_probs[i],
-            &counts.intra_mode[i],
-        );
-    }
-    for i in 0..10 {
-        adapt_probs(
-            &INTRA_MODE_TREE,
-            &mut probs.uv_mode_probs[i],
-            &counts.uv_mode[i],
-        );
-    }
-    for i in 0..16 {
-        adapt_probs(
-            &PARTITION_TREE,
-            &mut probs.partition_probs[i],
-            &counts.partition[i],
-        );
-    }
-    for i in 0..3 {
-        probs.skip_prob[i] = adapt_prob(probs.skip_prob[i], counts.skip[i]);
-    }
+    adapt_prob_slice(&mut probs.is_inter_prob, &counts.is_inter);
+    adapt_prob_slice(&mut probs.comp_mode_prob, &counts.comp_mode);
+    adapt_prob_slice(&mut probs.comp_ref_prob, &counts.comp_ref);
+    adapt_prob_slice(
+        probs.single_ref_prob.as_flattened_mut(),
+        counts.single_ref.as_flattened(),
+    );
+    adapt_probs_rows(
+        &INTER_MODE_TREE,
+        &mut probs.inter_mode_probs,
+        &counts.inter_mode,
+    );
+    adapt_probs_rows(
+        &INTRA_MODE_TREE,
+        &mut probs.y_mode_probs,
+        &counts.intra_mode,
+    );
+    adapt_probs_rows(&INTRA_MODE_TREE, &mut probs.uv_mode_probs, &counts.uv_mode);
+    adapt_probs_rows(
+        &PARTITION_TREE,
+        &mut probs.partition_probs,
+        &counts.partition,
+    );
+    adapt_prob_slice(&mut probs.skip_prob, &counts.skip);
     if interpolation_filter == SWITCHABLE {
-        for i in 0..4 {
-            adapt_probs(
-                &INTERP_FILTER_TREE,
-                &mut probs.interp_filter_probs[i],
-                &counts.interp_filter[i],
-            );
-        }
+        adapt_probs_rows(
+            &INTERP_FILTER_TREE,
+            &mut probs.interp_filter_probs,
+            &counts.interp_filter,
+        );
     }
     if tx_mode == TX_MODE_SELECT {
-        for i in 0..2 {
-            adapt_probs(
-                &crate::prob_tables::TX_SIZE_8_TREE,
-                &mut probs.tx_probs[TX_8X8 as usize][i],
-                &counts.tx_size[TX_8X8 as usize][i],
-            );
-            adapt_probs(
-                &crate::prob_tables::TX_SIZE_16_TREE,
-                &mut probs.tx_probs[TX_16X16 as usize][i],
-                &counts.tx_size[TX_16X16 as usize][i],
-            );
-            adapt_probs(
-                &crate::prob_tables::TX_SIZE_32_TREE,
-                &mut probs.tx_probs[TX_32X32 as usize][i],
-                &counts.tx_size[TX_32X32 as usize][i],
+        for (tx_sz, tree) in [
+            (TX_8X8, crate::prob_tables::TX_SIZE_8_TREE.as_slice()),
+            (TX_16X16, crate::prob_tables::TX_SIZE_16_TREE.as_slice()),
+            (TX_32X32, crate::prob_tables::TX_SIZE_32_TREE.as_slice()),
+        ] {
+            adapt_probs_rows(
+                tree,
+                &mut probs.tx_probs[tx_sz as usize],
+                &counts.tx_size[tx_sz as usize],
             );
         }
     }
@@ -406,16 +368,12 @@ pub fn adapt_noncoef_probs(
         );
         probs.mv_class0_bit_prob[i] =
             adapt_prob(probs.mv_class0_bit_prob[i], counts.mv_class0_bit[i]);
-        for j in 0..10 {
-            probs.mv_bits_prob[i][j] = adapt_prob(probs.mv_bits_prob[i][j], counts.mv_bits[i][j]);
-        }
-        for j in 0..2 {
-            adapt_probs(
-                &MV_FR_TREE,
-                &mut probs.mv_class0_fr_probs[i][j],
-                &counts.mv_class0_fr[i][j],
-            );
-        }
+        adapt_prob_slice(&mut probs.mv_bits_prob[i], &counts.mv_bits[i]);
+        adapt_probs_rows(
+            &MV_FR_TREE,
+            &mut probs.mv_class0_fr_probs[i],
+            &counts.mv_class0_fr[i],
+        );
         adapt_probs(&MV_FR_TREE, &mut probs.mv_fr_probs[i], &counts.mv_fr[i]);
         if allow_high_precision_mv {
             probs.mv_class0_hp_prob[i] =

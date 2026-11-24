@@ -40,18 +40,12 @@ const COMPANDED_MVREF_THRESH: i32 = 8;
 /// `MI_SIZE` (spec §3). The side length in pixels of an 8x8 mode info unit.
 const MI_SIZE: i32 = 8;
 
-/// `clamp_mv_row( mvec, border )` (spec §6.5.4).
-fn clamp_mv_row(mvec: i32, border: i32, mi_row: u32, bh: u32, mi_rows: u32) -> i32 {
-    let mb_to_top_edge = -((mi_row as i32) * MI_SIZE * 8);
-    let mb_to_bottom_edge = ((mi_rows as i32) - (bh as i32) - (mi_row as i32)) * MI_SIZE * 8;
-    mvec.clamp(mb_to_top_edge - border, mb_to_bottom_edge + border)
-}
-
-/// `clamp_mv_col( mvec, border )` (spec §6.5.5).
-fn clamp_mv_col(mvec: i32, border: i32, mi_col: u32, bw: u32, mi_cols: u32) -> i32 {
-    let mb_to_left_edge = -((mi_col as i32) * MI_SIZE * 8);
-    let mb_to_right_edge = ((mi_cols as i32) - (bw as i32) - (mi_col as i32)) * MI_SIZE * 8;
-    mvec.clamp(mb_to_left_edge - border, mb_to_right_edge + border)
+/// Shared body of `clamp_mv_row` (spec §6.5.4) and `clamp_mv_col` (spec §6.5.5).
+#[inline]
+fn clamp_mv_coord(mvec: i32, border: i32, mi_pos: u32, block_mis: u32, mi_limit: u32) -> i32 {
+    let mb_to_near = -((mi_pos as i32) * MI_SIZE * 8);
+    let mb_to_far = ((mi_limit as i32) - (block_mis as i32) - (mi_pos as i32)) * MI_SIZE * 8;
+    mvec.clamp(mb_to_near - border, mb_to_far + border)
 }
 
 /// `add_mv_ref_list( refList )` (spec §6.5.6). Handles appending to
@@ -118,9 +112,10 @@ impl TileDecoder {
         ref_list_mv: &mut [Mv; 2],
         ref_mv_count: &mut usize,
     ) {
-        if info.ref_frame[0] == ref_frame {
+        let rf = info.ref_frame();
+        if rf[0] == ref_frame {
             add_mv_ref_list(ref_list_mv, ref_mv_count, info.mv[0]);
-        } else if info.ref_frame[1] == ref_frame {
+        } else if rf[1] == ref_frame {
             add_mv_ref_list(ref_list_mv, ref_mv_count, info.mv[1]);
         }
     }
@@ -134,8 +129,7 @@ impl TileDecoder {
         ref_list_mv: &mut [Mv; 2],
         ref_mv_count: &mut usize,
     ) {
-        let frame0 = info.ref_frame[0];
-        let frame1 = info.ref_frame[1];
+        let [frame0, frame1] = info.ref_frame();
         let mv0 = info.mv[0];
         let mv1 = info.mv[1];
         let mvs_same = mv0 == mv1;
@@ -171,15 +165,17 @@ impl TileDecoder {
             if self.is_inside(cr, cc) {
                 different_ref_found = true;
                 let cand = self.mi_grid.get(cr as u32, cc as u32);
-                context_counter += MODE_2_COUNTER[cand.y_mode as usize] as u32;
-                for j in 0..2 {
-                    if cand.ref_frame[j] == ref_frame {
+                context_counter += MODE_2_COUNTER[cand.y_mode() as usize] as u32;
+                let cand_rf = cand.ref_frame();
+                for (j, &rf) in cand_rf.iter().enumerate() {
+                    if rf == ref_frame {
                         let idx = if block >= 0 {
                             IDX_N_COLUMN_TO_SUBBLOCK[block as usize][(dc == 0) as usize] as usize
                         } else {
                             3
                         };
-                        add_mv_ref_list(&mut ref_list_mv, &mut ref_mv_count, cand.sub_mvs[j][idx]);
+                        let cand_mv = self.mi_grid.get_sub_mv(cand, j, idx);
+                        add_mv_ref_list(&mut ref_list_mv, &mut ref_mv_count, cand_mv);
                         break;
                     }
                 }
@@ -253,8 +249,8 @@ impl TileDecoder {
         let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
         let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
         for mv in ref_list_mv.iter_mut() {
-            mv[0] = clamp_mv_row(mv[0], MV_BORDER, row, bh, self.mi_rows);
-            mv[1] = clamp_mv_col(mv[1], MV_BORDER, col, bw, self.mi_cols);
+            mv[0] = clamp_mv_coord(mv[0], MV_BORDER, row, bh, self.mi_rows);
+            mv[1] = clamp_mv_coord(mv[1], MV_BORDER, col, bw, self.mi_cols);
         }
 
         (ref_list_mv, mode_context)
@@ -272,18 +268,15 @@ impl TileDecoder {
         let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
         let mut out = ref_list_mv;
         for mv in out.iter_mut() {
-            let mut delta_row = mv[0];
-            let mut delta_col = mv[1];
             if !self.allow_high_precision_mv || !use_mv_hp(*mv) {
-                if delta_row & 1 != 0 {
-                    delta_row += if delta_row > 0 { -1 } else { 1 };
-                }
-                if delta_col & 1 != 0 {
-                    delta_col += if delta_col > 0 { -1 } else { 1 };
+                for comp in mv.iter_mut() {
+                    if *comp & 1 != 0 {
+                        *comp += if *comp > 0 { -1 } else { 1 };
+                    }
                 }
             }
-            mv[0] = clamp_mv_row(delta_row, MV_PRED_BORDER, row, bh, self.mi_rows);
-            mv[1] = clamp_mv_col(delta_col, MV_PRED_BORDER, col, bw, self.mi_cols);
+            mv[0] = clamp_mv_coord(mv[0], MV_PRED_BORDER, row, bh, self.mi_rows);
+            mv[1] = clamp_mv_coord(mv[1], MV_PRED_BORDER, col, bw, self.mi_cols);
         }
         (out[0], out[1], out[0])
     }

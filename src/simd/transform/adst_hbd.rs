@@ -9,7 +9,6 @@
 
 use std::arch::x86_64::*;
 
-use super::adst::{adst_input_permute_simd, adst_output_permute_simd};
 use super::dct::idct_permute_simd;
 
 /// Exact `lane * c` on 4 `i64` lanes (low 64 bits):
@@ -120,28 +119,9 @@ unsafe fn sh_op_i64(t: &mut [__m256i], s: &[__m256i], a: usize, b: usize) {
 /// Caller must confirm `avx2_enabled()` and `t.len() >= 4`.
 #[target_feature(enable = "avx2")]
 unsafe fn iadst4_i64(t: &mut [__m256i]) {
-    use crate::transform::{SINPI_1_9, SINPI_2_9, SINPI_3_9, SINPI_4_9};
-    let s0 = mul_i64(t[0], SINPI_1_9);
-    let s1 = mul_i64(t[0], SINPI_2_9);
-    let s2 = mul_i64(t[1], SINPI_3_9);
-    let s3 = mul_i64(t[2], SINPI_4_9);
-    let s4 = mul_i64(t[2], SINPI_1_9);
-    let s5 = mul_i64(t[3], SINPI_2_9);
-    let s6 = mul_i64(t[3], SINPI_4_9);
-    let v = _mm256_add_epi64(_mm256_sub_epi64(t[0], t[2]), t[3]);
-    let s7 = mul_i64(v, SINPI_3_9);
-    let x0 = _mm256_add_epi64(_mm256_add_epi64(s0, s3), s5);
-    let x1 = _mm256_sub_epi64(_mm256_sub_epi64(s1, s4), s6);
-    let x2 = s7;
-    let x3 = s2;
-    let o0 = _mm256_add_epi64(x0, x3);
-    let o1 = _mm256_add_epi64(x1, x3);
-    let o2 = x2;
-    let o3 = _mm256_sub_epi64(_mm256_add_epi64(x0, x1), x3);
-    t[0] = round2_i64(o0, 14);
-    t[1] = round2_i64(o1, 14);
-    t[2] = round2_i64(o2, 14);
-    t[3] = round2_i64(o3, 14);
+    crate::transform::iadst4_body!(t, mul_i64, _mm256_add_epi64, _mm256_sub_epi64, |v| {
+        round2_i64(v, 14)
+    });
 }
 
 /// Inverse ADST8 (`transform.rs::iadst8_impl`, spec §8.7.1.7) on 4 `i64` lanes.
@@ -150,34 +130,10 @@ unsafe fn iadst4_i64(t: &mut [__m256i]) {
 /// Caller must confirm `avx2_enabled()` and `t.len() >= 8`.
 #[target_feature(enable = "avx2")]
 unsafe fn iadst8_i64(t: &mut [__m256i]) {
-    adst_input_permute_simd(t, 3);
-    let mut s = [_mm256_setzero_si256(); 8];
-
-    for i in 0..4usize {
-        sb_op_i64(&mut s, t, 2 * i, 1 + 2 * i, 30 - 8 * i as i32, true);
-    }
-    for i in 0..4usize {
-        sh_op_i64(t, &s, i, 4 + i);
-    }
-    for i in 0..2usize {
-        sb_op_i64(&mut s, t, 4 + 3 * i, 5 + i, 24 - 16 * i as i32, true);
-    }
-    for i in 0..2usize {
-        sh_op_i64(t, &s, 4 + i, 6 + i);
-    }
-    for i in 0..2usize {
-        h_op_i64(t, i, 2 + i, false);
-    }
-    for i in 0..2usize {
-        b_op_i64(t, 2 + 4 * i, 3 + 4 * i, 16, true);
-    }
-
-    adst_output_permute_simd(t, 3);
-
     let zero = _mm256_setzero_si256();
-    for i in 0..4usize {
-        t[1 + 2 * i] = _mm256_sub_epi64(zero, t[1 + 2 * i]);
-    }
+    crate::transform::iadst8_body!(t, zero, sb_op_i64, sh_op_i64, h_op_i64, b_op_i64, |v| {
+        _mm256_sub_epi64(zero, v)
+    });
 }
 
 /// Inverse ADST16 (`transform.rs::iadst16_impl`, spec §8.7.1.8) on 4 `i64` lanes.
@@ -186,61 +142,10 @@ unsafe fn iadst8_i64(t: &mut [__m256i]) {
 /// Caller must confirm `avx2_enabled()` and `t.len() >= 16`.
 #[target_feature(enable = "avx2")]
 unsafe fn iadst16_i64(t: &mut [__m256i]) {
-    adst_input_permute_simd(t, 4);
-    let mut s = [_mm256_setzero_si256(); 16];
-
-    for i in 0..8usize {
-        sb_op_i64(&mut s, t, 2 * i, 1 + 2 * i, 31 - 4 * i as i32, true);
-    }
-    for i in 0..8usize {
-        sh_op_i64(t, &s, i, 8 + i);
-    }
-    for i in 0..4usize {
-        sb_op_i64(&mut s, t, 8 + 2 * i, 9 + 2 * i, 28 - 16 * i as i32, true);
-    }
-    for i in 0..4usize {
-        sh_op_i64(t, &s, 8 + i, 12 + i);
-    }
-    for i in 0..4usize {
-        h_op_i64(t, i, 4 + i, false);
-    }
-    for i in 0..2usize {
-        for j in 0..2usize {
-            sb_op_i64(
-                &mut s,
-                t,
-                4 + 8 * i + 3 * j,
-                5 + 8 * i + j,
-                24 - 16 * j as i32,
-                true,
-            );
-        }
-    }
-    for i in 0..2usize {
-        for j in 0..2usize {
-            sh_op_i64(t, &s, 4 + 8 * j + i, 6 + 8 * j + i);
-        }
-    }
-    for i in 0..2usize {
-        for j in 0..2usize {
-            h_op_i64(t, 8 * j + i, 2 + 8 * j + i, false);
-        }
-    }
-    for i in 0..2usize {
-        for j in 0..2usize {
-            let angle = 48 + 64 * (i ^ j) as i32;
-            b_op_i64(t, 2 + 4 * j + 8 * i, 3 + 4 * j + 8 * i, angle, false);
-        }
-    }
-
-    adst_output_permute_simd(t, 4);
-
     let zero = _mm256_setzero_si256();
-    for i in 0..2usize {
-        for j in 0..2usize {
-            t[1 + 12 * j + 2 * i] = _mm256_sub_epi64(zero, t[1 + 12 * j + 2 * i]);
-        }
-    }
+    crate::transform::iadst16_body!(t, zero, sb_op_i64, sh_op_i64, h_op_i64, b_op_i64, |v| {
+        _mm256_sub_epi64(zero, v)
+    });
 }
 
 /// `iadst(t, n)` (`transform.rs::iadst`, spec §8.7.1.9) on 4 `i64` lanes: ADST4/8/16 by size.
@@ -264,87 +169,7 @@ pub(in crate::simd) unsafe fn iadst_i64(t: &mut [__m256i], n: u32) {
 /// Caller must confirm `avx2_enabled()`, `2 <= n <= 5`, and `t.len() >= (1 << n)`.
 #[target_feature(enable = "avx2")]
 pub(in crate::simd) unsafe fn idct_i64(t: &mut [__m256i], n: u32) {
-    let n0 = 1i64 << n;
-    let n1 = 1i64 << (n - 1);
-    let n2 = 1i64 << (n - 2);
-
-    if n == 2 {
-        b_op_i64(t, 0, 1, 16, true);
-    } else {
-        idct_i64(t, n - 1);
-    }
-
-    for i in 0..n2 {
-        let a = (n1 + i) as usize;
-        let b = (n0 - 1 - i) as usize;
-        let angle = 32 - crate::transform::brev(5, a) as i32;
-        b_op_i64(t, a, b, angle, false);
-    }
-
-    if n >= 3 {
-        let n3 = 1i64 << (n - 3);
-        for i in 0..n3 {
-            for j in 0..2i64 {
-                let a = (n1 + 4 * i + 2 * j) as usize;
-                let b = (n1 + 1 + 4 * i + 2 * j) as usize;
-                h_op_i64(t, a, b, j == 1);
-            }
-        }
-    }
-
-    if n == 5 {
-        for i in 0..2i64 {
-            for j in 0..2i64 {
-                let a = (n0 - n as i64 + 3 - n2 * j - 4 * i) as usize;
-                let b = (n1 + n as i64 - 4 + n2 * j + 4 * i) as usize;
-                let angle = 28 - 16 * i as i32 + 56 * j as i32;
-                b_op_i64(t, a, b, angle, true);
-            }
-        }
-        let n3 = 1i64 << (n - 3);
-        for i in 0..2i64 {
-            for j in 0..4i64 {
-                let a = (n1 + n3 * j + i) as usize;
-                let b = (n1 + n2 - 5 + n3 * j - i) as usize;
-                h_op_i64(t, a, b, (j & 1) == 1);
-            }
-        }
-    }
-
-    if n >= 4 {
-        let imax_a: i64 = if n == 5 { 1 } else { 0 };
-        for i in 0..=imax_a {
-            for j in 0..2i64 {
-                let a = (n0 - n as i64 + 2 - i - n2 * j) as usize;
-                let b = (n1 + n as i64 - 3 + i + n2 * j) as usize;
-                let angle = 24 + 48 * j as i32;
-                b_op_i64(t, a, b, angle, true);
-            }
-        }
-        let imax_b: i64 = 2 * n as i64 - 7;
-        for j in 0..2i64 {
-            for i in 0..=imax_b {
-                let a = (n1 + n2 * j + i) as usize;
-                let b = (n1 + n2 - 1 + n2 * j - i) as usize;
-                h_op_i64(t, a, b, (j & 1) == 1);
-            }
-        }
-    }
-
-    if n >= 3 {
-        let n3 = 1i64 << (n - 3);
-        for i in 0..n3 {
-            let a = (n0 - n3 - 1 - i) as usize;
-            let b = (n1 + n3 + i) as usize;
-            b_op_i64(t, a, b, 16, true);
-        }
-    }
-
-    for i in 0..n1 {
-        let a = i as usize;
-        let b = (n0 - 1 - i) as usize;
-        h_op_i64(t, a, b, false);
-    }
+    crate::transform::idct_body!(t, n, b_op_i64, h_op_i64, idct_i64);
 }
 
 /// Transposes a 4x4 `i64` matrix (`r[i]` = row i, 4 `i64` lanes) so `out[j]` = column j.
@@ -371,6 +196,7 @@ unsafe fn transpose4x4_i64(r: &[__m256i; 4]) -> [__m256i; 4] {
 ///
 /// # Safety
 /// Caller must confirm `avx2_enabled()` and `2 <= n <= 4`.
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn xform_pass_i64<const ADST: bool>(
     input: &[i64; 256],

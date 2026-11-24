@@ -7,6 +7,8 @@ mod intra;
 
 #[cfg(test)]
 pub(crate) use inter::block_inter_predict_scalar;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use inter::RefSample;
 pub use inter::{predict_inter, InterPredictParams, RefPlaneView};
 pub use intra::predict_intra;
 #[cfg(test)]

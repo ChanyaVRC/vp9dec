@@ -14,7 +14,7 @@ use crate::header::{SegmentationParams, SEG_LVL_ALT_Q};
 /// Spec §8.6.1 `dc_qlookup[ 3 ][ 256 ]`.
 /// The row index is `(BitDepth - 8) >> 1` (8bit->0, 10bit->1, 12bit->2).
 #[rustfmt::skip]
-pub const DC_QLOOKUP: [[i32; 256]; 3] = [
+pub const DC_QLOOKUP: [[u16; 256]; 3] = [
     [
         4, 8, 8, 9, 10, 11, 12, 12, 13, 14, 15, 16,
         17, 18, 19, 19, 20, 21, 22, 23, 24, 25, 26, 26,
@@ -91,7 +91,7 @@ pub const DC_QLOOKUP: [[i32; 256]; 3] = [
 
 /// Spec §8.6.1 `ac_qlookup[ 3 ][ 256 ]`. The row index has the same meaning as [`DC_QLOOKUP`].
 #[rustfmt::skip]
-pub const AC_QLOOKUP: [[i32; 256]; 3] = [
+pub const AC_QLOOKUP: [[u16; 256]; 3] = [
     [
         4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
         19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
@@ -169,13 +169,13 @@ pub const AC_QLOOKUP: [[i32; 256]; 3] = [
 /// Spec §8.6.1 `dc_q( b )` = `dc_qlookup[ (BitDepth-8) >> 1 ][ Clip3( 0, 255, b ) ]`.
 pub fn dc_q(bit_depth: u8, b: i32) -> i32 {
     let row = ((bit_depth - 8) >> 1) as usize;
-    DC_QLOOKUP[row][clip3(0, 255, b) as usize]
+    DC_QLOOKUP[row][clip3(0, 255, b) as usize] as i32
 }
 
 /// Spec §8.6.1 `ac_q( b )` = `ac_qlookup[ (BitDepth-8) >> 1 ][ Clip3( 0, 255, b ) ]`.
 pub fn ac_q(bit_depth: u8, b: i32) -> i32 {
     let row = ((bit_depth - 8) >> 1) as usize;
-    AC_QLOOKUP[row][clip3(0, 255, b) as usize]
+    AC_QLOOKUP[row][clip3(0, 255, b) as usize] as i32
 }
 
 /// Spec §8.6.1 `get_qindex()`. `segmentation`/`segment_id` are taken directly rather than

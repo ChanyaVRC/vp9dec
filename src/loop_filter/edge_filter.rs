@@ -197,59 +197,24 @@ fn compute_filter_mask<P: PlaneAccess>(
     p: EdgeFilterParams,
 ) -> (bool, bool, bool, bool) {
     let g = |k: i64| get_off(plane, x, y, p.dx, p.dy, k);
-    let q0 = g(0);
-    let q1 = g(1);
-    let q2 = g(2);
-    let q3 = g(3);
-    let p0 = g(-1);
-    let p1 = g(-2);
-    let p2 = g(-3);
-    let p3 = g(-4);
+    let q: [i32; 4] = std::array::from_fn(|k| g(k as i64));
+    let pv: [i32; 4] = std::array::from_fn(|k| g(-(k as i64) - 1));
 
-    let hev_mask = (p1 - p0).abs() > p.thresh || (q1 - q0).abs() > p.thresh;
+    let hev_mask = (pv[1] - pv[0]).abs() > p.thresh || (q[1] - q[0]).abs() > p.thresh;
 
-    let mut mask = (p3 - p2).abs() > p.limit;
-    mask |= (p2 - p1).abs() > p.limit;
-    mask |= (p1 - p0).abs() > p.limit;
-    mask |= (q1 - q0).abs() > p.limit;
-    mask |= (q2 - q1).abs() > p.limit;
-    mask |= (q3 - q2).abs() > p.limit;
-    mask |= (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > p.blimit;
+    let mut mask = (pv[0] - q[0]).abs() * 2 + (pv[1] - q[1]).abs() / 2 > p.blimit;
+    for k in 0..3 {
+        mask |= (pv[k + 1] - pv[k]).abs() > p.limit || (q[k + 1] - q[k]).abs() > p.limit;
+    }
     let filter_mask = !mask;
 
     let threshold = 1i32 << (p.bit_depth - 8);
-
-    let mut flat_mask = false;
-    if p.filter_size >= TX_8X8 {
-        let mut m = (p1 - p0).abs() > threshold;
-        m |= (q1 - q0).abs() > threshold;
-        m |= (p2 - p0).abs() > threshold;
-        m |= (q2 - q0).abs() > threshold;
-        m |= (p3 - p0).abs() > threshold;
-        m |= (q3 - q0).abs() > threshold;
-        flat_mask = !m;
-    }
-
-    let mut flat_mask2 = false;
-    if p.filter_size >= TX_16X16 {
-        let q4 = g(4);
-        let q5 = g(5);
-        let q6 = g(6);
-        let q7 = g(7);
-        let p4 = g(-5);
-        let p5 = g(-6);
-        let p6 = g(-7);
-        let p7 = g(-8);
-        let mut m = (p7 - p0).abs() > threshold;
-        m |= (q7 - q0).abs() > threshold;
-        m |= (p6 - p0).abs() > threshold;
-        m |= (q6 - q0).abs() > threshold;
-        m |= (p5 - p0).abs() > threshold;
-        m |= (q5 - q0).abs() > threshold;
-        m |= (p4 - p0).abs() > threshold;
-        m |= (q4 - q0).abs() > threshold;
-        flat_mask2 = !m;
-    }
+    let flat_mask = p.filter_size >= TX_8X8
+        && !(1..=3).any(|k| (pv[k] - pv[0]).abs() > threshold || (q[k] - q[0]).abs() > threshold);
+    let flat_mask2 = p.filter_size >= TX_16X16
+        && !(4..=7).any(|k| {
+            (g(-(k as i64) - 1) - pv[0]).abs() > threshold || (g(k as i64) - q[0]).abs() > threshold
+        });
 
     (hev_mask, filter_mask, flat_mask, flat_mask2)
 }
