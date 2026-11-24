@@ -37,25 +37,31 @@
 //!   them (or from the default values `[1, 0, -1, -1]`/`[0, 0]` when
 //!   `FrameIsIntra || error_resilient_mode`, i.e. `setup_past_independence`).
 
+mod edge_filter;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::common::{clip3, get_uv_tx_size, round2, INTRA_FRAME, MAX_SEGMENTS};
+use crate::common::{get_uv_tx_size, INTRA_FRAME};
 use crate::framebuffer::Plane;
-use crate::header::{LoopFilterParams, SegmentationParams, SEG_LVL_ALT_L};
+use crate::header::{LoopFilterParams, SegmentationParams};
 use crate::prob_tables::{
     BLOCK_16X16, NEARESTMV, NEARMV, NEWMV, NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP,
-    TX_16X16, TX_4X4, TX_8X8,
 };
 use crate::tile::MiGrid;
-
-const MAX_REF_FRAMES: usize = 4;
-const MAX_MODE_LF_DELTAS: usize = 2;
-const MAX_LOOP_FILTER: i32 = 63;
+#[cfg(test)]
+use crate::header::SEG_LVL_ALT_L;
+#[cfg(test)]
+use crate::prob_tables::{TX_16X16, TX_4X4, TX_8X8};
+#[cfg(test)]
+use edge_filter::{adaptive_filter_strength, narrow_filter};
+use edge_filter::{
+    build_lvl_lookup, build_strength_table, filter_size_process, sample_filtering, LvlLookup,
+    PlaneAccess, StrengthTable,
+};
 
 /// Minimum frame size (in MI units, `MiCols * MiRows`) at which [`loop_filter_frame`] filters
-/// the planes on separate threads. Below it the per-frame thread-spawn cost outweighs the win,
-/// so the planes are filtered sequentially on the calling thread. Bench-tuned (see
-/// `examples/bench.rs`); 4096 MI ~= 512x512 luma, so sub-VGA frames stay sequential.
+/// the planes on separate threads. Below it the per-frame synchronization outweighs the win,
+/// so the planes are filtered sequentially on the calling thread. 4096 MI ~= 512x512 luma.
 const LF_PARALLEL_MIN_MI: u64 = 4096;
 
 /// Test-only knob: forces [`loop_filter_frame`] down the sequential path even when the intra-plane
@@ -78,49 +84,6 @@ pub static FORCE_PARALLEL_LOOP_FILTER: std::sync::atomic::AtomicBool =
 pub static WAVEFRONT_INVOCATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// `LvlLookup[ segmentId ][ ref ][ mode ]` (spec §8.8.1).
-type LvlLookup = [[[i32; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SEGMENTS];
-
-/// Precomputed `(limit, blimit, thresh)` table indexed by `lvl` (`0..=63`), built once per
-/// frame from `(sharpness, bit_depth)` so edge filtering avoids recomputing strength per block.
-type StrengthTable = [(i32, i32, i32); 64];
-
-fn build_strength_table(sharpness: u8, bit_depth: u8) -> StrengthTable {
-    std::array::from_fn(|lvl| adaptive_filter_strength(lvl as i32, sharpness, bit_depth))
-}
-
-/// Pixel read/write access to one plane for the loop filter. This abstracts the filter code over
-/// the safe single-threaded [`Plane`] path (sequential / small frames and the per-plane threads)
-/// and the raw `PlaneView` path used by the intra-plane wavefront, so the filter arithmetic is
-/// written exactly once and each path keeps its own memory-safety story.
-trait PlaneAccess {
-    fn lf_get(&self, x: usize, y: usize) -> u16;
-    fn lf_set(&mut self, x: usize, y: usize, v: u16);
-    /// Base pointer of the row-major buffer, for the AVX2 kernels (which index it raw rather than
-    /// going through `lf_get`/`lf_set`); `lf_stride` is its row stride (`= width`).
-    fn lf_base_ptr(&mut self) -> *mut u16;
-    fn lf_stride(&self) -> usize;
-}
-
-impl PlaneAccess for Plane {
-    #[inline]
-    fn lf_get(&self, x: usize, y: usize) -> u16 {
-        self.get(x, y)
-    }
-    #[inline]
-    fn lf_set(&mut self, x: usize, y: usize, v: u16) {
-        self.set(x, y, v);
-    }
-    #[inline]
-    fn lf_base_ptr(&mut self) -> *mut u16 {
-        self.as_mut_slice().as_mut_ptr()
-    }
-    #[inline]
-    fn lf_stride(&self) -> usize {
-        self.stride()
-    }
-}
-
 /// Raw-pointer view of one plane's pixel buffer for the multi-threaded loop-filter wavefront
 /// ([`wavefront_filter_planes`]), where several worker threads write DISJOINT pixels of the *same*
 /// plane at once. Rust forbids two `&mut Plane` (or overlapping `&mut [u16]`) to one buffer even
@@ -137,11 +100,11 @@ struct PlaneView {
 }
 
 // SAFETY: `PlaneView` is a bare pointer into a `Plane`'s `Vec<u16>`. It is only created from a
-// `&mut Plane` that outlives the `thread::scope` owning the workers (so the buffer stays alive and
-// is never moved/reallocated for the view's lifetime), and shared with workers that -- by the
-// wavefront ordering in `wavefront_filter_planes` -- never write the same pixel concurrently and
-// always establish happens-before (the `Release`/`Acquire` progress counter) before reading a
-// pixel another worker wrote. Hence there is no data race despite the shared buffer.
+// `&mut Plane` that outlives the synchronous parallel dispatch owning the workers (so the buffer
+// stays alive and is never moved/reallocated for the view's lifetime), and shared with workers
+// that -- by the wavefront ordering in `wavefront_filter_planes` -- never write the same pixel
+// concurrently and always establish happens-before (the `Release`/`Acquire` progress counter)
+// before reading a pixel another worker wrote. Hence there is no data race.
 unsafe impl Send for PlaneView {}
 unsafe impl Sync for PlaneView {}
 
@@ -191,318 +154,6 @@ impl PlaneAccess for PlaneView {
     #[inline]
     fn lf_stride(&self) -> usize {
         self.stride
-    }
-}
-
-/// Spec §8.8.1 "Loop filter frame init process".
-fn build_lvl_lookup(lf: &LoopFilterParams, seg: &SegmentationParams) -> LvlLookup {
-    // nShift is computed once from the frame-level loop_filter_level
-    // (note: not from lvlSeg — this matches the spec text).
-    let n_shift = (lf.level as i32) >> 5;
-    let mut table: LvlLookup = [[[0; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SEGMENTS];
-
-    for (segment_id, seg_table) in table.iter_mut().enumerate() {
-        // Step 1-2 (spec §8.8.1): lvlSeg starts at loop_filter_level, then
-        // seg_feature_active(SEG_LVL_ALT_L) overrides it (absolute or delta).
-        let mut lvl_seg = lf.level as i32;
-        if seg.enabled && seg.feature_enabled[segment_id][SEG_LVL_ALT_L] {
-            let data = seg.feature_data[segment_id][SEG_LVL_ALT_L];
-            lvl_seg = if seg.abs_or_delta_update {
-                data
-            } else {
-                data + lf.level as i32
-            };
-            lvl_seg = clip3(0, MAX_LOOP_FILTER, lvl_seg);
-        }
-
-        if !lf.delta_enabled {
-            for r in seg_table.iter_mut() {
-                for m in r.iter_mut() {
-                    *m = lvl_seg;
-                }
-            }
-        } else {
-            let intra_lvl = lvl_seg + (lf.ref_deltas[INTRA_FRAME as usize] as i32) * (1 << n_shift);
-            seg_table[INTRA_FRAME as usize][0] = clip3(0, MAX_LOOP_FILTER, intra_lvl);
-            // seg_table[INTRA_FRAME][1] is not defined by the spec (the INTRA_FRAME
-            // row only has mode=0). On keyframes isIntra is always true and
-            // modeType is always 0, so it's never referenced.
-            for (r, ref_delta) in lf.ref_deltas.iter().enumerate().skip(1) {
-                for (m, mode_delta) in lf.mode_deltas.iter().enumerate() {
-                    let inter_lvl = lvl_seg
-                        + (*ref_delta as i32) * (1 << n_shift)
-                        + (*mode_delta as i32) * (1 << n_shift);
-                    seg_table[r][m] = clip3(0, MAX_LOOP_FILTER, inter_lvl);
-                }
-            }
-        }
-    }
-    table
-}
-
-/// The `limit`/`blimit`/`thresh` computation from spec §8.8.4 "Adaptive
-/// filter strength process". (`lvl` is looked up from `LvlLookup` by the
-/// caller and passed in.) The result is scaled by `<< (bit_depth - 8)` (identity at
-/// `bit_depth == 8`) since these three values are compared directly against pixel
-/// differences, which widen by the same factor at higher bit depths.
-fn adaptive_filter_strength(lvl: i32, sharpness: u8, bit_depth: u8) -> (i32, i32, i32) {
-    let shift = if sharpness > 4 {
-        2
-    } else if sharpness > 0 {
-        1
-    } else {
-        0
-    };
-    let limit = if sharpness > 0 {
-        clip3(1, 9 - sharpness as i32, lvl >> shift)
-    } else {
-        (lvl >> shift).max(1)
-    };
-    let blimit = 2 * (lvl + 2) + limit;
-    let thresh = lvl >> 4;
-    let depth_shift = (bit_depth - 8) as u32;
-    (
-        limit << depth_shift,
-        blimit << depth_shift,
-        thresh << depth_shift,
-    )
-}
-
-/// Spec §8.8.3 "Filter size process".
-#[allow(clippy::too_many_arguments)]
-fn filter_size_process(
-    tx_sz: u8,
-    is_32_edge: bool,
-    pass: u32,
-    x: u32,
-    y: u32,
-    sub_x: u32,
-    sub_y: u32,
-    mi_cols: u32,
-    mi_rows: u32,
-) -> u8 {
-    let base_size = if tx_sz == TX_4X4 && is_32_edge {
-        TX_8X8
-    } else {
-        tx_sz.min(TX_16X16)
-    };
-
-    let luma_boundary = (pass == 0 && sub_x == 1 && (x >> 3) == mi_cols - 1)
-        || (pass == 1 && sub_y == 1 && (y >> 3) == mi_rows - 1);
-    if base_size == TX_16X16 && luma_boundary {
-        TX_8X8
-    } else {
-        base_size
-    }
-}
-
-/// Reads the sample at position `x + dx*k, y + dy*k` (the general form of the
-/// spec's `q_k`/`p_k`: negative `k` denotes the `p` side, non-negative `k`
-/// denotes the `q` side).
-#[inline]
-fn get_off<P: PlaneAccess>(plane: &P, x: usize, y: usize, dx: i64, dy: i64, k: i64) -> i32 {
-    let px = (x as i64 + dx * k) as usize;
-    let py = (y as i64 + dy * k) as usize;
-    plane.lf_get(px, py) as i32
-}
-
-#[inline]
-fn set_off<P: PlaneAccess>(plane: &mut P, x: usize, y: usize, dx: i64, dy: i64, k: i64, v: i32) {
-    let px = (x as i64 + dx * k) as usize;
-    let py = (y as i64 + dy * k) as usize;
-    plane.lf_set(px, py, v as u16);
-}
-
-/// Spec §8.8.5.1 "Filter mask process". Returns `(hevMask, filterMask, flatMask, flatMask2)`.
-/// `limit`/`blimit`/`thresh` arrive already scaled by `<< (bit_depth - 8)` (see
-/// `adaptive_filter_strength`); the flat-mask threshold (fixed at `1` in the spec's 8-bit
-/// text) is scaled here the same way.
-#[allow(clippy::too_many_arguments)]
-fn compute_filter_mask<P: PlaneAccess>(
-    plane: &P,
-    x: usize,
-    y: usize,
-    dx: i64,
-    dy: i64,
-    limit: i32,
-    blimit: i32,
-    thresh: i32,
-    filter_size: u8,
-    bit_depth: u8,
-) -> (bool, bool, bool, bool) {
-    let g = |k: i64| get_off(plane, x, y, dx, dy, k);
-    let q0 = g(0);
-    let q1 = g(1);
-    let q2 = g(2);
-    let q3 = g(3);
-    let p0 = g(-1);
-    let p1 = g(-2);
-    let p2 = g(-3);
-    let p3 = g(-4);
-
-    let hev_mask = (p1 - p0).abs() > thresh || (q1 - q0).abs() > thresh;
-
-    let mut mask = (p3 - p2).abs() > limit;
-    mask |= (p2 - p1).abs() > limit;
-    mask |= (p1 - p0).abs() > limit;
-    mask |= (q1 - q0).abs() > limit;
-    mask |= (q2 - q1).abs() > limit;
-    mask |= (q3 - q2).abs() > limit;
-    mask |= (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > blimit;
-    let filter_mask = !mask;
-
-    let threshold = 1i32 << (bit_depth - 8);
-
-    let mut flat_mask = false;
-    if filter_size >= TX_8X8 {
-        let mut m = (p1 - p0).abs() > threshold;
-        m |= (q1 - q0).abs() > threshold;
-        m |= (p2 - p0).abs() > threshold;
-        m |= (q2 - q0).abs() > threshold;
-        m |= (p3 - p0).abs() > threshold;
-        m |= (q3 - q0).abs() > threshold;
-        flat_mask = !m;
-    }
-
-    let mut flat_mask2 = false;
-    if filter_size >= TX_16X16 {
-        let q4 = g(4);
-        let q5 = g(5);
-        let q6 = g(6);
-        let q7 = g(7);
-        let p4 = g(-5);
-        let p5 = g(-6);
-        let p6 = g(-7);
-        let p7 = g(-8);
-        let mut m = (p7 - p0).abs() > threshold;
-        m |= (q7 - q0).abs() > threshold;
-        m |= (p6 - p0).abs() > threshold;
-        m |= (q6 - q0).abs() > threshold;
-        m |= (p5 - p0).abs() > threshold;
-        m |= (q5 - q0).abs() > threshold;
-        m |= (p4 - p0).abs() > threshold;
-        m |= (q4 - q0).abs() > threshold;
-        flat_mask2 = !m;
-    }
-
-    (hev_mask, filter_mask, flat_mask, flat_mask2)
-}
-
-/// Spec §8.8.5.2 "Narrow filter process" (`filter4`). The `0x80` base and the `clamp4`
-/// range scale by bit depth (spec §8.8.5.2's `Round2(1, BitDepth-1)`-style base and the
-/// `<< (BitDepth - 8)` clamp range); both are identity at `bit_depth == 8`.
-fn narrow_filter<P: PlaneAccess>(
-    plane: &mut P,
-    x: usize,
-    y: usize,
-    dx: i64,
-    dy: i64,
-    hev_mask: bool,
-    bit_depth: u8,
-) {
-    let half = 1i32 << (bit_depth - 1);
-    let clamp_hi = (128i32 << (bit_depth - 8)) - 1;
-    let clamp_lo = -(clamp_hi + 1);
-    let clamp4 = |v: i32| clip3(clamp_lo, clamp_hi, v);
-
-    let q0 = get_off(plane, x, y, dx, dy, 0);
-    let q1 = get_off(plane, x, y, dx, dy, 1);
-    let p0 = get_off(plane, x, y, dx, dy, -1);
-    let p1 = get_off(plane, x, y, dx, dy, -2);
-
-    let ps1 = p1 - half;
-    let ps0 = p0 - half;
-    let qs0 = q0 - half;
-    let qs1 = q1 - half;
-
-    let mut filter = if hev_mask { clamp4(ps1 - qs1) } else { 0 };
-    filter = clamp4(filter + 3 * (qs0 - ps0));
-    let filter1 = clamp4(filter + 4) >> 3;
-    let filter2 = clamp4(filter + 3) >> 3;
-
-    let oq0 = clamp4(qs0 - filter1) + half;
-    let op0 = clamp4(ps0 + filter2) + half;
-    set_off(plane, x, y, dx, dy, 0, oq0);
-    set_off(plane, x, y, dx, dy, -1, op0);
-
-    if !hev_mask {
-        let filter = round2(filter1, 1);
-        let oq1 = clamp4(qs1 - filter) + half;
-        let op1 = clamp4(ps1 + filter) + half;
-        set_off(plane, x, y, dx, dy, 1, oq1);
-        set_off(plane, x, y, dx, dy, -2, op1);
-    }
-}
-
-/// Spec §8.8.5.3 "Wide filter process". `log2_size` is 3 (8-tap) or 4 (16-tap).
-fn wide_filter<P: PlaneAccess>(
-    plane: &mut P,
-    x: usize,
-    y: usize,
-    dx: i64,
-    dy: i64,
-    log2_size: u32,
-) {
-    let n: i64 = (1i64 << (log2_size - 1)) - 1;
-    // F's index is -n..n-1. Stored in a 0-based array by adding offset n.
-    let mut f = [0i32; 16];
-
-    let mut i = -n;
-    while i < n {
-        let mut t = get_off(plane, x, y, dx, dy, i);
-        let mut j = -n;
-        while j <= n {
-            let p = clip3(-((n + 1) as i32), n as i32, (i + j) as i32) as i64;
-            t += get_off(plane, x, y, dx, dy, p);
-            j += 1;
-        }
-        f[(i + n) as usize] = round2(t, log2_size);
-        i += 1;
-    }
-
-    let mut i = -n;
-    while i < n {
-        set_off(plane, x, y, dx, dy, i, f[(i + n) as usize]);
-        i += 1;
-    }
-}
-
-/// Spec §8.8.5 "Sample filtering process".
-#[allow(clippy::too_many_arguments)]
-fn sample_filtering<P: PlaneAccess>(
-    plane: &mut P,
-    x: usize,
-    y: usize,
-    dx: i64,
-    dy: i64,
-    limit: i32,
-    blimit: i32,
-    thresh: i32,
-    filter_size: u8,
-    bit_depth: u8,
-) {
-    let (hev_mask, filter_mask, flat_mask, flat_mask2) = compute_filter_mask(
-        plane,
-        x,
-        y,
-        dx,
-        dy,
-        limit,
-        blimit,
-        thresh,
-        filter_size,
-        bit_depth,
-    );
-
-    if !filter_mask {
-        return;
-    }
-    if filter_size == TX_4X4 || !flat_mask {
-        narrow_filter(plane, x, y, dx, dy, hev_mask, bit_depth);
-    } else if filter_size == TX_8X8 || !flat_mask2 {
-        wide_filter(plane, x, y, dx, dy, 3);
-    } else {
-        wide_filter(plane, x, y, dx, dy, 4);
     }
 }
 
