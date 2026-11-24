@@ -206,6 +206,15 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   vectors leaves (measured: ≤14 unused bits, 0 over-read) and ~10x below the smallest corruption
   the invalid corpus shows, so valid output is untouched -- but they are heuristic margins, not
   spec constants.
+- **Memory-compaction invariants (`MiInfo`, `RefPlane`, `BorrowedStrip`).** `MiInfo` is bit-packed
+  to 24 bytes (representative `mv` + packed flags + `extra` holding either 4 intra `sub_modes` or
+  a sparse index into `MiGrid::sub_mvs`, which is cleared before archiving `prev_mi_grid`). 8-bit
+  DPB reference frames store packed `u8` samples (`RefPlaneData::U8`) widened on the fly during
+  motion compensation, while 10/12-bit DPB references keep cropped-in-place `u16` planes. During
+  tile-parallel decode, column workers bind non-owning `BorrowedStrip(*mut u16)` / `BorrowedStrip(*mut MiInfo)`
+  views directly into disjoint column strips of the parent frame; **never** construct a full-plane
+  `&[T]` or `&mut [T]` slice over a `BorrowedStrip` (its inter-row stride gaps overlap sibling
+  workers' columns — use per-row `[0..width]` slices or raw base pointers only).
 
 ## Conventions worth knowing
 

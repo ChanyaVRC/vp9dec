@@ -163,6 +163,15 @@ impl Plane {
         }
     }
 
+    /// Allocated backing element capacity (0 for borrowed strips).
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        match &self.storage {
+            PlaneStorage::Owned(data) => data.capacity(),
+            PlaneStorage::BorrowedStrip(_) => 0,
+        }
+    }
+
     /// Crops this plane's logical `(width, height)` in-place without reallocating or copying
     /// the backing buffer (for zero-copy DPB storage in `RefFrameData`).
     pub(crate) fn crop_in_place(&mut self, crop_width: usize, crop_height: usize) {

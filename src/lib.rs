@@ -630,11 +630,17 @@ impl Decoder {
                 _ => {}
             }
         }
-        // Prune stale geometries after the DPB update.
+        // Prune stale geometries and oversized working-plane capacities after the DPB update.
         let dpb = &self.dpb;
+        let (max_y, max_uv) = dpb.max_sb_plane_elems();
+        let max_y = max_y.max(active_geom.0 .1);
+        let max_uv = max_uv.max(active_geom.1 .1);
         self.plane_pool.retain(|p| {
             let g = plane_set_geom(p);
-            g == active_geom || dpb.has_u16_geometry(g)
+            (g == active_geom || dpb.has_u16_geometry(g))
+                && p[0].capacity() <= max_y
+                && p[1].capacity() <= max_uv
+                && p[2].capacity() <= max_uv
         });
         self.ref_u8_pool.retain(|b| {
             let g = (b[0].len(), b[1].len());
