@@ -644,17 +644,14 @@ impl Decoder {
         );
         self.reset_frame_contexts_if_needed(&header);
 
-        // The starting value equivalent to `load_probs`/`load_probs2` (spec §6.1, start of
-        // `frame()`). Kept around after the compressed_header call because `refresh_probs()`
-        // (spec §6.1.2) restores it to this pre-forward-update value before applying
-        // backward adaptation.
-        let starting_probs = self
-            .frame_contexts
-            .load(header.effective_frame_context_idx());
-
+        // Load the frame context slot once to seed forward updates in `parse_compressed_header`
+        // (by value, avoiding a second ~3.5 KB clone on non-refresh, error-resilient, and
+        // frame-parallel frames). When backward adaptation runs after tile decode, the slot in
+        // `self.frame_contexts` is still untouched and is loaded then.
+        let ctx_idx = header.effective_frame_context_idx();
         let compressed = {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::CompressedHeader);
-            parse_compressed_header(compressed_bytes, &header, starting_probs.clone())?
+            parse_compressed_header(compressed_bytes, &header, self.frame_contexts.load(ctx_idx))?
         };
 
         let resolved_refs = self.resolve_and_validate_refs(&header, &color_config)?;
@@ -704,8 +701,14 @@ impl Decoder {
 
         self.refresh_prev_segment_ids(&header, &image_size, tile_decoder.mi_grid());
 
-        // refresh_probs() (spec §6.1.2): only run when the frame context will actually be saved.
-        if header.refresh_frame_context {
+        // Backward adaptation (spec §6.1.2) needs `tile_decoder.counts()` before `tile_decoder`
+        // is consumed; FPM / error-resilient refresh saves `compressed.probs` directly after
+        // `tile_decoder.into_parts()` drops its `Arc` so `Arc::unwrap_or_clone` avoids cloning.
+        let backward_adapt = header.refresh_frame_context
+            && !header.error_resilient_mode
+            && !header.frame_parallel_decoding_mode;
+        if backward_adapt {
+            let starting_probs = self.frame_contexts.load(ctx_idx);
             let final_probs = refresh_probs(
                 &header,
                 starting_probs,
@@ -713,8 +716,7 @@ impl Decoder {
                 tile_decoder.counts(),
                 self.last_frame_type,
             );
-            self.frame_contexts
-                .save(header.effective_frame_context_idx(), final_probs);
+            self.frame_contexts.save(ctx_idx, final_probs);
         }
 
         self.update_persistent_state(&header);
@@ -730,10 +732,15 @@ impl Decoder {
         } else {
             None
         };
-        // Last use of tile_decoder: consume it to drop its read-only `Arc`s to DPB slots and
-        // `prev_mi_grid` BEFORE refreshing DPB / replacing `self.prev_mi_grid`, so evicted
-        // buffers have strong count 1 and recycle cleanly into our pools with zero copy.
+        // Last use of tile_decoder: consume it to drop its read-only `Arc`s to DPB slots,
+        // `prev_mi_grid`, and `compressed.probs` BEFORE refreshing DPB / saving probs /
+        // replacing `self.prev_mi_grid`, so evicted buffers have strong count 1 and recycle
+        // cleanly into our pools with zero copy.
         let (planes, mi_grid) = tile_decoder.into_parts();
+        if header.refresh_frame_context && !backward_adapt {
+            self.frame_contexts
+                .save(ctx_idx, Arc::unwrap_or_clone(compressed.probs));
+        }
         self.refresh_reference_frames(&header, &color_config, planes);
         self.store_and_recycle_mi_grid(mi_grid);
         Ok(DecodedFrame {

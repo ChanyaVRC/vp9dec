@@ -5,13 +5,28 @@
 //! driver. Split out of `tile.rs` (which keeps the sequential tile/superblock traversal this
 //! path is bit-identical to).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use crate::compressed_header::CompressedHeaderProbs;
 use crate::counts::Counts;
 use crate::framebuffer::Plane;
 use crate::thread_pool::ThreadPool;
 
 use super::{get_tile_offset, MiGrid, MiInfo, TileDecoder, TileError};
+
+/// Shared empty `prev_segment_ids` sentinel used when parking a worker `TileDecoder`, avoiding a
+/// fresh heap allocation of an `Arc<Vec<u8>>` control block on every worker per frame.
+fn empty_segment_ids() -> Arc<Vec<u8>> {
+    static EMPTY: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(Vec::new())))
+}
+
+/// Shared default `probs` sentinel used when parking a worker `TileDecoder` so the frame's
+/// `CompressedHeaderProbs` `Arc` is released before DPB/context cleanup.
+fn default_probs_sentinel() -> Arc<CompressedHeaderProbs> {
+    static DEFAULT: OnceLock<Arc<CompressedHeaderProbs>> = OnceLock::new();
+    Arc::clone(DEFAULT.get_or_init(|| Arc::new(CompressedHeaderProbs::default())))
+}
 
 /// Test-only knob: forces [`TileDecoder::decode_tiles`] down the sequential loop even when the
 /// tile-parallel fast path would engage, so tests can assert that the parallel and sequential
@@ -324,13 +339,14 @@ impl TileDecoder {
         w
     }
 
-    /// Drops frame-specific `Arc` handles (`resolved_refs`, `prev_mi_grid`, `prev_segment_ids`)
-    /// before parking a worker back in `Decoder::tile_worker_pool`, so DPB and `MiGrid` buffer
-    /// recycling observes `Arc::strong_count == 1`.
+    /// Drops frame-specific `Arc` handles (`probs`, `resolved_refs`, `prev_mi_grid`,
+    /// `prev_segment_ids`) before parking a worker back in `Decoder::tile_worker_pool`, so DPB,
+    /// `MiGrid`, and `CompressedHeaderProbs` recycling observes `Arc::strong_count == 1`.
     fn release_frame_refs(&mut self) {
+        self.probs = default_probs_sentinel();
         self.resolved_refs = [None, None, None];
         self.prev_mi_grid = None;
-        self.prev_segment_ids = Arc::new(Vec::new());
+        self.prev_segment_ids = empty_segment_ids();
     }
 
     /// Merges tile-column worker `w` (which decoded MI columns `[w.mi_col_start, w.mi_col_end)`
@@ -359,12 +375,11 @@ impl TileDecoder {
             let size = if last {
                 data.len()
             } else {
-                if data.len() < 4 {
+                let Some((size_bytes, rest)) = data.split_first_chunk::<4>() else {
                     return Err(TileError::InvalidTileSize);
-                }
-                let (size_bytes, rest) = data.split_at(4);
+                };
                 data = rest;
-                u32::from_be_bytes(size_bytes.try_into().unwrap()) as usize
+                u32::from_be_bytes(*size_bytes) as usize
             };
             if data.len() < size {
                 return Err(TileError::InvalidTileSize);

@@ -97,12 +97,12 @@ impl<'a> BoolDecoder<'a> {
         // Common case: at least 8 bytes remain in `data`, so read 8 bytes big-endian and keep
         // the top 6 bytes (48 bits). Bits `63..56 - count` are occupied; shifting the 48-bit
         // value left by `8 - count` places it directly in bits `55 - count .. 8 - count`.
-        if self.byte_pos + 8 <= self.data.len() {
-            let word = u64::from_be_bytes(
-                self.data[self.byte_pos..self.byte_pos + 8]
-                    .try_into()
-                    .unwrap(),
-            ) >> 16;
+        if let Some(&bytes) = self
+            .data
+            .get(self.byte_pos..)
+            .and_then(|rest| rest.first_chunk::<8>())
+        {
+            let word = u64::from_be_bytes(bytes) >> 16;
             self.value |= word << (8 - self.count);
             self.byte_pos += 6;
             self.count += 48;

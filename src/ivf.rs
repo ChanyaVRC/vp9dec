@@ -156,7 +156,10 @@ impl<'a> Iterator for IvfReader<'a> {
         let timestamp = read_u64_le(self.remaining, 4);
 
         let data_start = IVF_FRAME_HEADER_SIZE;
-        let data_end = data_start + frame_size;
+        let Some(data_end) = data_start.checked_add(frame_size) else {
+            self.remaining = &[];
+            return Some(Err(IvfError::TruncatedFrameData));
+        };
         if self.remaining.len() < data_end {
             self.remaining = &[];
             return Some(Err(IvfError::TruncatedFrameData));
@@ -180,7 +183,12 @@ pub fn write_ivf(
     timebase_num: u32,
     frames: &[Vec<u8>],
 ) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let total_size = IVF_FILE_HEADER_SIZE
+        + frames
+            .iter()
+            .map(|f| IVF_FRAME_HEADER_SIZE + f.len())
+            .sum::<usize>();
+    let mut buf = Vec::with_capacity(total_size);
     buf.extend_from_slice(IVF_SIGNATURE);
     buf.extend_from_slice(&0u16.to_le_bytes()); // version
     buf.extend_from_slice(&(IVF_FILE_HEADER_SIZE as u16).to_le_bytes());

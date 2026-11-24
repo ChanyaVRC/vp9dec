@@ -41,21 +41,21 @@ fn parse_superframe_index(data: &[u8]) -> Option<Vec<&[u8]>> {
         return None;
     }
 
-    let mut sizes = Vec::with_capacity(num_frames);
+    let mut sizes = [0usize; 8];
     let mut pos = 1;
-    for _ in 0..num_frames {
+    for slot in &mut sizes[..num_frames] {
         let mut size = 0usize;
         for (b, &byte) in index[pos..pos + bytes_per_framesize].iter().enumerate() {
             size |= (byte as usize) << (8 * b);
         }
-        sizes.push(size);
+        *slot = size;
         pos += bytes_per_framesize;
     }
 
     let payload = &data[..data.len() - index_size];
     let mut frames = Vec::with_capacity(num_frames);
     let mut offset = 0usize;
-    for size in sizes {
+    for &size in &sizes[..num_frames] {
         let end = offset.checked_add(size)?;
         frames.push(payload.get(offset..end)?);
         offset = end;

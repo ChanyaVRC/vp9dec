@@ -198,6 +198,11 @@ impl MiGrid {
         }
     }
 
+    /// Reuses a pooled whole-frame `MiGrid` for `(cols, rows)` if its allocation matches.
+    fn try_reuse(&mut self, cols: usize, rows: usize) -> bool {
+        self.try_reuse_as_strip(cols, rows, 0)
+    }
+
     /// Reuses a pooled column-strip `MiGrid` for `(cols, rows, col0)` if its allocation matches.
     pub(super) fn try_reuse_as_strip(&mut self, cols: usize, rows: usize, col0: u32) -> bool {
         if self.cols == cols && self.rows == rows && self.data.len() == cols * rows {
@@ -434,30 +439,23 @@ impl TileDecoder {
         let y_h = (image_size.sb64_rows * 64) as usize;
         let uv_w = y_w >> subsampling_x;
         let uv_h = y_h >> subsampling_y;
-        let planes = if let Some(mut p) = recycled_planes {
-            if p[0].try_reuse_as(y_w, y_h)
-                && p[1].try_reuse_as(uv_w, uv_h)
-                && p[2].try_reuse_as(uv_w, uv_h)
-            {
-                p
-            } else {
+        let planes = recycled_planes
+            .and_then(|mut p| {
+                (p[0].try_reuse_as(y_w, y_h)
+                    && p[1].try_reuse_as(uv_w, uv_h)
+                    && p[2].try_reuse_as(uv_w, uv_h))
+                .then_some(p)
+            })
+            .unwrap_or_else(|| {
                 [
                     Plane::new(y_w, y_h),
                     Plane::new(uv_w, uv_h),
                     Plane::new(uv_w, uv_h),
                 ]
-            }
-        } else {
-            [
-                Plane::new(y_w, y_h),
-                Plane::new(uv_w, uv_h),
-                Plane::new(uv_w, uv_h),
-            ]
-        };
-        let mi_grid = match recycled_mi_grid {
-            Some(g) if g.cols == grid_cols && g.rows == grid_rows && g.col0 == 0 => g,
-            _ => MiGrid::new(grid_cols, grid_rows),
-        };
+            });
+        let mi_grid = recycled_mi_grid
+            .and_then(|mut g| g.try_reuse(grid_cols, grid_rows).then_some(g))
+            .unwrap_or_else(|| MiGrid::new(grid_cols, grid_rows));
         // AboveNonzeroContext persists across the whole frame width in 4x4 units (2x the 8x8 mi unit).
         let above_nz_len = grid_cols * 2;
         let above_nonzero_context = [
@@ -595,10 +593,10 @@ impl TileDecoder {
 
     /// `clear_above_context( )` (spec §7.4.1): also clears `AboveSegPredContext`.
     fn clear_above_context(&mut self) {
-        self.above_partition_context.iter_mut().for_each(|v| *v = 0);
-        self.above_seg_pred_context.iter_mut().for_each(|v| *v = 0);
-        for plane_ctx in self.above_nonzero_context.iter_mut() {
-            plane_ctx.iter_mut().for_each(|v| *v = 0);
+        self.above_partition_context.fill(0);
+        self.above_seg_pred_context.fill(0);
+        for plane_ctx in &mut self.above_nonzero_context {
+            plane_ctx.fill(0);
         }
     }
 

@@ -53,14 +53,14 @@ impl Dpb {
     }
 
     pub fn get(&self, idx: u8) -> Option<&RefFrameData> {
-        self.slots[idx as usize].as_deref()
+        self.slots.get(idx as usize)?.as_deref()
     }
 
     /// Same slot as [`Dpb::get`], but returns a cheap `Arc` clone rather than a borrow, for
     /// callers that need to hold onto the data past `self`'s lifetime (e.g. resolving a
     /// frame's reference set for `TileDecoder`, which outlives the per-frame `&Dpb` borrow).
     pub fn get_arc(&self, idx: u8) -> Option<Arc<RefFrameData>> {
-        self.slots[idx as usize].clone()
+        self.slots.get(idx as usize)?.clone()
     }
 
     /// Step 1 of `Reference frame update process` (spec §8.10).
