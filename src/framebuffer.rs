@@ -178,10 +178,19 @@ impl Plane {
     }
 
     /// Restores a pooled plane back to full `(width, height)` with `x0 == 0` if its backing
-    /// allocation matches `(stride == width && data.len() == width * height)`. Returns `true`
-    /// on match so the caller can reuse it without allocating.
+    /// allocation matches `(stride == width && data.len() == width * height)`.
     pub(crate) fn try_reuse_as(&mut self, width: usize, height: usize) -> bool {
-        self.try_reuse_as_strip(width, height, 0)
+        let PlaneStorage::Owned(data) = &self.storage else {
+            return false;
+        };
+        if self.stride == width && data.len() == width * height {
+            self.width = width;
+            self.height = height;
+            self.x0 = 0;
+            true
+        } else {
+            false
+        }
     }
 
     /// Reuses a pooled whole-frame working plane for `(width, height)` when its backing capacity
@@ -203,22 +212,6 @@ impl Plane {
             self.stride = width;
             self.x0 = 0;
             data.resize(need, 0);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Reuses a pooled column-strip plane for `(width, height, x0)` if its backing allocation
-    /// matches `(stride == width && data.len() == width * height)` (zero allocation/zeroing).
-    pub(crate) fn try_reuse_as_strip(&mut self, width: usize, height: usize, x0: usize) -> bool {
-        let PlaneStorage::Owned(data) = &self.storage else {
-            return false;
-        };
-        if self.stride == width && data.len() == width * height {
-            self.width = width;
-            self.height = height;
-            self.x0 = x0;
             true
         } else {
             false
@@ -383,16 +376,31 @@ impl Plane {
             );
         }
     }
+}
 
-    /// Same as [`Plane::crop`] but returns a new [`Plane`] instead of a `Vec<u16>`
-    /// (for storing into `FrameStore` / DPB reference frame data per spec §8.10).
-    pub fn crop_to_plane(&self, crop_width: usize, crop_height: usize) -> Plane {
-        Plane {
-            width: crop_width,
-            height: crop_height,
-            stride: crop_width,
-            x0: 0,
-            storage: PlaneStorage::Owned(self.crop(crop_width, crop_height)),
+/// Borrowed slice of a reference plane's samples (`u8` for 8-bit DPB, `u16` for 10/12-bit DPB),
+/// letting non-hot scalar and scaled/border inter-prediction paths stay non-generic.
+#[derive(Clone, Copy)]
+pub(crate) enum RefSlice<'a> {
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+}
+
+impl RefSlice<'_> {
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(crate) fn len(self) -> usize {
+        match self {
+            RefSlice::U8(s) => s.len(),
+            RefSlice::U16(s) => s.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_i32(self, idx: usize) -> i32 {
+        match self {
+            RefSlice::U8(s) => s[idx] as i32,
+            RefSlice::U16(s) => s[idx] as i32,
         }
     }
 }
@@ -450,6 +458,14 @@ impl RefPlane {
     #[inline]
     pub fn data(&self) -> &RefPlaneData {
         &self.data
+    }
+
+    #[inline]
+    pub(crate) fn as_slice_ref(&self) -> RefSlice<'_> {
+        match &self.data {
+            RefPlaneData::U8(v) => RefSlice::U8(v),
+            RefPlaneData::U16(v) => RefSlice::U16(v),
+        }
     }
 
     /// Backing geometry `(stride, len)` when `U16` (for `plane_pool` matching).

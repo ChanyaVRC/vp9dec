@@ -188,6 +188,50 @@ impl TileDecoder {
         self.resolved_refs = parent.resolved_refs.clone();
     }
 
+    /// Creates a fresh blank worker `TileDecoder` before [`Self::sync_frame_config_from`] populates
+    /// its frame config and borrowed strips, avoiding duplicating every field initializer.
+    fn empty_worker(grid_cols: usize) -> Self {
+        Self {
+            tx_mode: 0,
+            probs: default_probs_sentinel(),
+            segmentation: crate::header::SegmentationParams::default(),
+            mi_cols: 0,
+            mi_rows: 0,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+            mi_grid: MiGrid::empty(),
+            above_ctx: AboveContexts::new(grid_cols),
+            left_partition_context: [0u8; 8],
+            left_seg_pred_context: [0u8; 8],
+            prev_segment_ids: empty_segment_ids(),
+            mi_col_start: 0,
+            mi_col_end: 0,
+            mi_row_start: 0,
+            mi_row_end: 0,
+            bit_depth: 8,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            lossless: false,
+            dequant_table: [[[0; 2]; 2]; crate::header::MAX_SEGMENTS],
+            planes: [Plane::empty(), Plane::empty(), Plane::empty()],
+            left_nonzero_context: [[0u8; 16]; 3],
+            frame_is_intra: true,
+            ref_frame_sign_bias: [false; 4],
+            allow_high_precision_mv: false,
+            interpolation_filter: 0,
+            reference_mode: 0,
+            comp_fixed_ref: 0,
+            comp_var_ref: [0; 2],
+            use_prev_frame_mvs: false,
+            prev_mi_grid: None,
+            frame_width: 0,
+            frame_height: 0,
+            resolved_refs: [None, None, None],
+            counts: None,
+            scratch: TileScratch::new(),
+        }
+    }
+
     /// Builds or reuses a worker `TileDecoder` whose `planes` and `mi_grid` are non-owning
     /// direct-write column strips pointing straight into `parent_ptrs` at `[mi_col_start, mi_col_end)`.
     ///
@@ -204,75 +248,35 @@ impl TileDecoder {
         recycled: Option<TileDecoder>,
     ) -> TileDecoder {
         let geom = ColumnStripGeometry::new(self, mi_col_start, mi_col_end);
-        let planes = std::array::from_fn(|p| {
-            let (x0, w, h) = geom.plane_strips[p];
+        let mut w = match recycled {
+            Some(mut w) => {
+                w.above_ctx.reset_for(geom.grid_cols);
+                w.clear_left_context();
+                w
+            }
+            None => Self::empty_worker(geom.grid_cols),
+        };
+        w.planes = std::array::from_fn(|p| {
+            let (x0, width, height) = geom.plane_strips[p];
             // SAFETY: caller guarantees `parent_ptrs.plane_ptrs[p]` outlives this worker and
-            // `[x0, x0 + w)` is disjoint from all sibling workers.
+            // `[x0, x0 + width)` is disjoint from all sibling workers.
             Plane::new_borrowed_strip(
                 parent_ptrs.plane_ptrs[p],
                 x0,
-                w,
-                h,
+                width,
+                height,
                 parent_ptrs.plane_strides[p],
             )
         });
-
-        let mut w = match recycled {
-            Some(mut w) => {
-                w.planes = planes;
-                w.above_ctx.reset_for(geom.grid_cols);
-                w.clear_left_context();
-                w.sync_frame_config_from(self, mi_col_start, mi_col_end);
-                if self.counts.is_some() {
-                    match w.counts.as_deref_mut() {
-                        Some(c) => c.reset(),
-                        None => w.counts = Some(Box::new(Counts::new())),
-                    }
-                } else {
-                    w.counts = None;
-                }
-                w
+        w.sync_frame_config_from(self, mi_col_start, mi_col_end);
+        if self.counts.is_some() {
+            match w.counts.as_deref_mut() {
+                Some(c) => c.reset(),
+                None => w.counts = Some(Box::new(Counts::new())),
             }
-            None => TileDecoder {
-                tx_mode: self.tx_mode,
-                probs: self.probs.clone(),
-                segmentation: self.segmentation,
-                mi_cols: self.mi_cols,
-                mi_rows: self.mi_rows,
-                tile_cols_log2: self.tile_cols_log2,
-                tile_rows_log2: self.tile_rows_log2,
-                mi_grid: MiGrid::empty(),
-                above_ctx: AboveContexts::new(geom.grid_cols),
-                left_partition_context: [0u8; 8],
-                left_seg_pred_context: [0u8; 8],
-                prev_segment_ids: self.prev_segment_ids.clone(),
-                mi_col_start,
-                mi_col_end,
-                mi_row_start: 0,
-                mi_row_end: self.mi_rows,
-                bit_depth: self.bit_depth,
-                subsampling_x: self.subsampling_x,
-                subsampling_y: self.subsampling_y,
-                lossless: self.lossless,
-                dequant_table: self.dequant_table,
-                planes,
-                left_nonzero_context: [[0u8; 16]; 3],
-                frame_is_intra: self.frame_is_intra,
-                ref_frame_sign_bias: self.ref_frame_sign_bias,
-                allow_high_precision_mv: self.allow_high_precision_mv,
-                interpolation_filter: self.interpolation_filter,
-                reference_mode: self.reference_mode,
-                comp_fixed_ref: self.comp_fixed_ref,
-                comp_var_ref: self.comp_var_ref,
-                use_prev_frame_mvs: self.use_prev_frame_mvs,
-                prev_mi_grid: self.prev_mi_grid.clone(),
-                frame_width: self.frame_width,
-                frame_height: self.frame_height,
-                resolved_refs: self.resolved_refs.clone(),
-                counts: self.counts.as_ref().map(|_| Box::new(Counts::new())),
-                scratch: TileScratch::new(),
-            },
-        };
+        } else {
+            w.counts = None;
+        }
         // SAFETY: caller guarantees `parent_ptrs.mi_ptr` outlives this worker and
         // `[mi_col_start, mi_col_start + strip_mi_cols)` is disjoint from all sibling workers.
         w.mi_grid.bind_borrowed_strip(
@@ -419,14 +423,10 @@ impl TileDecoder {
                 });
             }
 
-            for (_, snapshot) in &results {
-                crate::bench_timing::merge_snapshot(snapshot);
-            }
-            for (res, _) in results {
+            for (res, snapshot) in results {
+                crate::bench_timing::merge_snapshot(&snapshot);
                 if let Err(e) = res {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
+                    first_err.get_or_insert(e);
                 }
             }
             if first_err.is_none() {

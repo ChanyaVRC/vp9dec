@@ -1,12 +1,12 @@
 use super::*;
 
 #[test]
-fn clamp_mv_row_matches_spec_formula() {
+fn clamp_mv_coord_matches_spec_formula() {
     // An 8x8 block with MiRow=0, bh=1, MiRows=8 (64px frame).
     // mbToTopEdge = 0, mbToBottomEdge = (8-1-0)*8*8 = 448
-    assert_eq!(clamp_mv_row(1000, 128, 0, 1, 8), 448 + 128);
-    assert_eq!(clamp_mv_row(-1000, 128, 0, 1, 8), 0 - 128);
-    assert_eq!(clamp_mv_row(10, 128, 0, 1, 8), 10);
+    assert_eq!(clamp_mv_coord(1000, 128, 0, 1, 8), 448 + 128);
+    assert_eq!(clamp_mv_coord(-1000, 128, 0, 1, 8), 0 - 128);
+    assert_eq!(clamp_mv_coord(10, 128, 0, 1, 8), 10);
 }
 
 #[test]

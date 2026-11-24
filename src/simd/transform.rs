@@ -92,6 +92,17 @@ unsafe fn round2_var(x: __m256i, shift: u32) -> __m256i {
     _mm256_sra_epi32(_mm256_add_epi32(x, add), _mm_cvtsi32_si128(shift as i32))
 }
 
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_1d_xform<const HBD: bool, const ADST: bool>(t: &mut [__m256i; 32], n: u32) {
+    if ADST {
+        iadst_simd(t, n);
+    } else {
+        idct_permute_simd(t, n);
+        idct_simd::<HBD>(t, n);
+    }
+}
+
 /// One separable pass of the 2D inverse transform: transforms every "row" of `input` (n0 x n0,
 /// row-major i32) with the inverse DCT (`ADST == false`) or inverse ADST (`ADST == true`) and
 /// writes the result TRANSPOSED into `output`, so running this twice (row then column) lands
@@ -102,6 +113,7 @@ unsafe fn round2_var(x: __m256i, shift: u32) -> __m256i {
 /// Caller must confirm `avx2_enabled()`, `2 <= n <= 5` (`<= 4` when `ADST`), `input` valid for
 /// `n0 * n0` initialized `i32` reads, and `output` valid for `n0 * n0` non-overlapping `i32`
 /// writes.
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 unsafe fn xform_pass<const HBD: bool, const ADST: bool>(
     input: *const i32,
@@ -111,35 +123,26 @@ unsafe fn xform_pass<const HBD: bool, const ADST: bool>(
     max_row: usize,
 ) {
     let n0 = 1usize << n;
+    let zero = _mm256_setzero_si256();
 
     if n0 == 4 {
-        let mut rows4 = [_mm_setzero_si128(); 4];
-        for (r, slot) in rows4.iter_mut().enumerate() {
-            *slot = _mm_loadu_si128(input.add(r * 4) as *const __m128i);
-        }
+        let rows4: [__m128i; 4] =
+            std::array::from_fn(|r| _mm_loadu_si128(input.add(r * 4) as *const __m128i));
         let cols = transpose4x4_i32(&rows4);
-        let mut t = [_mm256_setzero_si256(); 32];
+        let mut t = [zero; 32];
         for (c, &col) in cols.iter().enumerate() {
-            // The upper 128 bits of `_mm256_castsi128_si256` are formally UNDEFINED. Safe here
-            // only because everything downstream on this n0 == 4 path is lane-wise (butterfly
-            // add/sub/mul/shift; the ADST/DCT permutes reorder whole element VECTORS, not
-            // lanes) and the final store reads only the low 128 bits.
+            // The upper 128 bits of `_mm256_castsi128_si256` are formally UNDEFINED; safe because
+            // everything downstream on n0 == 4 is lane-wise and stores only the low 128 bits.
             t[c] = _mm256_castsi128_si256(col);
         }
-        if ADST {
-            iadst_simd(&mut t, n);
-        } else {
-            idct_permute_simd(&mut t, n);
-            idct_simd::<HBD>(&mut t, n);
-        }
-        for (k, tk) in t[..4].iter().enumerate() {
-            let v = round_shift.map_or(*tk, |sh| round2_var(*tk, sh));
+        apply_1d_xform::<HBD, ADST>(&mut t, 2);
+        for (k, &tk) in t[..4].iter().enumerate() {
+            let v = round_shift.map_or(tk, |sh| round2_var(tk, sh));
             _mm_storeu_si128(output.add(k * 4) as *mut __m128i, _mm256_castsi256_si128(v));
         }
         return;
     }
 
-    let zero = _mm256_setzero_si256();
     let mut cs = 0usize;
     while cs < n0 {
         if cs > max_row {
@@ -152,22 +155,15 @@ unsafe fn xform_pass<const HBD: bool, const ADST: bool>(
         let mut t = [zero; 32];
         let mut g = 0usize;
         while g < n0 {
-            let mut rows8 = [zero; 8];
-            for (r, slot) in rows8.iter_mut().enumerate() {
-                *slot = _mm256_loadu_si256(input.add((cs + r) * n0 + g) as *const __m256i);
-            }
-            let cols = transpose8x8_i32(&rows8);
-            t[g..g + 8].copy_from_slice(&cols);
+            let rows8: [__m256i; 8] = std::array::from_fn(|r| {
+                _mm256_loadu_si256(input.add((cs + r) * n0 + g) as *const __m256i)
+            });
+            t[g..g + 8].copy_from_slice(&transpose8x8_i32(&rows8));
             g += 8;
         }
-        if ADST {
-            iadst_simd(&mut t, n);
-        } else {
-            idct_permute_simd(&mut t, n);
-            idct_simd::<HBD>(&mut t, n);
-        }
-        for (k, tk) in t[..n0].iter().enumerate() {
-            let v = round_shift.map_or(*tk, |sh| round2_var(*tk, sh));
+        apply_1d_xform::<HBD, ADST>(&mut t, n);
+        for (k, &tk) in t[..n0].iter().enumerate() {
+            let v = round_shift.map_or(tk, |sh| round2_var(tk, sh));
             _mm256_storeu_si256(output.add(k * n0 + cs) as *mut __m256i, v);
         }
         cs += 8;
@@ -194,62 +190,86 @@ unsafe fn idct_2d_dct<const HBD: bool>(dequant: &[i64], n: u32, max_row: usize, 
     xform_pass::<HBD, false>(buf2_ptr, out, n, Some((n + 2).min(6)), n0 - 1);
 }
 
-/// AVX2 8-bit DCT_DCT inverse transform + reconstruction with known `max_row`.
+/// Unified AVX2 fused inverse transform + reconstruction entry point covering lossless 4x4 WHT,
+/// 8-bit & HBD ADST-containing transforms (`n = 2..=4`), and 8-bit & HBD `DCT_DCT` (`n = 2..=5`)
+/// with known non-zero row bound `max_row`.
 ///
 /// # Safety
-/// `avx2_enabled()` must hold; `dequant.len()` must be `n0*n0` (`2 <= n <= 5`); the block's
-/// rows `start_y..start_y+n0` x columns `start_x..start_x+n0` must be in bounds for `plane_data`;
-/// and every row strictly below `max_row` in `dequant` must be all-zero.
-#[target_feature(enable = "avx2")]
-pub unsafe fn inverse_transform_dct_dct_reconstruct_eob_avx2(
-    plane_base: *mut u16,
-    plane_width: usize,
-    start_x: usize,
-    start_y: usize,
-    dequant: &[i64],
-    n: u32,
-    max_row: usize,
-) {
-    idct_dct_reconstruct::<false>(
-        plane_base,
-        plane_width,
-        start_x,
-        start_y,
-        dequant,
-        n,
-        max_row,
-        255,
-    );
-}
-
-/// High-bit-depth (10/12-bit) companion to [`inverse_transform_dct_dct_reconstruct_eob_avx2`].
-///
-/// # Safety
-/// Same contract as [`inverse_transform_dct_dct_reconstruct_eob_avx2`], with `bit_depth` set to
-/// the stream's bit depth (10 or 12).
+/// `avx2_enabled()` must hold; `dequant.len() == (1 << n)^2` with `2 <= n <= 5` (`n == 2` when
+/// `lossless`, `n <= 4` when `tx_type != DctDct`); `bit_depth` must be 8, 10, or 12; the block's
+/// `n0 x n0` region at `(start_x, start_y)` must lie in bounds for `plane_base` (stride
+/// `plane_width`); and every row strictly below `max_row` in `dequant` must be zero.
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
-pub unsafe fn inverse_transform_dct_dct_reconstruct_hbd_eob_avx2(
+pub unsafe fn inverse_transform_reconstruct_avx2(
     plane_base: *mut u16,
     plane_width: usize,
     start_x: usize,
     start_y: usize,
     dequant: &[i64],
     n: u32,
+    tx_type: TxType,
     max_row: usize,
+    lossless: bool,
     bit_depth: u8,
 ) {
-    let max_val = (1i32 << bit_depth) - 1;
-    idct_dct_reconstruct::<true>(
-        plane_base,
-        plane_width,
-        start_x,
-        start_y,
-        dequant,
-        n,
-        max_row,
-        max_val,
-    );
+    if lossless {
+        debug_assert_eq!(n, 2, "lossless transform (WHT) only supports 4x4");
+        inverse_transform_wht_reconstruct_avx2(
+            plane_base,
+            plane_width,
+            start_x,
+            start_y,
+            dequant,
+            bit_depth,
+        );
+    } else if tx_type != TxType::DctDct {
+        if bit_depth == 8 {
+            inverse_transform_adst_reconstruct_avx2(
+                plane_base,
+                plane_width,
+                start_x,
+                start_y,
+                dequant,
+                n,
+                tx_type,
+            );
+        } else {
+            inverse_transform_adst_reconstruct_hbd_avx2(
+                plane_base,
+                plane_width,
+                start_x,
+                start_y,
+                dequant,
+                n,
+                tx_type,
+                bit_depth,
+            );
+        }
+    } else if bit_depth == 8 {
+        idct_dct_reconstruct::<false>(
+            plane_base,
+            plane_width,
+            start_x,
+            start_y,
+            dequant,
+            n,
+            max_row,
+            255,
+        );
+    } else {
+        let max_val = (1i32 << bit_depth) - 1;
+        idct_dct_reconstruct::<true>(
+            plane_base,
+            plane_width,
+            start_x,
+            start_y,
+            dequant,
+            n,
+            max_row,
+            max_val,
+        );
+    }
 }
 
 /// AVX2 8-bit DCT_DCT inverse transform + fused reconstruction.
@@ -503,6 +523,7 @@ pub unsafe fn reconstruct_add_const_avx2(
 /// Caller must confirm `avx2_enabled()`, `n0` is `4, 8, 16, or 32`, `o` is valid for `n0 * n0`
 /// initialized `i32` reads, and `(start_x..start_x + n0, start_y..start_y + n0)` lies in
 /// `plane_data` (stride `plane_width`).
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 unsafe fn reconstruct_add_clip(
     plane_base: *mut u16,

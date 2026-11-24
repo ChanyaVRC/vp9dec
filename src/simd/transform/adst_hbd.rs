@@ -196,6 +196,7 @@ unsafe fn transpose4x4_i64(r: &[__m256i; 4]) -> [__m256i; 4] {
 ///
 /// # Safety
 /// Caller must confirm `avx2_enabled()` and `2 <= n <= 4`.
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn xform_pass_i64<const ADST: bool>(
     input: &[i64; 256],

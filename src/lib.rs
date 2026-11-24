@@ -453,43 +453,47 @@ impl Decoder {
         Some(self.ref_u8_pool.swap_remove(idx))
     }
 
-    /// Recycles `planes` into `self.plane_pool`, keeping at most one cached buffer set per active
-    /// resolution (current frame or any live 10/12-bit DPB slot) and pruning stale resolutions.
-    fn recycle_planes(&mut self, planes: [framebuffer::Plane; 3], active_geom: PlaneGeom) {
-        let geom = plane_set_geom(&planes);
-        let dpb = &self.dpb;
-        self.plane_pool.retain(|p| {
-            let g = plane_set_geom(p);
-            g == active_geom || dpb.has_u16_geometry(g)
+    /// Recycles `item` into `pool` (at most one entry per active geometry, pruning stale ones).
+    fn recycle_by_geom<T, G: Copy + Eq>(
+        pool: &mut Vec<T>,
+        item: T,
+        active_geom: G,
+        geom_of: impl Fn(&T) -> G,
+        in_dpb: impl Fn(G) -> bool,
+    ) {
+        let geom = geom_of(&item);
+        pool.retain(|entry| {
+            let g = geom_of(entry);
+            g == active_geom || in_dpb(g)
         });
-        let relevant = geom == active_geom || dpb.has_u16_geometry(geom);
-        if relevant
-            && self.plane_pool.len() < MAX_POOLED_PLANE_SETS
-            && !self.plane_pool.iter().any(|p| plane_set_geom(p) == geom)
+        if (geom == active_geom || in_dpb(geom))
+            && pool.len() < MAX_POOLED_PLANE_SETS
+            && !pool.iter().any(|entry| geom_of(entry) == geom)
         {
-            self.plane_pool.push(planes);
+            pool.push(item);
         }
     }
 
-    /// Recycles an evicted 8-bit DPB frame's `[Vec<u8>; 3]` buffers into `self.ref_u8_pool`
-    /// (at most one cached set per active cropped resolution).
-    fn recycle_ref_u8(&mut self, bufs: [Vec<u8>; 3], active_u8_geom: (usize, usize)) {
-        let geom = (bufs[0].len(), bufs[1].len());
+    fn recycle_planes(&mut self, planes: [framebuffer::Plane; 3], active_geom: PlaneGeom) {
         let dpb = &self.dpb;
-        self.ref_u8_pool.retain(|b| {
-            let g = (b[0].len(), b[1].len());
-            g == active_u8_geom || dpb.has_u8_geometry(g)
-        });
-        let relevant = geom == active_u8_geom || dpb.has_u8_geometry(geom);
-        if relevant
-            && self.ref_u8_pool.len() < MAX_POOLED_PLANE_SETS
-            && !self
-                .ref_u8_pool
-                .iter()
-                .any(|b| (b[0].len(), b[1].len()) == geom)
-        {
-            self.ref_u8_pool.push(bufs);
-        }
+        Self::recycle_by_geom(
+            &mut self.plane_pool,
+            planes,
+            active_geom,
+            plane_set_geom,
+            |g| dpb.has_u16_geometry(g),
+        );
+    }
+
+    fn recycle_ref_u8(&mut self, bufs: [Vec<u8>; 3], active_u8_geom: (usize, usize)) {
+        let dpb = &self.dpb;
+        Self::recycle_by_geom(
+            &mut self.ref_u8_pool,
+            bufs,
+            active_u8_geom,
+            |b| (b[0].len(), b[1].len()),
+            |g| dpb.has_u8_geometry(g),
+        );
     }
 
     /// Resets `PrevSegmentIds` to all-zero when the spec requires it, before tile decode
@@ -857,11 +861,13 @@ impl Decoder {
         let y_h = (image_size.sb64_rows * 64) as usize;
         let uv_w = y_w >> color_config.subsampling_x;
         let uv_h = y_h >> color_config.subsampling_y;
-        let recycled_planes = self.take_matching_planes(y_w, y_h, uv_w, uv_h);
-        let recycled_mi_grid = self.mi_grid_pool.take();
-        let recycled_above_ctx = self.above_ctx_pool.take();
-        let recycled_scratch = self.tile_scratch_pool.take();
-        let recycled_counts = self.counts_pool.take();
+        let recycled = tile::RecycledBuffers {
+            planes: self.take_matching_planes(y_w, y_h, uv_w, uv_h),
+            mi_grid: self.mi_grid_pool.take(),
+            above_ctx: self.above_ctx_pool.take(),
+            scratch: self.tile_scratch_pool.take(),
+            counts: self.counts_pool.take(),
+        };
         let backward_adapt = header.refresh_frame_context
             && !header.error_resilient_mode
             && !header.frame_parallel_decoding_mode;
@@ -874,11 +880,7 @@ impl Decoder {
             resolved_refs,
             self.prev_segment_ids.clone(),
             backward_adapt,
-            recycled_planes,
-            recycled_mi_grid,
-            recycled_above_ctx,
-            recycled_scratch,
-            recycled_counts,
+            recycled,
         );
         {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::TileDecode);

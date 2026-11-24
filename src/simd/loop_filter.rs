@@ -29,6 +29,7 @@ enum FilterWriteScope {
 /// Caller must confirm `avx2_enabled()` and that columns `x0..x0+8` over rows `y0-4..=y0+3`
 /// (and `y0-8..=y0+7` whenever any eligible lane has `is_tx16_v` set) lie within `plane_base`
 /// (stride `plane_width`).
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn loop_filter_horiz8_core(
@@ -60,20 +61,25 @@ unsafe fn loop_filter_horiz8_core(
 
     let abs_diff = |a: __m256i, b: __m256i| _mm256_abs_epi32(_mm256_sub_epi32(a, b));
     let gt = |a: __m256i, b: __m256i| _mm256_cmpgt_epi32(a, b);
+    let any_diff_gt = |pairs: &[(__m256i, __m256i)], thresh: __m256i| {
+        pairs.iter().fold(_mm256_setzero_si256(), |m, &(a, b)| {
+            _mm256_or_si256(m, gt(abs_diff(a, b), thresh))
+        })
+    };
 
     // Spec §8.8.5.1 "Filter mask process".
-    let mut mask = gt(abs_diff(p3, p2), limit_v);
-    mask = _mm256_or_si256(mask, gt(abs_diff(p2, p1), limit_v));
-    mask = _mm256_or_si256(mask, gt(abs_diff(p1, p0), limit_v));
-    mask = _mm256_or_si256(mask, gt(abs_diff(q1, q0), limit_v));
-    mask = _mm256_or_si256(mask, gt(abs_diff(q2, q1), limit_v));
-    mask = _mm256_or_si256(mask, gt(abs_diff(q3, q2), limit_v));
     let p0q0 = abs_diff(p0, q0);
     let blimit_sum = _mm256_add_epi32(
         _mm256_add_epi32(p0q0, p0q0),
         _mm256_srli_epi32(abs_diff(p1, q1), 1),
     );
-    mask = _mm256_or_si256(mask, gt(blimit_sum, blimit_v));
+    let mask = _mm256_or_si256(
+        any_diff_gt(
+            &[(p3, p2), (p2, p1), (p1, p0), (q1, q0), (q2, q1), (q3, q2)],
+            limit_v,
+        ),
+        gt(blimit_sum, blimit_v),
+    );
     let elig_and_fm = _mm256_andnot_si256(mask, eligible_v);
 
     // Early exit: no eligible lane passed `filter_mask` -> skip all filter math and stores.
@@ -148,12 +154,10 @@ unsafe fn loop_filter_horiz8_core(
 
     // Spec §8.8.5.1 `flat_mask`.
     let one = _mm256_set1_epi32(1 << (bit_depth - 8));
-    let mut fm = gt(abs_diff(p1, p0), one);
-    fm = _mm256_or_si256(fm, gt(abs_diff(q1, q0), one));
-    fm = _mm256_or_si256(fm, gt(abs_diff(p2, p0), one));
-    fm = _mm256_or_si256(fm, gt(abs_diff(q2, q0), one));
-    fm = _mm256_or_si256(fm, gt(abs_diff(p3, p0), one));
-    fm = _mm256_or_si256(fm, gt(abs_diff(q3, q0), one));
+    let fm = any_diff_gt(
+        &[(p1, p0), (q1, q0), (p2, p0), (q2, q0), (p3, p0), (q3, q0)],
+        one,
+    );
     let flat_mask = _mm256_andnot_si256(fm, is_wide_v);
     let elig_flat = _mm256_and_si256(elig_and_fm, flat_mask);
 
@@ -171,18 +175,15 @@ unsafe fn loop_filter_horiz8_core(
     let round2_3 = |t: __m256i| _mm256_srai_epi32(add(t, c4), 3);
 
     // Sliding base = 3*p3 + p2 + p1 + p0 + q0 (7 terms; each output adds its center sample).
+    let taps8 = [p3, p2, p1, p0, q0, q1, q2, q3];
     let mut b8 = add(add(add(p3, add(p3, p3)), add(p2, p1)), add(p0, q0));
-    let op2_wide = round2_3(add(b8, p2));
-    b8 = add(sub(b8, p3), q1);
-    let op1_wide = round2_3(add(b8, p1));
-    b8 = add(sub(b8, p3), q2);
-    let op0_wide = round2_3(add(b8, p0));
-    b8 = add(sub(b8, p3), q3);
-    let oq0_wide = round2_3(add(b8, q0));
-    b8 = add(sub(b8, p2), q3);
-    let oq1_wide = round2_3(add(b8, q1));
-    b8 = add(sub(b8, p1), q3);
-    let oq2_wide = round2_3(add(b8, q2));
+    let mut w8 = [b8; 6];
+    w8[0] = round2_3(add(b8, p2));
+    for k in 1..6usize {
+        b8 = add(sub(b8, taps8[k.saturating_sub(3)]), taps8[(k + 4).min(7)]);
+        w8[k] = round2_3(add(b8, taps8[k + 1]));
+    }
+    let [op2_wide, op1_wide, op0_wide, oq0_wide, oq1_wide, oq2_wide] = w8;
 
     let store_narrow_or_wide8 = || {
         let use_wide8 = elig_flat;
@@ -210,23 +211,20 @@ unsafe fn loop_filter_horiz8_core(
     }
 
     // Slow path: at least one active flat lane is TX_16X16. Load p4..p7 / q4..q7 and test flat_mask2.
-    let p4 = load_row(-5);
-    let p5 = load_row(-6);
-    let p6 = load_row(-7);
-    let p7 = load_row(-8);
-    let q4 = load_row(4);
-    let q5 = load_row(5);
-    let q6 = load_row(6);
-    let q7 = load_row(7);
-
-    let mut fm2 = gt(abs_diff(p7, p0), one);
-    fm2 = _mm256_or_si256(fm2, gt(abs_diff(q7, q0), one));
-    fm2 = _mm256_or_si256(fm2, gt(abs_diff(p6, p0), one));
-    fm2 = _mm256_or_si256(fm2, gt(abs_diff(q6, q0), one));
-    fm2 = _mm256_or_si256(fm2, gt(abs_diff(p5, p0), one));
-    fm2 = _mm256_or_si256(fm2, gt(abs_diff(q5, q0), one));
-    fm2 = _mm256_or_si256(fm2, gt(abs_diff(p4, p0), one));
-    fm2 = _mm256_or_si256(fm2, gt(abs_diff(q4, q0), one));
+    let [p4, p5, p6, p7, q4, q5, q6, q7] = [-5, -6, -7, -8, 4, 5, 6, 7].map(load_row);
+    let fm2 = any_diff_gt(
+        &[
+            (p7, p0),
+            (q7, q0),
+            (p6, p0),
+            (q6, q0),
+            (p5, p0),
+            (q5, q0),
+            (p4, p0),
+            (q4, q0),
+        ],
+        one,
+    );
     let flat_mask2 = _mm256_andnot_si256(fm2, is_tx16_v);
     let use_wide16 = _mm256_and_si256(elig_flat, flat_mask2);
 
@@ -294,6 +292,21 @@ unsafe fn loop_filter_horiz8_core(
 /// (and `y0-8..=y0+7` whenever any lane has `is_tx16 != 0`) lie within `plane_base` (stride
 /// `plane_width`).
 #[cfg(test)]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn load_i32x8_filter_params(
+    eligible: &[i32; 8],
+    is_tx8: &[i32; 8],
+    is_tx16: &[i32; 8],
+    limit: &[i32; 8],
+    blimit: &[i32; 8],
+    thresh: &[i32; 8],
+) -> [__m256i; 6] {
+    [eligible, is_tx8, is_tx16, limit, blimit, thresh]
+        .map(|a| _mm256_loadu_si256(a.as_ptr() as *const __m256i))
+}
+
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn loop_filter_horiz8_avx2(
@@ -309,12 +322,8 @@ pub unsafe fn loop_filter_horiz8_avx2(
     thresh: &[i32; 8],
     bit_depth: u8,
 ) {
-    let eligible_v = _mm256_loadu_si256(eligible.as_ptr() as *const __m256i);
-    let is_tx8_v = _mm256_loadu_si256(is_tx8.as_ptr() as *const __m256i);
-    let is_tx16_v = _mm256_loadu_si256(is_tx16.as_ptr() as *const __m256i);
-    let limit_v = _mm256_loadu_si256(limit.as_ptr() as *const __m256i);
-    let blimit_v = _mm256_loadu_si256(blimit.as_ptr() as *const __m256i);
-    let thresh_v = _mm256_loadu_si256(thresh.as_ptr() as *const __m256i);
+    let [eligible_v, is_tx8_v, is_tx16_v, limit_v, blimit_v, thresh_v] =
+        load_i32x8_filter_params(eligible, is_tx8, is_tx16, limit, blimit, thresh);
     let _ = loop_filter_horiz8_core(
         plane_base,
         plane_width,
@@ -422,31 +431,20 @@ unsafe fn transpose8x8_u16(r: &[__m128i; 8]) -> [__m128i; 8] {
     ]
 }
 
-/// Loads an 8x8 `u16` tile from `src` (stride `src_stride`), transposes it, and stores it
-/// contiguously (stride 8) to `dst`.
+/// Transposes an 8x8 `u16` tile from `src` (stride `src_stride`) into `dst` (stride `dst_stride`).
 ///
 /// # Safety
 /// Caller must confirm `src` is valid for 8 rows of 8 `u16` reads at `src_stride` and `dst` is
-/// valid for 64 contiguous `u16` writes.
+/// valid for 8 rows of 8 `u16` writes at `dst_stride`.
 #[inline]
-unsafe fn load_transpose_8x8(src: *const u16, src_stride: usize, dst: *mut u16) {
+unsafe fn transpose_8x8_block(
+    src: *const u16,
+    src_stride: usize,
+    dst: *mut u16,
+    dst_stride: usize,
+) {
     let rows: [__m128i; 8] =
         std::array::from_fn(|r| _mm_loadu_si128(src.add(r * src_stride) as *const __m128i));
-    for (tr, &v) in transpose8x8_u16(&rows).iter().enumerate() {
-        _mm_storeu_si128(dst.add(tr * 8) as *mut __m128i, v);
-    }
-}
-
-/// Loads a contiguous 8x8 `u16` tile from `src` (stride 8), transposes it, and stores it into
-/// `dst` (stride `dst_stride`).
-///
-/// # Safety
-/// Caller must confirm `src` is valid for 64 contiguous `u16` reads and `dst` is valid for 8
-/// rows of 8 `u16` writes at `dst_stride`.
-#[inline]
-unsafe fn transpose_store_8x8(src: *const u16, dst: *mut u16, dst_stride: usize) {
-    let rows: [__m128i; 8] =
-        std::array::from_fn(|tr| _mm_loadu_si128(src.add(tr * 8) as *const __m128i));
     for (r, &v) in transpose8x8_u16(&rows).iter().enumerate() {
         _mm_storeu_si128(dst.add(r * dst_stride) as *mut __m128i, v);
     }
@@ -459,6 +457,7 @@ unsafe fn transpose_store_8x8(src: *const u16, dst: *mut u16, dst_stride: usize)
 /// # Safety
 /// Caller must confirm `avx2_enabled()` and that columns `x0-4..=x0+3` (or `x0-8..=x0+7` when
 /// `wide == true`) across rows `y0..=y0+7` lie within `plane_base` (stride `plane_width`).
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn loop_filter_vert8_core(
@@ -480,16 +479,18 @@ unsafe fn loop_filter_vert8_core(
     let base = plane_base;
     let mut scratch = [0u16; 16 * 8];
 
-    load_transpose_8x8(
+    transpose_8x8_block(
         base.add(y0 * plane_width + col0),
         plane_width,
         scratch.as_mut_ptr(),
+        8,
     );
     if wide {
-        load_transpose_8x8(
+        transpose_8x8_block(
             base.add(y0 * plane_width + col0 + 8),
             plane_width,
             scratch.as_mut_ptr().add(64),
+            8,
         );
     }
 
@@ -510,20 +511,23 @@ unsafe fn loop_filter_vert8_core(
     match scope {
         FilterWriteScope::None => {}
         FilterWriteScope::NarrowOrWide8 => {
-            transpose_store_8x8(
+            transpose_8x8_block(
                 scratch.as_ptr().add((center - 4) * 8),
+                8,
                 base.add(y0 * plane_width + (x0 - 4)),
                 plane_width,
             );
         }
         FilterWriteScope::Wide16 => {
-            transpose_store_8x8(
+            transpose_8x8_block(
                 scratch.as_ptr(),
+                8,
                 base.add(y0 * plane_width + col0),
                 plane_width,
             );
-            transpose_store_8x8(
+            transpose_8x8_block(
                 scratch.as_ptr().add(64),
+                8,
                 base.add(y0 * plane_width + col0 + 8),
                 plane_width,
             );
@@ -553,12 +557,8 @@ pub unsafe fn loop_filter_vert8_avx2(
     bit_depth: u8,
 ) {
     let wide = is_tx16.iter().any(|&t| t != 0);
-    let eligible_v = _mm256_loadu_si256(eligible.as_ptr() as *const __m256i);
-    let is_tx8_v = _mm256_loadu_si256(is_tx8.as_ptr() as *const __m256i);
-    let is_tx16_v = _mm256_loadu_si256(is_tx16.as_ptr() as *const __m256i);
-    let limit_v = _mm256_loadu_si256(limit.as_ptr() as *const __m256i);
-    let blimit_v = _mm256_loadu_si256(blimit.as_ptr() as *const __m256i);
-    let thresh_v = _mm256_loadu_si256(thresh.as_ptr() as *const __m256i);
+    let [eligible_v, is_tx8_v, is_tx16_v, limit_v, blimit_v, thresh_v] =
+        load_i32x8_filter_params(eligible, is_tx8, is_tx16, limit, blimit, thresh);
     loop_filter_vert8_core(
         plane_base,
         plane_width,

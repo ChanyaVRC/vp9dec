@@ -3,7 +3,7 @@
 //! with direct-to-u16 AVX2 fast paths), and compound averaging.
 
 use crate::common::{clip3, round2};
-use crate::framebuffer::{Plane, RefPlane, RefPlaneData};
+use crate::framebuffer::{Plane, RefPlane, RefSlice};
 use crate::prob_tables::{
     BLOCK_8X8, INTRA_FRAME, NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP,
 };
@@ -14,41 +14,20 @@ use crate::subpel::{
 use crate::tile::Mv;
 
 /// Reference pixel sample type (`u8` for 8-bit DPB planes, `u16` for 10/12-bit DPB planes),
-/// allowing both scalar and AVX2 inter prediction to share one generic implementation.
+/// allowing hot AVX2 unscaled inter-prediction kernels to share one implementation.
+#[cfg(target_arch = "x86_64")]
 pub(crate) trait RefSample: Copy {
-    #[cfg(target_arch = "x86_64")]
     const IS_U8: bool;
-    #[cfg(target_arch = "x86_64")]
-    fn to_u16(self) -> u16;
-    fn to_i32(self) -> i32;
 }
 
+#[cfg(target_arch = "x86_64")]
 impl RefSample for u8 {
-    #[cfg(target_arch = "x86_64")]
     const IS_U8: bool = true;
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    fn to_u16(self) -> u16 {
-        self as u16
-    }
-    #[inline(always)]
-    fn to_i32(self) -> i32 {
-        self as i32
-    }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl RefSample for u16 {
-    #[cfg(target_arch = "x86_64")]
     const IS_U8: bool = false;
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    fn to_u16(self) -> u16 {
-        self
-    }
-    #[inline(always)]
-    fn to_i32(self) -> i32 {
-        self as i32
-    }
 }
 
 /// A view over one plane of a reference frame (equivalent to the spec's
@@ -225,8 +204,8 @@ pub(crate) fn block_inter_predict_scalar(
     bit_depth: u8,
     pred: &mut [i32],
 ) {
-    block_inter_predict_scalar_slice(
-        ref_plane.as_slice(),
+    block_inter_predict_scalar_ref(
+        RefSlice::U16(ref_plane.as_slice()),
         ref_plane.width,
         ref_plane.stride(),
         ref_plane.height,
@@ -243,8 +222,8 @@ pub(crate) fn block_inter_predict_scalar(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn block_inter_predict_scalar_slice<S: RefSample>(
-    ref_data: &[S],
+fn block_inter_predict_scalar_ref(
+    ref_data: RefSlice<'_>,
     ref_w: usize,
     ref_stride: usize,
     ref_h: usize,
@@ -266,6 +245,7 @@ fn block_inter_predict_scalar_slice<S: RefSample>(
     debug_assert!(intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT);
 
     let filters = &SUBPEL_FILTERS[interp_filter as usize];
+    let px = |row_off: usize, col: usize| ref_data.get_i32(row_off + col);
 
     // Fast unscaled scalar paths: avoid running zero taps when fx == 0 or fy == 0, and avoid
     // 34 KB stack zeroing on every small block.
@@ -277,19 +257,16 @@ fn block_inter_predict_scalar_slice<S: RefSample>(
         let max_val = (1i32 << bit_depth) - 1;
 
         if fx == 0 && fy == 0 {
+            let in_x = x0 >= 0 && x0 + w as i64 - 1 <= last_x;
             for r in 0..h {
-                let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
-                let row = &ref_data[ref_y * ref_stride..ref_y * ref_stride + ref_w];
-                if x0 >= 0 && x0 + w as i64 - 1 <= last_x {
-                    let sx = x0 as usize;
-                    for c in 0..w {
-                        pred[r * w + c] = row[sx + c].to_i32();
-                    }
-                } else {
-                    for c in 0..w {
-                        let sx = (x0 + c as i64).clamp(0, last_x) as usize;
-                        pred[r * w + c] = row[sx].to_i32();
-                    }
+                let row_off = (y0 + r as i64).clamp(0, last_y) as usize * ref_stride;
+                for c in 0..w {
+                    let sx = if in_x {
+                        (x0 as usize) + c
+                    } else {
+                        (x0 + c as i64).clamp(0, last_x) as usize
+                    };
+                    pred[r * w + c] = px(row_off, sx);
                 }
             }
             return;
@@ -298,65 +275,55 @@ fn block_inter_predict_scalar_slice<S: RefSample>(
             let hcoeffs = &filters[fx];
             let in_x = x0 - 3 >= 0 && x0 + w as i64 + 3 <= last_x;
             for r in 0..h {
-                let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
-                let row = &ref_data[ref_y * ref_stride..ref_y * ref_stride + ref_w];
-                if in_x {
-                    let sx0 = (x0 - 3) as usize;
-                    for c in 0..w {
-                        let base = &row[sx0 + c..sx0 + c + 8];
-                        let s: i32 = hcoeffs
-                            .iter()
-                            .zip(base.iter())
-                            .map(|(&k, &v)| k * v.to_i32())
-                            .sum();
-                        pred[r * w + c] = clip3(0, max_val, round2(s, 7));
+                let row_off = (y0 + r as i64).clamp(0, last_y) as usize * ref_stride;
+                for c in 0..w {
+                    let mut s = 0i32;
+                    for (t, &coeff) in hcoeffs.iter().enumerate() {
+                        let sx = if in_x {
+                            (x0 - 3) as usize + c + t
+                        } else {
+                            (x0 + c as i64 + t as i64 - 3).clamp(0, last_x) as usize
+                        };
+                        s += coeff * px(row_off, sx);
                     }
-                } else {
-                    for c in 0..w {
-                        let mut s = 0i32;
-                        for (t, &coeff) in hcoeffs.iter().enumerate() {
-                            let sx = (x0 + c as i64 + t as i64 - 3).clamp(0, last_x) as usize;
-                            s += coeff * row[sx].to_i32();
-                        }
-                        pred[r * w + c] = clip3(0, max_val, round2(s, 7));
-                    }
+                    pred[r * w + c] = clip3(0, max_val, round2(s, 7));
                 }
             }
             return;
         }
-        if fx == 0 {
+        if fx == 0
+            && x0 >= 0
+            && x0 + w as i64 - 1 <= last_x
+            && y0 - 3 >= 0
+            && y0 + h as i64 + 3 <= last_y
+        {
             let vcoeffs = &filters[fy];
-            let in_x = x0 >= 0 && x0 + w as i64 - 1 <= last_x;
-            let in_y = y0 - 3 >= 0 && y0 + h as i64 + 3 <= last_y;
-            if in_x && in_y {
-                let sx = x0 as usize;
-                for r in 0..h {
-                    let ybase = (y0 - 3) as usize + r;
-                    for c in 0..w {
-                        let mut s = 0i32;
-                        for (t, &coeff) in vcoeffs.iter().enumerate() {
-                            s += coeff * ref_data[(ybase + t) * ref_stride + sx + c].to_i32();
-                        }
-                        pred[r * w + c] = clip3(0, max_val, round2(s, 7));
+            let sx = x0 as usize;
+            for r in 0..h {
+                let ybase = (y0 - 3) as usize + r;
+                for c in 0..w {
+                    let mut s = 0i32;
+                    for (t, &coeff) in vcoeffs.iter().enumerate() {
+                        s += coeff * px((ybase + t) * ref_stride, sx + c);
                     }
+                    pred[r * w + c] = clip3(0, max_val, round2(s, 7));
                 }
-                return;
             }
+            return;
         }
     }
 
     // General scalar path (scaled or 2D unscaled).
     let mut intermediate = [0i32; MAX_INTERMEDIATE_HEIGHT * MAX_BLOCK_DIM];
     for r in 0..intermediate_height {
-        let ref_y = ((y >> 4) + r - 3).clamp(0, last_y) as usize;
-        let row = &ref_data[ref_y * ref_stride..ref_y * ref_stride + ref_w];
+        let row_off = ((y >> 4) + r - 3).clamp(0, last_y) as usize * ref_stride;
         for c in 0..w {
             let p = x + x_step * (c as i64);
             let coeffs = &filters[(p & 15) as usize];
             let mut s = 0i32;
             for (t, &coeff) in coeffs.iter().enumerate() {
                 let ref_x = ((p >> 4) + t as i64 - 3).clamp(0, last_x) as usize;
-                s += coeff * row[ref_x].to_i32();
+                s += coeff * px(row_off, ref_x);
             }
             intermediate[(r as usize) * w + c] = clip1(round2(s, 7), bit_depth);
         }
@@ -394,77 +361,19 @@ fn block_inter_predict_into_plane(
     bit_depth: u8,
     compound: bool,
 ) {
-    match ref_plane.data() {
-        RefPlaneData::U8(data) => block_inter_predict_slice_into_plane(
-            data,
-            ref_plane.width,
-            ref_plane.stride(),
-            ref_plane.height,
-            dst,
-            dst_x,
-            dst_y,
-            x,
-            y,
-            x_step,
-            y_step,
-            w,
-            h,
-            interp_filter,
-            bit_depth,
-            compound,
-        ),
-        RefPlaneData::U16(data) => block_inter_predict_slice_into_plane(
-            data,
-            ref_plane.width,
-            ref_plane.stride(),
-            ref_plane.height,
-            dst,
-            dst_x,
-            dst_y,
-            x,
-            y,
-            x_step,
-            y_step,
-            w,
-            h,
-            interp_filter,
-            bit_depth,
-            compound,
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn block_inter_predict_slice_into_plane<S: RefSample>(
-    ref_data: &[S],
-    ref_width: usize,
-    ref_stride: usize,
-    ref_height: usize,
-    dst: &mut Plane,
-    dst_x: usize,
-    dst_y: usize,
-    x: i64,
-    y: i64,
-    x_step: i64,
-    y_step: i64,
-    w: usize,
-    h: usize,
-    interp_filter: u8,
-    bit_depth: u8,
-    compound: bool,
-) {
     debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
     debug_assert!(dst_x >= dst.x0 && dst_x - dst.x0 + w <= dst.width);
     debug_assert!(dst_y + h <= dst.height);
+    let ref_slice = ref_plane.as_slice_ref();
 
     #[cfg(target_arch = "x86_64")]
     if (w == 4 || w.is_multiple_of(8))
         && crate::simd::avx2_enabled()
         && try_inter_predict_avx2(
-            ref_data,
-            ref_width,
-            ref_stride,
-            ref_height,
+            ref_slice,
+            ref_plane.width,
+            ref_plane.stride(),
+            ref_plane.height,
             dst,
             dst_x,
             dst_y,
@@ -484,11 +393,11 @@ fn block_inter_predict_slice_into_plane<S: RefSample>(
 
     // Scalar fallback (non-x86_64 or `VP9DEC_NO_SIMD=1`).
     let mut pred = [0i32; MAX_BLOCK_DIM * MAX_BLOCK_DIM];
-    block_inter_predict_scalar_slice(
-        ref_data,
-        ref_width,
-        ref_stride,
-        ref_height,
+    block_inter_predict_scalar_ref(
+        ref_slice,
+        ref_plane.width,
+        ref_plane.stride(),
+        ref_plane.height,
         x,
         y,
         x_step,
@@ -500,18 +409,14 @@ fn block_inter_predict_slice_into_plane<S: RefSample>(
         &mut pred[..w * h],
     );
     let local_x = dst_x - dst.x0;
-    if compound {
-        for i in 0..h {
-            let dst_row = &mut dst.row_mut(dst_y + i)[local_x..local_x + w];
-            let src_row = &pred[i * w..(i + 1) * w];
+    for i in 0..h {
+        let dst_row = &mut dst.row_mut(dst_y + i)[local_x..local_x + w];
+        let src_row = &pred[i * w..(i + 1) * w];
+        if compound {
             for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
                 *d = round2(*d as i32 + s, 1) as u16;
             }
-        }
-    } else {
-        for i in 0..h {
-            let dst_row = &mut dst.row_mut(dst_y + i)[local_x..local_x + w];
-            let src_row = &pred[i * w..(i + 1) * w];
+        } else {
             for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
                 *d = s as u16;
             }
@@ -521,8 +426,8 @@ fn block_inter_predict_slice_into_plane<S: RefSample>(
 
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
-fn try_inter_predict_avx2<S: RefSample>(
-    ref_data: &[S],
+fn try_inter_predict_avx2(
+    ref_data: RefSlice<'_>,
     ref_width: usize,
     ref_stride: usize,
     ref_height: usize,
@@ -539,76 +444,16 @@ fn try_inter_predict_avx2<S: RefSample>(
     bit_depth: u8,
     compound: bool,
 ) -> bool {
-    if compound {
-        try_inter_predict_avx2_mode::<S, true>(
-            ref_data,
-            ref_width,
-            ref_stride,
-            ref_height,
-            dst,
-            dst_x,
-            dst_y,
-            x,
-            y,
-            x_step,
-            y_step,
-            w,
-            h,
-            interp_filter,
-            bit_depth,
-        )
-    } else {
-        try_inter_predict_avx2_mode::<S, false>(
-            ref_data,
-            ref_width,
-            ref_stride,
-            ref_height,
-            dst,
-            dst_x,
-            dst_y,
-            x,
-            y,
-            x_step,
-            y_step,
-            w,
-            h,
-            interp_filter,
-            bit_depth,
-        )
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn try_inter_predict_avx2_mode<S: RefSample, const COMPOUND: bool>(
-    ref_data: &[S],
-    ref_width: usize,
-    ref_stride: usize,
-    ref_height: usize,
-    dst: &mut Plane,
-    dst_x: usize,
-    dst_y: usize,
-    x: i64,
-    y: i64,
-    x_step: i64,
-    y_step: i64,
-    w: usize,
-    h: usize,
-    interp_filter: u8,
-    bit_depth: u8,
-) -> bool {
     let max_val = (1i32 << bit_depth) - 1;
     let local_x = dst_x - dst.x0;
     let dst_stride = dst.stride();
+    let dst_ptr = dst.base_ptr_mut();
     let last_x = ref_width as i64 - 1;
     let last_y = ref_height as i64 - 1;
 
     if x_step == 16 && y_step == 16 {
-        let x0 = x >> 4;
-        let y0 = y >> 4;
-        let fx = (x & 15) as usize;
-        let fy = (y & 15) as usize;
+        let (x0, y0) = (x >> 4, y >> 4);
+        let (fx, fy) = ((x & 15) as usize, (y & 15) as usize);
         let x_ok = if fx == 0 {
             x0 >= 0 && x0 + (w as i64 - 1) <= last_x
         } else {
@@ -623,22 +468,42 @@ fn try_inter_predict_avx2_mode<S: RefSample, const COMPOUND: bool>(
             // SAFETY: `avx2_enabled()` confirmed by caller; `x_ok && y_ok` proves every source
             // pixel read lies in `ref_data`, and `dst` bounds hold within this strip.
             unsafe {
-                crate::simd::block_inter_predict_u16_avx2::<S, COMPOUND>(
-                    ref_data,
-                    ref_stride,
-                    dst.base_ptr_mut(),
-                    dst_stride,
-                    local_x,
-                    dst_y,
-                    x0,
-                    y0,
-                    fx,
-                    fy,
-                    w,
-                    h,
-                    interp_filter,
-                    max_val,
-                );
+                match ref_data {
+                    RefSlice::U8(s) => crate::simd::block_inter_predict_u16_avx2::<u8>(
+                        s,
+                        ref_stride,
+                        dst_ptr,
+                        dst_stride,
+                        local_x,
+                        dst_y,
+                        x0,
+                        y0,
+                        fx,
+                        fy,
+                        w,
+                        h,
+                        interp_filter,
+                        max_val,
+                        compound,
+                    ),
+                    RefSlice::U16(s) => crate::simd::block_inter_predict_u16_avx2::<u16>(
+                        s,
+                        ref_stride,
+                        dst_ptr,
+                        dst_stride,
+                        local_x,
+                        dst_y,
+                        x0,
+                        y0,
+                        fx,
+                        fy,
+                        w,
+                        h,
+                        interp_filter,
+                        max_val,
+                        compound,
+                    ),
+                }
             }
             return true;
         }
@@ -653,12 +518,12 @@ fn try_inter_predict_avx2_mode<S: RefSample, const COMPOUND: bool>(
         // every source read is clamped inside `ref_width x ref_height`, scratch bounds were checked,
         // and `dst` bounds hold within this strip.
         unsafe {
-            crate::simd::block_inter_predict_scaled_u16_avx2::<S, COMPOUND>(
+            crate::simd::block_inter_predict_scaled_u16_avx2(
                 ref_data,
                 ref_width,
                 ref_stride,
                 ref_height,
-                dst.base_ptr_mut(),
+                dst_ptr,
                 dst_stride,
                 local_x,
                 dst_y,
@@ -671,6 +536,7 @@ fn try_inter_predict_avx2_mode<S: RefSample, const COMPOUND: bool>(
                 intermediate_height as usize,
                 interp_filter,
                 max_val,
+                compound,
             );
         }
         return true;

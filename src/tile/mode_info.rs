@@ -158,9 +158,7 @@ impl TileDecoder {
         }
         let skip = r.read_bool(self.probs.skip_prob[ctx]);
         if !self.frame_is_intra {
-            if let Some(counts) = self.counts.as_deref_mut() {
-                counts.skip[ctx][skip as usize] += 1;
-            }
+            self.count(|c| c.skip[ctx][skip as usize] += 1);
         }
         skip
     }
@@ -206,9 +204,7 @@ impl TileDecoder {
                 _ => r.read_tree(&TX_SIZE_8_TREE, |node| probs[node]) as u8,
             };
             if !self.frame_is_intra {
-                if let Some(counts) = self.counts.as_deref_mut() {
-                    counts.tx_size[max_tx_size as usize][ctx][tx_size as usize] += 1;
-                }
+                self.count(|c| c.tx_size[max_tx_size as usize][ctx][tx_size as usize] += 1);
             }
             tx_size
         } else {
@@ -354,9 +350,7 @@ impl TileDecoder {
             0
         };
         let is_inter = r.read_bool(self.probs.is_inter_prob[ctx]);
-        if let Some(counts) = self.counts.as_deref_mut() {
-            counts.is_inter[ctx][is_inter as usize] += 1;
-        }
+        self.count(|c| c.is_inter[ctx][is_inter as usize] += 1);
         is_inter
     }
 
@@ -373,18 +367,14 @@ impl TileDecoder {
             let ctx = SIZE_GROUP_LOOKUP[mi_size as usize] as usize;
             let mode =
                 r.read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[ctx][node]) as u8;
-            if let Some(counts) = self.counts.as_deref_mut() {
-                counts.intra_mode[ctx][mode as usize] += 1;
-            }
+            self.count(|c| c.intra_mode[ctx][mode as usize] += 1);
             (mode, [mode; 4])
         } else {
             decode_sub8x8_intra_modes(mi_size, |_, _, _| {
                 // sub_intra_mode: ctx is always 0 (spec §9.3.2).
                 let mode =
                     r.read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[0][node]) as u8;
-                if let Some(counts) = self.counts.as_deref_mut() {
-                    counts.intra_mode[0][mode as usize] += 1;
-                }
+                self.count(|c| c.intra_mode[0][mode as usize] += 1);
                 mode
             })
         };
@@ -392,9 +382,7 @@ impl TileDecoder {
         let uv_mode = r.read_tree(&INTRA_MODE_TREE, |node| {
             self.probs.uv_mode_probs[y_mode as usize][node]
         }) as u8;
-        if let Some(counts) = self.counts.as_deref_mut() {
-            counts.uv_mode[y_mode as usize][uv_mode as usize] += 1;
-        }
+        self.count(|c| c.uv_mode[y_mode as usize][uv_mode as usize] += 1);
 
         Ok(MiInfo::new_intra(
             skip, tx_size, mi_size, y_mode, uv_mode, sub_modes, segment_id,
@@ -417,9 +405,7 @@ impl TileDecoder {
         let comp_mode = if self.reference_mode == REFERENCE_MODE_SELECT {
             let ctx = self.comp_mode_ctx(n);
             let bit = r.read_bool(self.probs.comp_mode_prob[ctx]);
-            if let Some(counts) = self.counts.as_deref_mut() {
-                counts.comp_mode[ctx][bit as usize] += 1;
-            }
+            self.count(|c| c.comp_mode[ctx][bit as usize] += 1);
             (bit as u8) + SINGLE_REFERENCE
         } else {
             self.reference_mode
@@ -429,33 +415,20 @@ impl TileDecoder {
             let idx = self.ref_frame_sign_bias[self.comp_fixed_ref as usize] as usize;
             let ctx = self.comp_ref_ctx(n);
             let comp_ref = r.read_bool(self.probs.comp_ref_prob[ctx]) as usize;
-            if let Some(counts) = self.counts.as_deref_mut() {
-                counts.comp_ref[ctx][comp_ref] += 1;
-            }
+            self.count(|c| c.comp_ref[ctx][comp_ref] += 1);
             let mut ref_frame = [0u8; 2];
             ref_frame[idx] = self.comp_fixed_ref;
             ref_frame[1 - idx] = self.comp_var_ref[comp_ref];
             ref_frame
         } else {
             let ctx1 = self.single_ref_p1_ctx(n);
-            let single_ref_p1 = r.read_bool(self.probs.single_ref_prob[ctx1][0]);
-            if let Some(counts) = self.counts.as_deref_mut() {
-                counts.single_ref[ctx1][0][single_ref_p1 as usize] += 1;
-            }
-            if single_ref_p1 {
+            let p1 = r.read_bool(self.probs.single_ref_prob[ctx1][0]);
+            self.count(|c| c.single_ref[ctx1][0][p1 as usize] += 1);
+            if p1 {
                 let ctx2 = self.single_ref_p2_ctx(n);
-                let single_ref_p2 = r.read_bool(self.probs.single_ref_prob[ctx2][1]);
-                if let Some(counts) = self.counts.as_deref_mut() {
-                    counts.single_ref[ctx2][1][single_ref_p2 as usize] += 1;
-                }
-                [
-                    if single_ref_p2 {
-                        ALTREF_FRAME
-                    } else {
-                        GOLDEN_FRAME
-                    },
-                    REF_NONE,
-                ]
+                let p2 = r.read_bool(self.probs.single_ref_prob[ctx2][1]);
+                self.count(|c| c.single_ref[ctx2][1][p2 as usize] += 1);
+                [if p2 { ALTREF_FRAME } else { GOLDEN_FRAME }, REF_NONE]
             } else {
                 [LAST_FRAME, REF_NONE]
             }
@@ -476,12 +449,10 @@ impl TileDecoder {
         } else {
             INTERP_FILTER_UNSET
         };
-        if left_interp == above_interp {
+        if left_interp == above_interp || above_interp == INTERP_FILTER_UNSET {
             left_interp as usize
         } else if left_interp == INTERP_FILTER_UNSET {
             above_interp as usize
-        } else if above_interp == INTERP_FILTER_UNSET {
-            left_interp as usize
         } else {
             INTERP_FILTER_UNSET as usize
         }
@@ -502,10 +473,18 @@ impl TileDecoder {
         let f = r.read_tree(&INTERP_FILTER_TREE, |node| {
             self.probs.interp_filter_probs[ctx][node]
         }) as u8;
-        if let Some(counts) = self.counts.as_deref_mut() {
-            counts.interp_filter[ctx][f as usize] += 1;
-        }
+        self.count(|c| c.interp_filter[ctx][f as usize] += 1);
         f
+    }
+
+    /// Reads one `inter_mode` symbol in `ctx`, updates counts, and returns `NEARESTMV + inter_mode`.
+    #[inline]
+    fn read_inter_y_mode(&mut self, r: &mut BoolDecoder, ctx: usize) -> u8 {
+        let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
+            self.probs.inter_mode_probs[ctx][node]
+        }) as u8;
+        self.count(|c| c.inter_mode[ctx][inter_mode as usize] += 1);
+        NEARESTMV + inter_mode
     }
 
     /// Decodes per-subblock inter modes and MVs for a sub-8x8 inter block (`mi_size < BLOCK_8X8`),
@@ -528,18 +507,12 @@ impl TileDecoder {
         let mut y_mode = ZEROMV;
         let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
         let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
+        let ctx = mode_context[ref_frame[0] as usize] as usize;
         let mut idy = 0u32;
         while idy < 2 {
             let mut idx = 0u32;
             while idx < 2 {
-                let ctx = mode_context[ref_frame[0] as usize] as usize;
-                let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
-                    self.probs.inter_mode_probs[ctx][node]
-                }) as u8;
-                if let Some(counts) = self.counts.as_deref_mut() {
-                    counts.inter_mode[ctx][inter_mode as usize] += 1;
-                }
-                y_mode = NEARESTMV + inter_mode;
+                y_mode = self.read_inter_y_mode(r, ctx);
                 let block = (idy * 2 + idx) as i32;
                 if y_mode == NEARESTMV || y_mode == NEARMV {
                     for j in 0..n_refs {
@@ -608,18 +581,10 @@ impl TileDecoder {
 
         // §6.4.16: when seg_feature_active(SEG_LVL_SKIP), y_mode is forced to ZEROMV without
         // reading inter_mode. Bitstream conformance guarantees MiSize >= BLOCK_8X8 whenever
-        // seg_feature_active(SEG_LVL_SKIP) is set here, so the MiSize < BLOCK_8X8 sub8x8 branch
-        // below never runs in that case.
+        // seg_feature_active(SEG_LVL_SKIP) is set here.
         let mut y_mode = ZEROMV;
         if !self.seg_feature_active(segment_id, SEG_LVL_SKIP) && mi_size >= BLOCK_8X8 {
-            let ctx = mode_context[ref_frame[0] as usize] as usize;
-            let inter_mode = r.read_tree(&INTER_MODE_TREE, |node| {
-                self.probs.inter_mode_probs[ctx][node]
-            }) as u8;
-            if let Some(counts) = self.counts.as_deref_mut() {
-                counts.inter_mode[ctx][inter_mode as usize] += 1;
-            }
-            y_mode = NEARESTMV + inter_mode;
+            y_mode = self.read_inter_y_mode(r, mode_context[ref_frame[0] as usize] as usize);
         }
 
         let interp_filter = self.read_interp_filter(r, row, col, n);
@@ -640,8 +605,10 @@ impl TileDecoder {
             y_mode = sub_y_mode;
             ([mvs[0][3], mvs[1][3]], Some(mvs))
         } else {
-            let mv = self.assign_mv(r, y_mode, n_refs, nearest_mv, near_mv, best_mv);
-            (mv, None)
+            (
+                self.assign_mv(r, y_mode, n_refs, nearest_mv, near_mv, best_mv),
+                None,
+            )
         };
 
         Ok((
@@ -685,9 +652,7 @@ impl TileDecoder {
     fn read_mv(&mut self, r: &mut BoolDecoder, best_mv: Mv) -> Mv {
         let use_hp = self.allow_high_precision_mv && use_mv_hp(best_mv);
         let mv_joint = r.read_tree(&MV_JOINT_TREE, |node| self.probs.mv_joint_probs[node]) as u8;
-        if let Some(counts) = self.counts.as_deref_mut() {
-            counts.mv_joint[mv_joint as usize] += 1;
-        }
+        self.count(|c| c.mv_joint[mv_joint as usize] += 1);
         let mut diff = ZERO_MV;
         if mv_joint == MV_JOINT_HZVNZ || mv_joint == MV_JOINT_HNZVNZ {
             diff[0] = self.read_mv_component(r, 0, use_hp);
@@ -701,14 +666,10 @@ impl TileDecoder {
     /// `read_mv_component( comp )` (spec §6.4.20).
     fn read_mv_component(&mut self, r: &mut BoolDecoder, comp: usize, use_hp: bool) -> i32 {
         let sign = r.read_bool(self.probs.mv_sign_prob[comp]);
-        if let Some(counts) = self.counts.as_deref_mut() {
-            counts.mv_sign[comp][sign as usize] += 1;
-        }
+        self.count(|c| c.mv_sign[comp][sign as usize] += 1);
         let mv_class =
             r.read_tree(&MV_CLASS_TREE, |node| self.probs.mv_class_probs[comp][node]) as usize;
-        if let Some(counts) = self.counts.as_deref_mut() {
-            counts.mv_class[comp][mv_class] += 1;
-        }
+        self.count(|c| c.mv_class[comp][mv_class] += 1);
         let mag: u32 = if mv_class == 0 {
             let class0_bit = r.read_bool(self.probs.mv_class0_bit_prob[comp]) as u32;
             let class0_fr = r.read_tree(&MV_FR_TREE, |node| {
@@ -719,19 +680,17 @@ impl TileDecoder {
             } else {
                 1
             };
-            if let Some(counts) = self.counts.as_deref_mut() {
-                counts.mv_class0_bit[comp][class0_bit as usize] += 1;
-                counts.mv_class0_fr[comp][class0_bit as usize][class0_fr as usize] += 1;
-                counts.mv_class0_hp[comp][class0_hp as usize] += 1;
-            }
+            self.count(|c| {
+                c.mv_class0_bit[comp][class0_bit as usize] += 1;
+                c.mv_class0_fr[comp][class0_bit as usize][class0_fr as usize] += 1;
+                c.mv_class0_hp[comp][class0_hp as usize] += 1;
+            });
             ((class0_bit << 3) | (class0_fr << 1) | class0_hp) + 1
         } else {
             let mut d: u32 = 0;
             for i in 0..mv_class {
                 let bit = r.read_bool(self.probs.mv_bits_prob[comp][i]) as u32;
-                if let Some(counts) = self.counts.as_deref_mut() {
-                    counts.mv_bits[comp][i][bit as usize] += 1;
-                }
+                self.count(|c| c.mv_bits[comp][i][bit as usize] += 1);
                 d |= bit << i;
             }
             let fr = r.read_tree(&MV_FR_TREE, |node| self.probs.mv_fr_probs[comp][node]) as u32;
@@ -740,10 +699,10 @@ impl TileDecoder {
             } else {
                 1
             };
-            if let Some(counts) = self.counts.as_deref_mut() {
-                counts.mv_fr[comp][fr as usize] += 1;
-                counts.mv_hp[comp][hp as usize] += 1;
-            }
+            self.count(|c| {
+                c.mv_fr[comp][fr as usize] += 1;
+                c.mv_hp[comp][hp as usize] += 1;
+            });
             (2u32 << (mv_class + 2)) + ((d << 3) | (fr << 1) | hp) + 1
         };
         if sign {

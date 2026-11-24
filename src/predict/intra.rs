@@ -289,6 +289,8 @@ pub(crate) fn predict_intra_scalar(
     let mut pred_buf = [0i32; 1024];
     let pred = &mut pred_buf[..size * size];
     let at = |i: usize, j: usize| i * size + j;
+    let avg2 = |a: i32, b: i32| round2(a + b, 1);
+    let avg3 = |a: i32, b: i32, c: i32| round2(a + 2 * b + c, 2);
 
     match mode {
         V_PRED => {
@@ -299,30 +301,25 @@ pub(crate) fn predict_intra_scalar(
             }
         }
         H_PRED => {
-            for i in 0..size {
-                for j in 0..size {
-                    pred[at(i, j)] = left_col[i];
-                }
+            for (i, &lv) in left_col.iter().enumerate() {
+                pred[i * size..(i + 1) * size].fill(lv);
             }
         }
         D207_PRED => {
-            for j in 0..size {
-                pred[at(size - 1, j)] = left_col[size - 1];
-            }
+            pred[(size - 1) * size..size * size].fill(left_col[size - 1]);
             for i in 0..size.saturating_sub(1) {
-                pred[at(i, 0)] = round2(left_col[i] + left_col[i + 1], 1);
+                pred[at(i, 0)] = avg2(left_col[i], left_col[i + 1]);
             }
             for i in 0..size.saturating_sub(2) {
-                pred[at(i, 1)] = round2(left_col[i] + 2 * left_col[i + 1] + left_col[i + 2], 2);
+                pred[at(i, 1)] = avg3(left_col[i], left_col[i + 1], left_col[i + 2]);
             }
             if size >= 2 {
-                pred[at(size - 2, 1)] = round2(left_col[size - 2] + 3 * left_col[size - 1], 2);
+                pred[at(size - 2, 1)] =
+                    avg3(left_col[size - 2], left_col[size - 1], left_col[size - 1]);
             }
-            if size >= 3 {
-                for i in (0..=(size - 2)).rev() {
-                    for j in 2..size {
-                        pred[at(i, j)] = pred[at(i + 1, j - 2)];
-                    }
+            for i in (0..size.saturating_sub(1)).rev() {
+                for j in 2..size {
+                    pred[at(i, j)] = pred[at(i + 1, j - 2)];
                 }
             }
         }
@@ -331,7 +328,7 @@ pub(crate) fn predict_intra_scalar(
                 for j in 0..size {
                     let s = (i + j) as i32;
                     pred[at(i, j)] = if s + 2 < (size as i32) * 2 {
-                        round2(above(s) + above(s + 1) * 2 + above(s + 2), 2)
+                        avg3(above(s), above(s + 1), above(s + 2))
                     } else {
                         above(2 * size as i32 - 1)
                     };
@@ -341,31 +338,28 @@ pub(crate) fn predict_intra_scalar(
         D63_PRED => {
             for i in 0..size {
                 for j in 0..size {
-                    let half = (i / 2) as i32 + j as i32;
+                    let h = (i / 2) as i32 + j as i32;
                     pred[at(i, j)] = if i & 1 == 1 {
-                        round2(above(half) + above(half + 1) * 2 + above(half + 2), 2)
+                        avg3(above(h), above(h + 1), above(h + 2))
                     } else {
-                        round2(above(half) + above(half + 1), 1)
+                        avg2(above(h), above(h + 1))
                     };
                 }
             }
         }
         D117_PRED => {
             for j in 0..size {
-                pred[at(0, j)] = round2(above(j as i32 - 1) + above(j as i32), 1);
+                pred[at(0, j)] = avg2(above(j as i32 - 1), above(j as i32));
             }
-            pred[at(1, 0)] = round2(left_col[0] + 2 * above(-1) + above(0), 2);
+            pred[at(1, 0)] = avg3(left_col[0], above(-1), above(0));
             for j in 1..size {
-                pred[at(1, j)] = round2(
-                    above(j as i32 - 2) + 2 * above(j as i32 - 1) + above(j as i32),
-                    2,
-                );
+                pred[at(1, j)] = avg3(above(j as i32 - 2), above(j as i32 - 1), above(j as i32));
             }
             if size >= 3 {
-                pred[at(2, 0)] = round2(above(-1) + 2 * left_col[0] + left_col[1], 2);
+                pred[at(2, 0)] = avg3(above(-1), left_col[0], left_col[1]);
             }
             for i in 3..size {
-                pred[at(i, 0)] = round2(left_col[i - 3] + 2 * left_col[i - 2] + left_col[i - 1], 2);
+                pred[at(i, 0)] = avg3(left_col[i - 3], left_col[i - 2], left_col[i - 1]);
             }
             for i in 2..size {
                 for j in 1..size {
@@ -374,18 +368,15 @@ pub(crate) fn predict_intra_scalar(
             }
         }
         D135_PRED => {
-            pred[at(0, 0)] = round2(left_col[0] + 2 * above(-1) + above(0), 2);
+            pred[at(0, 0)] = avg3(left_col[0], above(-1), above(0));
             for j in 1..size {
-                pred[at(0, j)] = round2(
-                    above(j as i32 - 2) + 2 * above(j as i32 - 1) + above(j as i32),
-                    2,
-                );
+                pred[at(0, j)] = avg3(above(j as i32 - 2), above(j as i32 - 1), above(j as i32));
             }
             if size >= 2 {
-                pred[at(1, 0)] = round2(above(-1) + 2 * left_col[0] + left_col[1], 2);
+                pred[at(1, 0)] = avg3(above(-1), left_col[0], left_col[1]);
             }
             for i in 2..size {
-                pred[at(i, 0)] = round2(left_col[i - 2] + 2 * left_col[i - 1] + left_col[i], 2);
+                pred[at(i, 0)] = avg3(left_col[i - 2], left_col[i - 1], left_col[i]);
             }
             for i in 1..size {
                 for j in 1..size {
@@ -394,21 +385,22 @@ pub(crate) fn predict_intra_scalar(
             }
         }
         D153_PRED => {
-            pred[at(0, 0)] = round2(left_col[0] + above(-1), 1);
+            pred[at(0, 0)] = avg2(left_col[0], above(-1));
             for i in 1..size {
-                pred[at(i, 0)] = round2(left_col[i - 1] + left_col[i], 1);
+                pred[at(i, 0)] = avg2(left_col[i - 1], left_col[i]);
             }
             if size >= 2 {
-                pred[at(0, 1)] = round2(left_col[0] + 2 * above(-1) + above(0), 2);
-                pred[at(1, 1)] = round2(above(-1) + 2 * left_col[0] + left_col[1], 2);
+                pred[at(0, 1)] = avg3(left_col[0], above(-1), above(0));
+                pred[at(1, 1)] = avg3(above(-1), left_col[0], left_col[1]);
             }
             for i in 2..size {
-                pred[at(i, 1)] = round2(left_col[i - 2] + 2 * left_col[i - 1] + left_col[i], 2);
+                pred[at(i, 1)] = avg3(left_col[i - 2], left_col[i - 1], left_col[i]);
             }
             for j in 2..size {
-                pred[at(0, j)] = round2(
-                    above(j as i32 - 3) + 2 * above(j as i32 - 2) + above(j as i32 - 1),
-                    2,
+                pred[at(0, j)] = avg3(
+                    above(j as i32 - 3),
+                    above(j as i32 - 2),
+                    above(j as i32 - 1),
                 );
             }
             for i in 1..size {
@@ -419,32 +411,31 @@ pub(crate) fn predict_intra_scalar(
         }
         TM_PRED => {
             let top_left = above(-1);
-            for i in 0..size {
+            let max_v = (1 << bit_depth) - 1;
+            for (i, &lv) in left_col.iter().enumerate() {
                 for j in 0..size {
-                    pred[at(i, j)] = clip3(
-                        0,
-                        (1 << bit_depth) - 1,
-                        above(j as i32) + left_col[i] - top_left,
-                    );
+                    pred[at(i, j)] = clip3(0, max_v, above(j as i32) + lv - top_left);
                 }
             }
         }
         DC_PRED => {
-            let value = if have_left && have_above {
-                let mut sum = 0i32;
-                for (k, &l) in left_col.iter().enumerate() {
-                    sum += l;
-                    sum += above(k as i32);
+            let value = match (have_left, have_above) {
+                (true, true) => {
+                    let sum: i32 = left_col
+                        .iter()
+                        .enumerate()
+                        .map(|(k, &l)| l + above(k as i32))
+                        .sum();
+                    (sum + size as i32) >> (log2_size + 1)
                 }
-                (sum + size as i32) >> (log2_size + 1)
-            } else if have_left {
-                let sum: i32 = left_col.iter().sum();
-                (sum + (1 << (log2_size - 1))) >> log2_size
-            } else if have_above {
-                let sum: i32 = (0..size).map(|k| above(k as i32)).sum();
-                (sum + (1 << (log2_size - 1))) >> log2_size
-            } else {
-                base
+                (true, false) => {
+                    (left_col.iter().sum::<i32>() + (1 << (log2_size - 1))) >> log2_size
+                }
+                (false, true) => {
+                    ((0..size).map(|k| above(k as i32)).sum::<i32>() + (1 << (log2_size - 1)))
+                        >> log2_size
+                }
+                (false, false) => base,
             };
             pred.fill(value);
         }

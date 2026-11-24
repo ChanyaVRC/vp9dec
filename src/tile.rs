@@ -586,20 +586,24 @@ pub(crate) struct AboveContexts {
 
 impl AboveContexts {
     pub(crate) fn new(grid_cols: usize) -> Self {
-        let nz_len = grid_cols * 2;
-        Self {
-            partition: vec![0u8; grid_cols],
-            seg_pred: vec![0u8; grid_cols],
-            nonzero: [vec![0u8; nz_len], vec![0u8; nz_len], vec![0u8; nz_len]],
-        }
+        let mut ctx = Self {
+            partition: Vec::new(),
+            seg_pred: Vec::new(),
+            nonzero: [Vec::new(), Vec::new(), Vec::new()],
+        };
+        ctx.reset_for(grid_cols);
+        ctx
     }
 
     pub(crate) fn reset_for(&mut self, grid_cols: usize) {
+        for (buf, len) in [
+            (&mut self.partition, grid_cols),
+            (&mut self.seg_pred, grid_cols),
+        ] {
+            buf.resize(len, 0);
+            buf.fill(0);
+        }
         let nz_len = grid_cols * 2;
-        self.partition.resize(grid_cols, 0);
-        self.partition.fill(0);
-        self.seg_pred.resize(grid_cols, 0);
-        self.seg_pred.fill(0);
         for ctx in &mut self.nonzero {
             ctx.resize(nz_len, 0);
             ctx.fill(0);
@@ -613,6 +617,17 @@ impl AboveContexts {
             ctx.fill(0);
         }
     }
+}
+
+/// Optional caller-pooled buffers passed into [`TileDecoder::new_with_buffers`] to avoid per-frame
+/// heap allocations across consecutive frames.
+#[derive(Default)]
+pub(crate) struct RecycledBuffers {
+    pub(crate) planes: Option<[Plane; 3]>,
+    pub(crate) mi_grid: Option<MiGrid>,
+    pub(crate) above_ctx: Option<AboveContexts>,
+    pub(crate) scratch: Option<Box<TileScratch>>,
+    pub(crate) counts: Option<Box<Counts>>,
 }
 
 /// `get_tile_offset( tileNum, mis, tileSzLog2 )` (spec §6.4.1).
@@ -764,11 +779,7 @@ impl TileDecoder {
             resolved_refs,
             prev_segment_ids,
             true,
-            None,
-            None,
-            None,
-            None,
-            None,
+            RecycledBuffers::default(),
         )
     }
 
@@ -784,11 +795,7 @@ impl TileDecoder {
         resolved_refs: [Option<Arc<RefFrameData>>; 3],
         prev_segment_ids: Arc<Vec<u8>>,
         collect_counts: bool,
-        recycled_planes: Option<[Plane; 3]>,
-        recycled_mi_grid: Option<MiGrid>,
-        recycled_above_ctx: Option<AboveContexts>,
-        recycled_scratch: Option<Box<TileScratch>>,
-        recycled_counts: Option<Box<Counts>>,
+        recycled: RecycledBuffers,
     ) -> Self {
         let image_size = header::compute_image_size(header.width, header.height);
         let grid_cols = (image_size.sb64_cols * 8) as usize;
@@ -800,7 +807,8 @@ impl TileDecoder {
         let y_h = (image_size.sb64_rows * 64) as usize;
         let uv_w = y_w >> subsampling_x;
         let uv_h = y_h >> subsampling_y;
-        let planes = recycled_planes
+        let planes = recycled
+            .planes
             .and_then(|mut p| {
                 let cap_ok = p[0].try_reuse_as(y_w, y_h)
                     && p[1].try_reuse_as(uv_w, uv_h)
@@ -814,19 +822,20 @@ impl TileDecoder {
                     Plane::new(uv_w, uv_h),
                 ]
             });
-        let mi_grid = recycled_mi_grid
+        let mi_grid = recycled
+            .mi_grid
             .and_then(|mut g| g.try_reuse(grid_cols, grid_rows).then_some(g))
             .unwrap_or_else(|| MiGrid::new(grid_cols, grid_rows));
-        let above_ctx = match recycled_above_ctx {
+        let above_ctx = match recycled.above_ctx {
             Some(mut ctx) => {
                 ctx.reset_for(grid_cols);
                 ctx
             }
             None => AboveContexts::new(grid_cols),
         };
-        let scratch = recycled_scratch.unwrap_or_else(TileScratch::new);
+        let scratch = recycled.scratch.unwrap_or_else(TileScratch::new);
         let counts = if collect_counts {
-            Some(match recycled_counts {
+            Some(match recycled.counts {
                 Some(mut c) => {
                     c.reset();
                     c
@@ -905,6 +914,14 @@ impl TileDecoder {
         )
     }
 
+    /// Invokes `f` on `self.counts` when backward-adaptation counting is enabled.
+    #[inline(always)]
+    pub(super) fn count(&mut self, f: impl FnOnce(&mut Counts)) {
+        if let Some(counts) = self.counts.as_deref_mut() {
+            f(counts);
+        }
+    }
+
     /// The collected syntax element counters (used for probability adaptation, spec §8.4).
     /// Panics if count collection was disabled for this frame.
     pub fn counts(&self) -> &Counts {
@@ -933,22 +950,8 @@ impl TileDecoder {
     }
 
     /// Applies the loop filter (spec §8.8, [`crate::loop_filter`]) to the decoded `planes`.
-    /// Call this right after `decode_tiles`, before reading the output via `planes()`.
-    ///
-    /// By directly borrowing `self.planes` (`&mut`) and `self.mi_grid` (`&`) as separate
-    /// fields, both can be passed safely to `loop_filter_frame`, which needs both at once.
     pub fn apply_loop_filter(&mut self, lf: &header::LoopFilterParams) {
-        crate::loop_filter::loop_filter_frame(
-            &mut self.planes,
-            &self.mi_grid,
-            self.mi_cols,
-            self.mi_rows,
-            self.subsampling_x,
-            self.subsampling_y,
-            lf,
-            &self.segmentation,
-            self.bit_depth,
-        );
+        self.apply_loop_filter_inner(lf, None);
     }
 
     /// Like [`Self::apply_loop_filter`], reusing `pool`'s persistent worker threads.
@@ -956,6 +959,14 @@ impl TileDecoder {
         &mut self,
         lf: &header::LoopFilterParams,
         pool: &mut crate::thread_pool::ThreadPool,
+    ) {
+        self.apply_loop_filter_inner(lf, Some(pool));
+    }
+
+    fn apply_loop_filter_inner(
+        &mut self,
+        lf: &header::LoopFilterParams,
+        pool: Option<&mut crate::thread_pool::ThreadPool>,
     ) {
         crate::loop_filter::loop_filter_frame_with_pool(
             &mut self.planes,
@@ -967,7 +978,7 @@ impl TileDecoder {
             lf,
             &self.segmentation,
             self.bit_depth,
-            Some(pool),
+            pool,
         );
     }
 
@@ -1184,9 +1195,7 @@ impl TileDecoder {
             PARTITION_SPLIT
         };
         if !self.frame_is_intra {
-            if let Some(counts) = self.counts.as_deref_mut() {
-                counts.partition[ctx][partition as usize] += 1;
-            }
+            self.count(|c| c.partition[ctx][partition as usize] += 1);
         }
         partition
     }

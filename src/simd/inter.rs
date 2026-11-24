@@ -9,6 +9,7 @@
 //! scratch so small blocks never pay a 34 KB zero-fill. `predict.rs` owns the dispatch and the
 //! scalar fallback; this module owns only the vector kernels.
 
+use crate::framebuffer::RefSlice;
 use crate::predict::RefSample;
 use crate::prob_tables::BILINEAR;
 use crate::subpel::{MAX_BLOCK_DIM, MAX_INTERMEDIATE_HEIGHT, SUBPEL_FILTERS};
@@ -128,17 +129,16 @@ unsafe fn round_clip_pack_8(
 }
 
 /// Stores 16 `u16` values into `dst`, or averages them with existing `dst` via `VPAVGW`
-/// (`(dst + v + 1) >> 1 == round2(dst + v, 1)`) when `COMPOUND` is true.
+/// (`(dst + v + 1) >> 1 == round2(dst + v, 1)`) when `compound` is true.
 ///
 /// # Safety
 /// Caller must confirm `avx2_enabled()` and `dst` valid for 16 `u16` writes (and initialized
-/// reads when `COMPOUND`).
+/// reads when `compound`).
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn store_or_avg_16<const COMPOUND: bool>(dst: *mut u16, v: __m256i) {
-    let out = if COMPOUND {
-        let cur = _mm256_loadu_si256(dst as *const __m256i);
-        _mm256_avg_epu16(cur, v)
+unsafe fn store_or_avg_16(dst: *mut u16, v: __m256i, compound: bool) {
+    let out = if compound {
+        _mm256_avg_epu16(_mm256_loadu_si256(dst as *const __m256i), v)
     } else {
         v
     };
@@ -149,13 +149,12 @@ unsafe fn store_or_avg_16<const COMPOUND: bool>(dst: *mut u16, v: __m256i) {
 ///
 /// # Safety
 /// Caller must confirm `avx2_enabled()` and `dst` valid for 8 `u16` writes (and initialized
-/// reads when `COMPOUND`).
+/// reads when `compound`).
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn store_or_avg_8<const COMPOUND: bool>(dst: *mut u16, v: __m128i) {
-    let out = if COMPOUND {
-        let cur = _mm_loadu_si128(dst as *const __m128i);
-        _mm_avg_epu16(cur, v)
+unsafe fn store_or_avg_8(dst: *mut u16, v: __m128i, compound: bool) {
+    let out = if compound {
+        _mm_avg_epu16(_mm_loadu_si128(dst as *const __m128i), v)
     } else {
         v
     };
@@ -166,13 +165,12 @@ unsafe fn store_or_avg_8<const COMPOUND: bool>(dst: *mut u16, v: __m128i) {
 ///
 /// # Safety
 /// Caller must confirm `avx2_enabled()` and `dst` valid for 4 `u16` writes (and initialized
-/// reads when `COMPOUND`).
+/// reads when `compound`).
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn store_or_avg_4<const COMPOUND: bool>(dst: *mut u16, v: __m128i) {
-    let out = if COMPOUND {
-        let cur = _mm_loadl_epi64(dst as *const __m128i);
-        _mm_avg_epu16(cur, v)
+unsafe fn store_or_avg_4(dst: *mut u16, v: __m128i, compound: bool) {
+    let out = if compound {
+        _mm_avg_epu16(_mm_loadl_epi64(dst as *const __m128i), v)
     } else {
         v
     };
@@ -224,19 +222,22 @@ unsafe fn madd_8tap_256(s: [__m256i; 8], c: [__m256i; 4]) -> (__m256i, __m256i) 
     (lo, hi)
 }
 
-/// Unified 1D subpel filter (`HORIZ == true`: horizontal tap step `1`; `HORIZ == false`: vertical
-/// tap step `src_stride`), writing `rows` rows of `w` (`4` or multiple of `8`) `u16` samples into
-/// `dst` (stride `dst_stride`), with optional compound averaging.
+/// Unified 1D subpel filter (`tap_step == 1` for horizontal, `src_stride` for vertical), writing
+/// `rows` rows of `w` (`4` or multiple of `8`) `u16` samples into `dst` (stride `dst_stride`),
+/// with optional compound averaging. Keeping `tap_step` as a runtime register halves monomorphized
+/// `.text` size without hurting throughput.
 ///
 /// # Safety
 /// Caller must confirm `avx2_enabled()`, `w` is 4 or a multiple of 8, `src` valid for all tap
-/// reads across `rows` rows at `src_stride`, and `dst` valid for `rows` rows of `w` `u16` writes
-/// at `dst_stride` (initialized when `COMPOUND`).
+/// reads across `rows` rows at `src_stride`/`tap_step`, and `dst` valid for `rows` rows of `w`
+/// `u16` writes at `dst_stride` (initialized when `COMPOUND`).
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn convolve_1d_u16_avx2<S: RefSample, const COMPOUND: bool, const HORIZ: bool>(
+unsafe fn convolve_1d_u16_avx2<S: RefSample>(
     src: *const S,
     src_stride: usize,
+    tap_step: usize,
     dst: *mut u16,
     dst_stride: usize,
     w: usize,
@@ -244,9 +245,8 @@ unsafe fn convolve_1d_u16_avx2<S: RefSample, const COMPOUND: bool, const HORIZ: 
     coeffs: &[i32; 8],
     is_bilinear: bool,
     max_val: i32,
+    compound: bool,
 ) {
-    let tap_step = if HORIZ { 1 } else { src_stride };
-
     if w <= 8 {
         let round_add = _mm_set1_epi32(64);
         let zero = _mm_setzero_si128();
@@ -258,50 +258,31 @@ unsafe fn convolve_1d_u16_avx2<S: RefSample, const COMPOUND: bool, const HORIZ: 
             pair_coeff_128(coeffs[6], coeffs[7]),
         ];
         let c34 = pair_coeff_128(coeffs[3], coeffs[4]);
-        let load = |p: *const S| -> __m128i {
-            if w == 4 {
-                load4_u16(p)
-            } else {
-                load8_u16(p)
-            }
-        };
+        let load = |p: *const S| if w == 4 { load4_u16(p) } else { load8_u16(p) };
 
         for r in 0..rows {
             let sp = src.add(r * src_stride);
             let dp = dst.add(r * dst_stride);
-            if w == 4 {
-                let acc = if is_bilinear {
-                    let s3 = load(sp.add(3 * tap_step));
-                    let s4 = load(sp.add(4 * tap_step));
-                    _mm_madd_epi16(_mm_unpacklo_epi16(s3, s4), c34)
-                } else {
-                    let s: [__m128i; 8] = std::array::from_fn(|t| load(sp.add(t * tap_step)));
-                    let mut a = _mm_madd_epi16(_mm_unpacklo_epi16(s[0], s[1]), c[0]);
-                    for i in 1..4 {
-                        a = _mm_add_epi32(
-                            a,
-                            _mm_madd_epi16(_mm_unpacklo_epi16(s[2 * i], s[2 * i + 1]), c[i]),
-                        );
-                    }
-                    a
-                };
-                let res = _mm_srai_epi32(_mm_add_epi32(acc, round_add), 7);
-                let clipped = _mm_min_epi32(_mm_max_epi32(res, zero), max_clip);
-                store_or_avg_4::<COMPOUND>(dp, _mm_packus_epi32(clipped, clipped));
+            let (acc_lo, acc_hi) = if is_bilinear {
+                let s3 = load(sp.add(3 * tap_step));
+                let s4 = load(sp.add(4 * tap_step));
+                (
+                    _mm_madd_epi16(_mm_unpacklo_epi16(s3, s4), c34),
+                    if w == 8 {
+                        _mm_madd_epi16(_mm_unpackhi_epi16(s3, s4), c34)
+                    } else {
+                        zero
+                    },
+                )
             } else {
-                let (acc_lo, acc_hi) = if is_bilinear {
-                    let s3 = load(sp.add(3 * tap_step));
-                    let s4 = load(sp.add(4 * tap_step));
-                    (
-                        _mm_madd_epi16(_mm_unpacklo_epi16(s3, s4), c34),
-                        _mm_madd_epi16(_mm_unpackhi_epi16(s3, s4), c34),
-                    )
-                } else {
-                    let s: [__m128i; 8] = std::array::from_fn(|t| load(sp.add(t * tap_step)));
-                    madd_8tap_128(s, c)
-                };
-                let packed = round_clip_pack_8(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_8::<COMPOUND>(dp, packed);
+                let s: [__m128i; 8] = std::array::from_fn(|t| load(sp.add(t * tap_step)));
+                madd_8tap_128(s, c)
+            };
+            let packed = round_clip_pack_8(acc_lo, acc_hi, round_add, zero, max_clip);
+            if w == 4 {
+                store_or_avg_4(dp, packed, compound);
+            } else {
+                store_or_avg_8(dp, packed, compound);
             }
         }
         return;
@@ -318,15 +299,13 @@ unsafe fn convolve_1d_u16_avx2<S: RefSample, const COMPOUND: bool, const HORIZ: 
             let p3 = src.add(r * src_stride + 3 * tap_step);
             let p4 = src.add(r * src_stride + 4 * tap_step);
             let row_dst = dst.add(r * dst_stride);
-            let mut col = 0usize;
-            while col < w {
+            for col in (0..w).step_by(16) {
                 let s3 = load16_u16(p3.add(col));
                 let s4 = load16_u16(p4.add(col));
                 let acc_lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(s3, s4), c34);
                 let acc_hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(s3, s4), c34);
                 let packed = round_clip_pack_16(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_16::<COMPOUND>(row_dst.add(col), packed);
-                col += 16;
+                store_or_avg_16(row_dst.add(col), packed, compound);
             }
         }
     } else {
@@ -340,13 +319,11 @@ unsafe fn convolve_1d_u16_avx2<S: RefSample, const COMPOUND: bool, const HORIZ: 
             let row_src = src.add(r * src_stride);
             let pt: [*const S; 8] = std::array::from_fn(|t| row_src.add(t * tap_step));
             let row_dst = dst.add(r * dst_stride);
-            let mut col = 0usize;
-            while col < w {
+            for col in (0..w).step_by(16) {
                 let s: [__m256i; 8] = std::array::from_fn(|t| load16_u16(pt[t].add(col)));
                 let (acc_lo, acc_hi) = madd_8tap_256(s, c);
                 let packed = round_clip_pack_16(acc_lo, acc_hi, round_add, zero, max_clip);
-                store_or_avg_16::<COMPOUND>(row_dst.add(col), packed);
-                col += 16;
+                store_or_avg_16(row_dst.add(col), packed, compound);
             }
         }
     }
@@ -357,61 +334,52 @@ unsafe fn convolve_1d_u16_avx2<S: RefSample, const COMPOUND: bool, const HORIZ: 
 /// # Safety
 /// Caller must confirm `avx2_enabled()`, `w` is 4 or a multiple of 8, `src` valid for `h` rows
 /// of `w` `S` reads at `src_stride`, and `dst` valid for `h` rows of `w` `u16` writes at
-/// `dst_stride` (initialized when `COMPOUND`).
+/// `dst_stride` (initialized when `compound`).
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn copy_u16_avx2<S: RefSample, const COMPOUND: bool>(
+unsafe fn copy_u16_avx2<S: RefSample>(
     src: *const S,
     src_stride: usize,
     dst: *mut u16,
     dst_stride: usize,
     w: usize,
     h: usize,
+    compound: bool,
 ) {
-    match w {
-        4 => {
-            for r in 0..h {
-                let v = load4_u16(src.add(r * src_stride));
-                store_or_avg_4::<COMPOUND>(dst.add(r * dst_stride), v);
+    if w <= 8 {
+        for r in 0..h {
+            let sp = src.add(r * src_stride);
+            let dp = dst.add(r * dst_stride);
+            if w == 4 {
+                store_or_avg_4(dp, load4_u16(sp), compound);
+            } else {
+                store_or_avg_8(dp, load8_u16(sp), compound);
             }
         }
-        8 => {
-            for r in 0..h {
-                let v = load8_u16(src.add(r * src_stride));
-                store_or_avg_8::<COMPOUND>(dst.add(r * dst_stride), v);
-            }
-        }
-        _ => {
-            debug_assert_eq!(w % 16, 0);
-            for r in 0..h {
-                let sp = src.add(r * src_stride);
-                let dp = dst.add(r * dst_stride);
-                let mut c = 0usize;
-                while c < w {
-                    let v = load16_u16(sp.add(c));
-                    store_or_avg_16::<COMPOUND>(dp.add(c), v);
-                    c += 16;
-                }
+    } else {
+        debug_assert_eq!(w % 16, 0);
+        for r in 0..h {
+            let sp = src.add(r * src_stride);
+            let dp = dst.add(r * dst_stride);
+            for c in (0..w).step_by(16) {
+                store_or_avg_16(dp.add(c), load16_u16(sp.add(c)), compound);
             }
         }
     }
 }
 
 /// Direct-to-plane unscaled AVX2 inter prediction (`x_step == y_step == 16`, `w` is 4 or a
-/// multiple of 8). Writes `u16` output straight into `dst_data` at `(dst_x, dst_y)` (or averages
-/// with existing `dst_data` via `VPAVGW`/`PAVGW` when `COMPOUND == true`), dispatching full-pel
-/// copy (`fx == 0 && fy == 0`), 1D horizontal (`fy == 0`), 1D vertical (`fx == 0`), and 2D
-/// separable paths with uninitialized `u16` intermediate scratch.
+/// multiple of 8). Writes `u16` output straight into `dst_base` at `(dst_x, dst_y)` (or averages
+/// with existing `dst_base` via `VPAVGW`/`PAVGW` when `compound == true`).
 ///
 /// # Safety
-/// Caller must confirm `avx2_enabled()`, that `dst_data` holds rows `dst_y..dst_y + h` x cols
+/// Caller must confirm `avx2_enabled()`, that `dst_base` holds rows `dst_y..dst_y + h` x cols
 /// `dst_x..dst_x + w` (stride `dst_width`), and that `ref_data` (stride `ref_width`) covers every
-/// source pixel read by the active `(fx, fy)` branch:
-/// - rows `y0..y0 + h` if `fy == 0`, else `(y0 - 3)..(y0 + h + 4)`;
-/// - cols `x0..x0 + w` if `fx == 0`, else `(x0 - 3)..(x0 + w + 4)`.
+/// source pixel read by the active `(fx, fy)` branch.
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn block_inter_predict_u16_avx2<S: RefSample, const COMPOUND: bool>(
+pub(crate) unsafe fn block_inter_predict_u16_avx2<S: RefSample>(
     ref_data: &[S],
     ref_width: usize,
     dst_base: *mut u16,
@@ -426,51 +394,12 @@ pub(crate) unsafe fn block_inter_predict_u16_avx2<S: RefSample, const COMPOUND: 
     h: usize,
     interp_filter: u8,
     max_val: i32,
+    compound: bool,
 ) {
     debug_assert!(dst_x + w <= dst_width);
-    let dst = dst_base.add(dst_y * dst_width + dst_x);
-    block_inter_predict_u16_ptr_avx2::<S, COMPOUND>(
-        ref_data,
-        ref_width,
-        dst,
-        dst_width,
-        x0,
-        y0,
-        fx,
-        fy,
-        w,
-        h,
-        interp_filter,
-        max_val,
-    );
-}
-
-/// Raw-pointer core of [`block_inter_predict_u16_avx2`]. Taking `dst: *mut u16` allows callers
-/// writing into uninitialized `MaybeUninit<u16>` stack scratch (`COMPOUND == false`) to avoid
-/// constructing an invalid `&mut [u16]` over uninitialized memory.
-///
-/// # Safety
-/// Same contract as [`block_inter_predict_u16_avx2`] with `dst` pointing to `(dst_x, dst_y)`
-/// (writable for `h` rows of `w` samples at stride `dst_width`, and already initialized when
-/// `COMPOUND == true`).
-#[target_feature(enable = "avx2")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn block_inter_predict_u16_ptr_avx2<S: RefSample, const COMPOUND: bool>(
-    ref_data: &[S],
-    ref_width: usize,
-    dst: *mut u16,
-    dst_width: usize,
-    x0: i64,
-    y0: i64,
-    fx: usize,
-    fy: usize,
-    w: usize,
-    h: usize,
-    interp_filter: u8,
-    max_val: i32,
-) {
     debug_assert!(w == 4 || w.is_multiple_of(8));
     debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
+    let dst = dst_base.add(dst_y * dst_width + dst_x);
     let is_bilinear = interp_filter == BILINEAR;
     let filters = &SUBPEL_FILTERS[interp_filter as usize];
 
@@ -479,15 +408,16 @@ unsafe fn block_inter_predict_u16_ptr_avx2<S: RefSample, const COMPOUND: bool>(
             let src = ref_data
                 .as_ptr()
                 .add((y0 as usize) * ref_width + (x0 as usize));
-            copy_u16_avx2::<S, COMPOUND>(src, ref_width, dst, dst_width, w, h);
+            copy_u16_avx2::<S>(src, ref_width, dst, dst_width, w, h, compound);
         }
         (false, true) => {
             let src = ref_data
                 .as_ptr()
                 .add((y0 as usize) * ref_width + ((x0 - 3) as usize));
-            convolve_1d_u16_avx2::<S, COMPOUND, true>(
+            convolve_1d_u16_avx2::<S>(
                 src,
                 ref_width,
+                1,
                 dst,
                 dst_width,
                 w,
@@ -495,14 +425,16 @@ unsafe fn block_inter_predict_u16_ptr_avx2<S: RefSample, const COMPOUND: bool>(
                 &filters[fx],
                 is_bilinear,
                 max_val,
+                compound,
             );
         }
         (true, false) => {
             let src = ref_data
                 .as_ptr()
                 .add(((y0 - 3) as usize) * ref_width + (x0 as usize));
-            convolve_1d_u16_avx2::<S, COMPOUND, false>(
+            convolve_1d_u16_avx2::<S>(
                 src,
+                ref_width,
                 ref_width,
                 dst,
                 dst_width,
@@ -511,21 +443,20 @@ unsafe fn block_inter_predict_u16_ptr_avx2<S: RefSample, const COMPOUND: bool>(
                 &filters[fy],
                 is_bilinear,
                 max_val,
+                compound,
             );
         }
         (false, false) => {
-            // Uninitialized stack scratch sized for unscaled 2D max (71 * 64 u16 = 9 KB):
-            // only the first `(h + 7) * w` entries are written by the horizontal pass and read
-            // by the vertical pass.
             let mut intermediate =
                 [MaybeUninit::<u16>::uninit(); (MAX_BLOCK_DIM + 7) * MAX_BLOCK_DIM];
             let tmp_ptr = intermediate.as_mut_ptr() as *mut u16;
             let src = ref_data
                 .as_ptr()
                 .add(((y0 - 3) as usize) * ref_width + ((x0 - 3) as usize));
-            convolve_1d_u16_avx2::<S, false, true>(
+            convolve_1d_u16_avx2::<S>(
                 src,
                 ref_width,
+                1,
                 tmp_ptr,
                 w,
                 w,
@@ -533,9 +464,11 @@ unsafe fn block_inter_predict_u16_ptr_avx2<S: RefSample, const COMPOUND: bool>(
                 &filters[fx],
                 is_bilinear,
                 max_val,
+                false,
             );
-            convolve_1d_u16_avx2::<u16, COMPOUND, false>(
+            convolve_1d_u16_avx2::<u16>(
                 tmp_ptr,
+                w,
                 w,
                 dst,
                 dst_width,
@@ -544,6 +477,7 @@ unsafe fn block_inter_predict_u16_ptr_avx2<S: RefSample, const COMPOUND: bool>(
                 &filters[fy],
                 is_bilinear,
                 max_val,
+                compound,
             );
         }
     }
@@ -551,19 +485,18 @@ unsafe fn block_inter_predict_u16_ptr_avx2<S: RefSample, const COMPOUND: bool>(
 
 /// Direct-to-plane edge-clamping AVX2 inter prediction for unscaled border blocks
 /// (`x_step == y_step == 16`) AND scaled references (`x_step`/`y_step` != 16, SVC / resize).
-/// Writes `u16` output straight into `dst_data` at `(dst_x, dst_y)` (or averages with existing
-/// `dst_data` when `COMPOUND == true`), without zero-initializing the intermediate scratch.
 ///
 /// # Safety
 /// The caller must have confirmed `avx2_enabled()`, and must guarantee:
 /// `ref_stride >= ref_width`; `ref_data.len() >= ref_stride * ref_height`;
 /// `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`; horizontal source span
-/// `<= MAX_INTERMEDIATE_HEIGHT`; and `dst_data` holds rows `dst_y..dst_y + h` x cols
+/// `<= MAX_INTERMEDIATE_HEIGHT`; and `dst_base` holds rows `dst_y..dst_y + h` x cols
 /// `dst_x..dst_x + w` (stride `dst_width`).
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COMPOUND: bool>(
-    ref_data: &[S],
+pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2(
+    ref_data: RefSlice<'_>,
     ref_width: usize,
     ref_stride: usize,
     ref_height: usize,
@@ -580,6 +513,7 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
     intermediate_height: usize,
     interp_filter: u8,
     max_val: i32,
+    compound: bool,
 ) {
     debug_assert!(w == 4 || w.is_multiple_of(8));
     debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
@@ -593,33 +527,26 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
     let last_y = ref_height as i64 - 1;
     let filters = &SUBPEL_FILTERS[interp_filter as usize];
 
-    // Fast path for unscaled border blocks (`x_step == 16 && y_step == 16`): edge-clamp each
-    // needed source row into a tiny contiguous `u16` line buffer and reuse the fast contiguous
-    // `madd_epi16` / copy kernels instead of `i32` gathers.
     if x_step == 16 && y_step == 16 {
-        let x0 = x >> 4;
-        let y0 = y >> 4;
-        let fx = (x & 15) as usize;
-        let fy = (y & 15) as usize;
+        let (x0, y0) = (x >> 4, y >> 4);
+        let (fx, fy) = ((x & 15) as usize, (y & 15) as usize);
         let is_bilinear = interp_filter == BILINEAR;
-        let ref_base = ref_data.as_ptr();
 
         let fill_clamped_row = |ref_y: usize, col_start: i64, len: usize, out: *mut u16| {
-            let row = ref_base.add(ref_y * ref_stride);
+            let row_off = ref_y * ref_stride;
             if col_start >= 0 && col_start + (len as i64) - 1 <= last_x {
-                let src = row.add(col_start as usize);
-                if S::IS_U8 {
-                    for i in 0..len {
-                        *out.add(i) = (*src.add(i)).to_u16();
-                    }
-                } else {
-                    std::ptr::copy_nonoverlapping(src as *const u16, out, len);
+                if let RefSlice::U16(s) = ref_data {
+                    std::ptr::copy_nonoverlapping(
+                        s.as_ptr().add(row_off + col_start as usize),
+                        out,
+                        len,
+                    );
+                    return;
                 }
-            } else {
-                for i in 0..len {
-                    let sx = (col_start + i as i64).clamp(0, last_x) as usize;
-                    *out.add(i) = (*row.add(sx)).to_u16();
-                }
+            }
+            for i in 0..len {
+                let sx = (col_start + i as i64).clamp(0, last_x) as usize;
+                *out.add(i) = ref_data.get_i32(row_off + sx) as u16;
             }
         };
 
@@ -632,12 +559,13 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
                 let row_dst = dst.add(r * dst_width);
                 if fx == 0 {
                     fill_clamped_row(ref_y, x0, w, line_ptr);
-                    copy_u16_avx2::<u16, COMPOUND>(line_ptr, w, row_dst, dst_width, w, 1);
+                    copy_u16_avx2::<u16>(line_ptr, w, row_dst, dst_width, w, 1, compound);
                 } else {
                     fill_clamped_row(ref_y, x0 - 3, w + 7, line_ptr);
-                    convolve_1d_u16_avx2::<u16, COMPOUND, true>(
+                    convolve_1d_u16_avx2::<u16>(
                         line_ptr,
                         w + 7,
+                        1,
                         row_dst,
                         dst_width,
                         w,
@@ -645,6 +573,7 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
                         &filters[fx],
                         is_bilinear,
                         max_val,
+                        compound,
                     );
                 }
             }
@@ -657,9 +586,10 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
                     fill_clamped_row(ref_y, x0, w, tmp_ptr.add(r * w));
                 } else {
                     fill_clamped_row(ref_y, x0 - 3, w + 7, line_ptr);
-                    convolve_1d_u16_avx2::<u16, false, true>(
+                    convolve_1d_u16_avx2::<u16>(
                         line_ptr,
                         w + 7,
+                        1,
                         tmp_ptr.add(r * w),
                         w,
                         w,
@@ -667,11 +597,13 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
                         &filters[fx],
                         is_bilinear,
                         max_val,
+                        false,
                     );
                 }
             }
-            convolve_1d_u16_avx2::<u16, COMPOUND, false>(
+            convolve_1d_u16_avx2::<u16>(
                 tmp_ptr,
+                w,
                 w,
                 dst,
                 dst_width,
@@ -680,14 +612,12 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
                 &filters[fy],
                 is_bilinear,
                 max_val,
+                compound,
             );
         }
         return;
     }
 
-    // General scaled reference path (SVC / resize): gather horizontal pass into uninitialized
-    // `i32` stack scratch via raw pointer (never forming `&mut [i32]` over uninit), then pack
-    // to `u16` into `dst` (with optional compound average).
     let mut pred = [MaybeUninit::<i32>::uninit(); MAX_BLOCK_DIM * MAX_BLOCK_DIM];
     let pred_ptr = pred.as_mut_ptr().cast::<i32>();
     block_inter_predict_scaled_strided_avx2(
@@ -710,15 +640,13 @@ pub(crate) unsafe fn block_inter_predict_scaled_u16_avx2<S: RefSample, const COM
         let sp = pred_ptr.add(r * w);
         let dp = dst.add(r * dst_width);
         if w == 4 {
-            let v = _mm_loadu_si128(sp as *const __m128i);
-            store_or_avg_4::<COMPOUND>(dp, _mm_packus_epi32(v, v));
+            let v = _mm_packus_epi32(_mm_loadu_si128(sp as *const __m128i), _mm_setzero_si128());
+            store_or_avg_4(dp, v, compound);
         } else {
-            let mut c = 0usize;
-            while c < w {
+            for c in (0..w).step_by(8) {
                 let lo = _mm_loadu_si128(sp.add(c) as *const __m128i);
                 let hi = _mm_loadu_si128(sp.add(c + 4) as *const __m128i);
-                store_or_avg_8::<COMPOUND>(dp.add(c), _mm_packus_epi32(lo, hi));
-                c += 8;
+                store_or_avg_8(dp.add(c), _mm_packus_epi32(lo, hi), compound);
             }
         }
     }
@@ -757,11 +685,13 @@ pub unsafe fn block_inter_predict_avx2(
 
     let mut out_u16 = [MaybeUninit::<u16>::uninit(); MAX_BLOCK_DIM * MAX_BLOCK_DIM];
     let out_ptr = out_u16.as_mut_ptr().cast::<u16>();
-    block_inter_predict_u16_ptr_avx2::<u16, false>(
+    block_inter_predict_u16_avx2::<u16>(
         ref_data,
         ref_width,
         out_ptr,
         w,
+        0,
+        0,
         src_col0 + 3,
         src_row0 + 3,
         fx,
@@ -770,6 +700,7 @@ pub unsafe fn block_inter_predict_avx2(
         h,
         interp_filter,
         max_val,
+        false,
     );
     for (i, dst) in pred.iter_mut().enumerate() {
         *dst = *out_ptr.add(i) as i32;
@@ -840,7 +771,7 @@ pub unsafe fn block_inter_predict_scaled_avx2(
 ) {
     debug_assert_eq!(pred.len(), w * h);
     block_inter_predict_scaled_strided_avx2(
-        ref_data,
+        RefSlice::U16(ref_data),
         ref_width,
         ref_width,
         ref_height,
@@ -865,10 +796,11 @@ pub unsafe fn block_inter_predict_scaled_avx2(
 /// `ref_data.len() >= ref_stride * ref_height`, `intermediate_height <= MAX_INTERMEDIATE_HEIGHT`,
 /// horizontal source span `<= MAX_INTERMEDIATE_HEIGHT`, and `pred_ptr` valid for writes of
 /// `w * h` contiguous `i32` elements.
+#[inline(never)]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn block_inter_predict_scaled_strided_avx2<S: RefSample>(
-    ref_data: &[S],
+unsafe fn block_inter_predict_scaled_strided_avx2(
+    ref_data: RefSlice<'_>,
     ref_width: usize,
     ref_stride: usize,
     ref_height: usize,
@@ -926,9 +858,9 @@ unsafe fn block_inter_predict_scaled_strided_avx2<S: RefSample>(
 
     for r in 0..intermediate_height {
         let ref_y = ((y >> 4) + r as i64 - 3).clamp(0, last_y) as usize;
-        let row = &ref_data[ref_y * ref_stride..ref_y * ref_stride + ref_width];
+        let row_off = ref_y * ref_stride;
         for (i, &sc) in src_col[..span].iter().enumerate() {
-            *scratch_ptr.add(i) = row[sc].to_i32();
+            *scratch_ptr.add(i) = ref_data.get_i32(row_off + sc);
         }
         for (g, (idx_lanes, taps)) in gidx[..groups]
             .iter()

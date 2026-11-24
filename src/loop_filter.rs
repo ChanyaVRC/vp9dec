@@ -356,25 +356,15 @@ fn superblock_loop_filter<P: PlaneAccess>(
     for edge in 0..num_edges {
         // Edge-level screen boundary check: `x` (Vertical) or `y` (Horizontal) is constant along the
         // entire edge, so skip edge 0 at frame origin and break past the frame's far edge.
-        match pass {
-            FilterPass::Vertical => {
-                let edge_x = col * 8 + edge * (4 << sub_x);
-                if edge_x == 0 {
-                    continue;
-                }
-                if edge_x >= 8 * ctx.mi_cols {
-                    break;
-                }
-            }
-            FilterPass::Horizontal => {
-                let edge_y = row * 8 + edge * (4 << sub_y);
-                if edge_y == 0 {
-                    continue;
-                }
-                if edge_y >= 8 * ctx.mi_rows {
-                    break;
-                }
-            }
+        let (edge_coord, edge_limit) = match pass {
+            FilterPass::Vertical => (col * 8 + edge * (4 << sub_x), 8 * ctx.mi_cols),
+            FilterPass::Horizontal => (row * 8 + edge * (4 << sub_y), 8 * ctx.mi_rows),
+        };
+        if edge_coord == 0 {
+            continue;
+        }
+        if edge_coord >= edge_limit {
+            break;
         }
 
         let mut i = 0u32;
@@ -390,45 +380,26 @@ fn superblock_loop_filter<P: PlaneAccess>(
                 let py0 = (group.y >> sub_y) as usize;
                 #[cfg(target_arch = "x86_64")]
                 if use_avx2 {
-                    let plane_width = plane.lf_stride();
-                    let base = plane.lf_base_ptr();
-                    match pass {
-                        FilterPass::Horizontal => {
-                            // SAFETY: `avx2_enabled()` confirmed; active lanes lie within the
-                            // superblock-padded plane, and `filter_size == TX_16X16` guarantees the
-                            // `p7..q7` window is in bounds (same proof as scalar `sample_filtering`).
-                            unsafe {
-                                crate::simd::loop_filter_horiz8_uniform_avx2(
-                                    base,
-                                    plane_width,
-                                    px0,
-                                    py0,
-                                    group.active_lanes,
-                                    spec.filter_size,
-                                    limit,
-                                    blimit,
-                                    thresh,
-                                    ctx.bit_depth,
-                                );
-                            }
-                        }
-                        FilterPass::Vertical => {
-                            // SAFETY: transpose of the horizontal contract above.
-                            unsafe {
-                                crate::simd::loop_filter_vert8_uniform_avx2(
-                                    base,
-                                    plane_width,
-                                    px0,
-                                    py0,
-                                    group.active_lanes,
-                                    spec.filter_size,
-                                    limit,
-                                    blimit,
-                                    thresh,
-                                    ctx.bit_depth,
-                                );
-                            }
-                        }
+                    let lf_fn = match pass {
+                        FilterPass::Horizontal => crate::simd::loop_filter_horiz8_uniform_avx2,
+                        FilterPass::Vertical => crate::simd::loop_filter_vert8_uniform_avx2,
+                    };
+                    // SAFETY: `avx2_enabled()` confirmed; active lanes lie within the
+                    // superblock-padded plane, and `filter_size == TX_16X16` guarantees the
+                    // `p7..q7` window is in bounds (same proof as scalar `sample_filtering`).
+                    unsafe {
+                        lf_fn(
+                            plane.lf_base_ptr(),
+                            plane.lf_stride(),
+                            px0,
+                            py0,
+                            group.active_lanes,
+                            spec.filter_size,
+                            limit,
+                            blimit,
+                            thresh,
+                            ctx.bit_depth,
+                        );
                     }
                     i += 8;
                     continue;

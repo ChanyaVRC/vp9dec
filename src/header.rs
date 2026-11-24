@@ -175,21 +175,11 @@ impl Default for LoopFilterDeltas {
 /// (spec §7.2.10), persisted across frames by the caller and reset only by
 /// `setup_past_independence()`. Replaces the former `(SegFeatureEnabled, SegFeatureData,
 /// bool)` tuple threaded through [`parse_uncompressed_header`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SegFeaturePersist {
     pub enabled: SegFeatureEnabled,
     pub data: SegFeatureData,
     pub abs_or_delta: bool,
-}
-
-impl Default for SegFeaturePersist {
-    fn default() -> Self {
-        Self {
-            enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
-            data: [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
-            abs_or_delta: false,
-        }
-    }
 }
 
 /// All of the cross-frame state [`parse_uncompressed_header`] needs from the caller (spec
@@ -197,7 +187,7 @@ impl Default for SegFeaturePersist {
 /// `frame_size_with_refs()`, spec §6.2.5), and the loop filter/segmentation state that
 /// `setup_past_independence()` would otherwise reset. Callers (`Decoder`) keep one instance of
 /// this across frames instead of three separate fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PersistentState {
     pub ref_frame_sizes: [(u32, u32); NUM_REF_FRAMES],
     pub loop_filter_deltas: LoopFilterDeltas,
@@ -206,17 +196,7 @@ pub struct PersistentState {
 
 impl PersistentState {
     pub fn new() -> Self {
-        Self {
-            ref_frame_sizes: [(0, 0); NUM_REF_FRAMES],
-            loop_filter_deltas: LoopFilterDeltas::default(),
-            segmentation: SegFeaturePersist::default(),
-        }
-    }
-}
-
-impl Default for PersistentState {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 
@@ -621,14 +601,10 @@ fn parse_segmentation_params(
 
     if !enabled {
         return SegmentationParams {
-            enabled: false,
-            update_map: false,
-            tree_probs: [255; 7],
-            pred_prob: [255; 3],
-            temporal_update: false,
             abs_or_delta_update,
             feature_enabled,
             feature_data,
+            ..SegmentationParams::default()
         };
     }
 

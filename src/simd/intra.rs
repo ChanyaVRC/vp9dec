@@ -9,6 +9,47 @@
 
 use std::arch::x86_64::*;
 
+/// Stores 4 or 8 `u16` lanes from `v` into `row`.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `row` valid for 4 (if `is_4`) or 8 `u16` writes.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn store_row_128(row: *mut u16, v: __m128i, is_4: bool) {
+    if is_4 {
+        _mm_storel_epi64(row as *mut __m128i, v);
+    } else {
+        _mm_storeu_si128(row as *mut __m128i, v);
+    }
+}
+
+/// Loads 4 or 8 `u16` lanes from `src`.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `src` valid for 4 (if `is_4`) or 8 `u16` reads.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn load_row_128(src: *const u16, is_4: bool) -> __m128i {
+    if is_4 {
+        _mm_loadl_epi64(src as *const __m128i)
+    } else {
+        _mm_loadu_si128(src as *const __m128i)
+    }
+}
+
+/// Stores 16 (`v0`) or 32 (`v0`, `v1`) `u16` lanes into `row`.
+///
+/// # Safety
+/// Caller must confirm `avx2_enabled()` and `row` valid for 16 (or 32 if `is_32`) `u16` writes.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn store_row_256(row: *mut u16, v0: __m256i, v1: __m256i, is_32: bool) {
+    _mm256_storeu_si256(row as *mut __m256i, v0);
+    if is_32 {
+        _mm256_storeu_si256(row.add(16) as *mut __m256i, v1);
+    }
+}
+
 /// Fills an `size x size` block at `(start_x, start_y)` in `plane_data` (row-major `u16`,
 /// stride `plane_width`) with the constant `val`. Shared by `DC_PRED`, unavailable-above
 /// `V_PRED`, and unavailable-left `H_PRED`.
@@ -29,26 +70,24 @@ pub unsafe fn intra_pred_fill_avx2(
     debug_assert!(matches!(size, 4 | 8 | 16 | 32));
     debug_assert!(start_x + size <= plane_width);
 
-    let base = plane_base;
     if size <= 8 {
         let v = _mm_set1_epi16(val as i16);
         for i in 0..size {
-            let row = base.add((start_y + i) * plane_width + start_x);
-            if size == 4 {
-                _mm_storel_epi64(row as *mut __m128i, v);
-            } else {
-                _mm_storeu_si128(row as *mut __m128i, v);
-            }
+            store_row_128(
+                plane_base.add((start_y + i) * plane_width + start_x),
+                v,
+                size == 4,
+            );
         }
     } else {
         let v = _mm256_set1_epi16(val as i16);
         for i in 0..size {
-            let row = base.add((start_y + i) * plane_width + start_x);
-            let mut j = 0usize;
-            while j < size {
-                _mm256_storeu_si256(row.add(j) as *mut __m256i, v);
-                j += 16;
-            }
+            store_row_256(
+                plane_base.add((start_y + i) * plane_width + start_x),
+                v,
+                v,
+                size == 32,
+            );
         }
     }
 }
@@ -74,21 +113,15 @@ pub unsafe fn intra_pred_v_avx2(
     debug_assert!(above.len() >= size);
     debug_assert!(start_x + size <= plane_width);
 
-    let base = plane_base;
     let src = above.as_ptr();
     if size <= 8 {
-        let v = if size == 4 {
-            _mm_loadl_epi64(src as *const __m128i)
-        } else {
-            _mm_loadu_si128(src as *const __m128i)
-        };
+        let v = load_row_128(src, size == 4);
         for i in 0..size {
-            let row = base.add((start_y + i) * plane_width + start_x);
-            if size == 4 {
-                _mm_storel_epi64(row as *mut __m128i, v);
-            } else {
-                _mm_storeu_si128(row as *mut __m128i, v);
-            }
+            store_row_128(
+                plane_base.add((start_y + i) * plane_width + start_x),
+                v,
+                size == 4,
+            );
         }
     } else {
         let v0 = _mm256_loadu_si256(src as *const __m256i);
@@ -98,11 +131,12 @@ pub unsafe fn intra_pred_v_avx2(
             v0
         };
         for i in 0..size {
-            let row = base.add((start_y + i) * plane_width + start_x);
-            _mm256_storeu_si256(row as *mut __m256i, v0);
-            if size == 32 {
-                _mm256_storeu_si256(row.add(16) as *mut __m256i, v1);
-            }
+            store_row_256(
+                plane_base.add((start_y + i) * plane_width + start_x),
+                v0,
+                v1,
+                size == 32,
+            );
         }
     }
 }
@@ -128,26 +162,23 @@ pub unsafe fn intra_pred_h_avx2(
     debug_assert!(left.len() >= size);
     debug_assert!(start_x + size <= plane_width);
 
-    let base = plane_base;
     if size <= 8 {
         for (i, &lv) in left[..size].iter().enumerate() {
-            let v = _mm_set1_epi16(lv as i16);
-            let row = base.add((start_y + i) * plane_width + start_x);
-            if size == 4 {
-                _mm_storel_epi64(row as *mut __m128i, v);
-            } else {
-                _mm_storeu_si128(row as *mut __m128i, v);
-            }
+            store_row_128(
+                plane_base.add((start_y + i) * plane_width + start_x),
+                _mm_set1_epi16(lv as i16),
+                size == 4,
+            );
         }
     } else {
         for (i, &lv) in left[..size].iter().enumerate() {
             let v = _mm256_set1_epi16(lv as i16);
-            let row = base.add((start_y + i) * plane_width + start_x);
-            let mut j = 0usize;
-            while j < size {
-                _mm256_storeu_si256(row.add(j) as *mut __m256i, v);
-                j += 16;
-            }
+            store_row_256(
+                plane_base.add((start_y + i) * plane_width + start_x),
+                v,
+                v,
+                size == 32,
+            );
         }
     }
 }
@@ -216,16 +247,10 @@ pub unsafe fn intra_pred_dc_avx2(
     let size = 1usize << log2_size;
     let dc = match (above, left) {
         (Some(a), Some(l)) => {
-            let sum = sum_u16_avx2(a, size) + sum_u16_avx2(l, size);
-            (sum + size as i32) >> (log2_size + 1)
+            (sum_u16_avx2(a, size) + sum_u16_avx2(l, size) + size as i32) >> (log2_size + 1)
         }
-        (None, Some(l)) => {
-            let sum = sum_u16_avx2(l, size);
-            (sum + (1 << (log2_size - 1))) >> log2_size
-        }
-        (Some(a), None) => {
-            let sum = sum_u16_avx2(a, size);
-            (sum + (1 << (log2_size - 1))) >> log2_size
+        (None, Some(s)) | (Some(s), None) => {
+            (sum_u16_avx2(s, size) + (1 << (log2_size - 1))) >> log2_size
         }
         (None, None) => 1i32 << (bit_depth - 1),
     };
@@ -268,27 +293,22 @@ pub unsafe fn intra_pred_tm_avx2(
     debug_assert!(above[..size].iter().all(|&v| v <= 4095));
     debug_assert!(left[..size].iter().all(|&v| v <= 4095));
 
-    let base = plane_base;
     let max_val = ((1i32 << bit_depth) - 1) as i16;
     if size <= 8 {
         let zero = _mm_setzero_si128();
         let max_v = _mm_set1_epi16(max_val);
-        let tl = _mm_set1_epi16(top_left as i16);
-        let above_v = if size == 4 {
-            _mm_loadl_epi64(above.as_ptr() as *const __m128i)
-        } else {
-            _mm_loadu_si128(above.as_ptr() as *const __m128i)
-        };
-        let diff = _mm_sub_epi16(above_v, tl);
+        let diff = _mm_sub_epi16(
+            load_row_128(above.as_ptr(), size == 4),
+            _mm_set1_epi16(top_left as i16),
+        );
         for (i, &lv) in left[..size].iter().enumerate() {
             let sum = _mm_add_epi16(diff, _mm_set1_epi16(lv as i16));
             let clipped = _mm_min_epi16(_mm_max_epi16(sum, zero), max_v);
-            let row = base.add((start_y + i) * plane_width + start_x);
-            if size == 4 {
-                _mm_storel_epi64(row as *mut __m128i, clipped);
-            } else {
-                _mm_storeu_si128(row as *mut __m128i, clipped);
-            }
+            store_row_128(
+                plane_base.add((start_y + i) * plane_width + start_x),
+                clipped,
+                size == 4,
+            );
         }
     } else {
         let zero = _mm256_setzero_si256();
@@ -306,13 +326,17 @@ pub unsafe fn intra_pred_tm_avx2(
         for (i, &lv) in left[..size].iter().enumerate() {
             let lvec = _mm256_set1_epi16(lv as i16);
             let c0 = _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(diff0, lvec), zero), max_v);
-            let row = base.add((start_y + i) * plane_width + start_x);
-            _mm256_storeu_si256(row as *mut __m256i, c0);
-            if size == 32 {
-                let c1 =
-                    _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(diff1, lvec), zero), max_v);
-                _mm256_storeu_si256(row.add(16) as *mut __m256i, c1);
-            }
+            let c1 = if size == 32 {
+                _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(diff1, lvec), zero), max_v)
+            } else {
+                c0
+            };
+            store_row_256(
+                plane_base.add((start_y + i) * plane_width + start_x),
+                c0,
+                c1,
+                size == 32,
+            );
         }
     }
 }
