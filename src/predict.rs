@@ -643,6 +643,16 @@ fn scale_mv_for_plane(
     ref_height: u32,
     p: &InterPredictParams,
 ) -> (i64, i64, i64, i64) {
+    // Fast path for the common unscaled case (same-size reference): x_scale == y_scale == 16384
+    // (1 << REF_SCALE_SHIFT), so base = (x, y), frac = (0, 0), d = clamped_mv, step = (16, 16).
+    if ref_width == p.frame_width && ref_height == p.frame_height {
+        return (
+            ((x as i64) << SUBPEL_BITS) + clamped_mv[1] as i64,
+            ((y as i64) << SUBPEL_BITS) + clamped_mv[0] as i64,
+            16,
+            16,
+        );
+    }
     let x_scale = ((ref_width as i64) << REF_SCALE_SHIFT) / p.frame_width as i64;
     let y_scale = ((ref_height as i64) << REF_SCALE_SHIFT) / p.frame_height as i64;
     let base_x = ((x as i64) * x_scale) >> REF_SCALE_SHIFT;
@@ -684,162 +694,7 @@ pub(crate) const MAX_BLOCK_DIM: usize = 64;
 /// `pub(crate)`: shared with `src/simd/inter.rs`'s AVX2 mirror of [`block_inter_predict`].
 pub(crate) const MAX_INTERMEDIATE_HEIGHT: usize = 134;
 
-/// Per-block inter prediction process (spec §8.5.2.4 "Block inter prediction process").
-/// Writes `pred[r*w+c]` (`r`=0..h-1, `c`=0..w-1) into the caller-provided `pred` buffer
-/// (length exactly `h*w`) -- avoids a per-call heap allocation (this runs once per sub-8x8
-/// chroma 4x4 block, the hottest call site).
-#[allow(clippy::too_many_arguments)]
-fn block_inter_predict(
-    ref_plane: &Plane,
-    x: i64,
-    y: i64,
-    x_step: i64,
-    y_step: i64,
-    w: usize,
-    h: usize,
-    interp_filter: u8,
-    bit_depth: u8,
-    pred: &mut [i32],
-) {
-    debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
-    debug_assert_eq!(pred.len(), w * h);
-
-    // Current SIMD coverage (docs/implementation-notes.md): AVX2 fast path for the common
-    // unscaled case (spec §8.5.2.3's x_step == y_step == 16, i.e. reference frame same size as the
-    // current frame -- the overwhelming majority of content). When x_step/y_step == 16,
-    // `p & 15` in the scalar loops is step-invariant (adding a multiple of 16 never
-    // changes the low 4 bits), so there's exactly one filter for the whole call instead
-    // of one per column/row; and `p >> 4` reduces to a flat per-call offset (`c` alone
-    // for the horizontal pass's column, `r` alone for the vertical pass's row -- see
-    // `simd/inter.rs`'s doc comment for the derivation). A block whose source window needs
-    // border replication instead routes to the general edge-clamping AVX2 kernel below; x86
-    // has no u16 gather, so that kernel first widens the clamped source span to i32. All bit
-    // depths use the kernels: the subpel FIR is bit-depth-agnostic and its i32 accumulation
-    // holds a 12-bit sample through the two passes; only the `clip1` bound differs, passed as
-    // `max_val = (1<<bit_depth)-1`. Width 4 (the `4x4`/`4x8` partitions) dispatches to the
-    // 128-bit-wide `block_inter_predict_avx2_w4`; widths 8/16/32/64 to the 256-bit
-    // `block_inter_predict_avx2`.
-    #[cfg(target_arch = "x86_64")]
-    {
-        let last_x = ref_plane.width as i64 - 1;
-        let last_y = ref_plane.height as i64 - 1;
-        let intermediate_height = (((h as i64 - 1) * y_step + 15) >> 4) + 8;
-        let unscaled = x_step == 16 && y_step == 16;
-        let src_row0 = (y >> 4) - 3;
-        let src_col0 = (x >> 4) - 3;
-        let unscaled_in_bounds = unscaled
-            && src_row0 >= 0
-            && src_row0 + intermediate_height - 1 <= last_y
-            && src_col0 >= 0
-            && src_col0 + (w as i64 - 1) + 7 <= last_x;
-        if x_step == 16
-            && y_step == 16
-            && (w == 4 || w.is_multiple_of(8))
-            && crate::simd::avx2_enabled()
-        {
-            let max_val = (1i32 << bit_depth) - 1;
-            if unscaled_in_bounds {
-                let fx = (x & 15) as usize;
-                let fy = (y & 15) as usize;
-                // SAFETY: `avx2_enabled()` proved AVX2 support; `unscaled_in_bounds` proves every
-                // source pixel the kernel touches (rows src_row0..src_row0+intermediate_height,
-                // columns src_col0..src_col0+w+7) is within `ref_plane`, matching the kernels'
-                // documented contract.
-                unsafe {
-                    if w == 4 {
-                        crate::simd::block_inter_predict_avx2_w4(
-                            ref_plane.as_slice(),
-                            ref_plane.width,
-                            src_row0,
-                            src_col0,
-                            fx,
-                            fy,
-                            h,
-                            intermediate_height as usize,
-                            interp_filter,
-                            max_val,
-                            pred,
-                        );
-                    } else {
-                        crate::simd::block_inter_predict_avx2(
-                            ref_plane.as_slice(),
-                            ref_plane.width,
-                            src_row0,
-                            src_col0,
-                            fx,
-                            fy,
-                            w,
-                            h,
-                            intermediate_height as usize,
-                            interp_filter,
-                            max_val,
-                            pred,
-                        );
-                    }
-                }
-                return;
-            }
-        }
-
-        // General edge-clamping path: scaled references (SVC / resize: x_step or y_step != 16)
-        // and unscaled blocks whose 8-tap source window crosses a reference edge. Unlike the
-        // direct-load unscaled kernels, this one edge-clamps internally (every source read goes
-        // through precomputed clamped indices, reproducing the scalar border replication
-        // exactly). Steps are <= 32 by construction here: `decode_block`
-        // (`src/tile.rs`) rejects any block whose reference exceeds spec §8.5.2.3's 2x bound
-        // (`TileError::RefFrameSizeOutOfRange`) before prediction, which caps both quantities
-        // below at MAX_INTERMEDIATE_HEIGHT (the same `(((MAX_BLOCK_DIM - 1) * 32 + 15) >> 4)
-        // + 8` derivation on each axis). The two bound checks are therefore defensive
-        // redundancy for the kernel's fixed scratch sizes, NOT a malformed-stream handler --
-        // the scalar fallback's own fixed scratch has the identical limit and would panic on
-        // its slice bounds past it.
-        if (w == 4 || w.is_multiple_of(8)) && crate::simd::avx2_enabled() {
-            let span = (((x & 15) + x_step * (w as i64 - 1)) >> 4) + 8;
-            if intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT
-                && span as usize <= MAX_INTERMEDIATE_HEIGHT
-            {
-                let max_val = (1i32 << bit_depth) - 1;
-                // SAFETY: `avx2_enabled()` proved AVX2 support; `ref_plane.as_slice()` is
-                // exactly `width * height` samples (`Plane::new`), and the kernel clamps
-                // every source read to that rectangle; the two checks above bound its
-                // fixed-size scratch indices.
-                unsafe {
-                    crate::simd::block_inter_predict_scaled_avx2(
-                        ref_plane.as_slice(),
-                        ref_plane.width,
-                        ref_plane.height,
-                        x,
-                        y,
-                        x_step,
-                        y_step,
-                        w,
-                        h,
-                        intermediate_height as usize,
-                        interp_filter,
-                        max_val,
-                        pred,
-                    );
-                }
-                return;
-            }
-        }
-    }
-
-    block_inter_predict_scalar(
-        ref_plane,
-        x,
-        y,
-        x_step,
-        y_step,
-        w,
-        h,
-        interp_filter,
-        bit_depth,
-        pred,
-    );
-}
-
-/// Scalar body of [`block_inter_predict`] (the spec §8.5.2.4 two-pass loops, verbatim): the
+/// Scalar body of [`block_inter_predict_into_plane`] (spec §8.5.2.4 two-pass loops): the
 /// always-kept fallback for every case the AVX2 kernels don't take (`VP9DEC_NO_SIMD=1`,
 /// non-x86_64, or an unsupported dispatch shape), and the bit-exactness oracle
 /// `tests/unit/simd.rs`'s unit tests pin the kernels against (hence `pub(crate)`).
@@ -864,19 +719,114 @@ pub(crate) fn block_inter_predict_scalar(
     debug_assert!(intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT);
 
     let filters = &SUBPEL_FILTERS[interp_filter as usize];
+    let ref_data = ref_plane.as_slice();
+    let ref_w = ref_plane.width;
 
-    // Fixed-size scratch, sized for the worst case; only the first `intermediate_height * w`
-    // entries are written/read below.
+    // Fast unscaled scalar paths: avoid running zero taps when fx == 0 or fy == 0, and avoid
+    // 34 KB stack zeroing on every small block.
+    if x_step == 16 && y_step == 16 {
+        let fx = (x & 15) as usize;
+        let fy = (y & 15) as usize;
+        let x0 = x >> 4;
+        let y0 = y >> 4;
+        let max_val = (1i32 << bit_depth) - 1;
+
+        if fx == 0 && fy == 0 {
+            for r in 0..h {
+                let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
+                let row = &ref_data[ref_y * ref_w..ref_y * ref_w + ref_w];
+                if x0 >= 0 && x0 + w as i64 - 1 <= last_x {
+                    let sx = x0 as usize;
+                    for c in 0..w {
+                        pred[r * w + c] = row[sx + c] as i32;
+                    }
+                } else {
+                    for c in 0..w {
+                        let sx = (x0 + c as i64).clamp(0, last_x) as usize;
+                        pred[r * w + c] = row[sx] as i32;
+                    }
+                }
+            }
+            return;
+        }
+        if fy == 0 {
+            let hcoeffs = &filters[fx];
+            let in_x = x0 - 3 >= 0 && x0 + w as i64 + 3 <= last_x;
+            for r in 0..h {
+                let ref_y = (y0 + r as i64).clamp(0, last_y) as usize;
+                let row = &ref_data[ref_y * ref_w..ref_y * ref_w + ref_w];
+                if in_x {
+                    let sx0 = (x0 - 3) as usize;
+                    for c in 0..w {
+                        let base = &row[sx0 + c..sx0 + c + 8];
+                        let s = hcoeffs[0] * base[0] as i32
+                            + hcoeffs[1] * base[1] as i32
+                            + hcoeffs[2] * base[2] as i32
+                            + hcoeffs[3] * base[3] as i32
+                            + hcoeffs[4] * base[4] as i32
+                            + hcoeffs[5] * base[5] as i32
+                            + hcoeffs[6] * base[6] as i32
+                            + hcoeffs[7] * base[7] as i32;
+                        pred[r * w + c] = clip3(0, max_val, round2(s, 7));
+                    }
+                } else {
+                    for c in 0..w {
+                        let mut s = 0i32;
+                        for (t, &coeff) in hcoeffs.iter().enumerate() {
+                            let sx = (x0 + c as i64 + t as i64 - 3).clamp(0, last_x) as usize;
+                            s += coeff * row[sx] as i32;
+                        }
+                        pred[r * w + c] = clip3(0, max_val, round2(s, 7));
+                    }
+                }
+            }
+            return;
+        }
+        if fx == 0 {
+            let vcoeffs = &filters[fy];
+            let in_x = x0 >= 0 && x0 + w as i64 - 1 <= last_x;
+            let in_y = y0 - 3 >= 0 && y0 + h as i64 + 3 <= last_y;
+            if in_x && in_y {
+                let sx = x0 as usize;
+                for r in 0..h {
+                    let ybase = (y0 - 3) as usize + r;
+                    let r0 = &ref_data[ybase * ref_w + sx..ybase * ref_w + sx + w];
+                    let r1 = &ref_data[(ybase + 1) * ref_w + sx..(ybase + 1) * ref_w + sx + w];
+                    let r2 = &ref_data[(ybase + 2) * ref_w + sx..(ybase + 2) * ref_w + sx + w];
+                    let r3 = &ref_data[(ybase + 3) * ref_w + sx..(ybase + 3) * ref_w + sx + w];
+                    let r4 = &ref_data[(ybase + 4) * ref_w + sx..(ybase + 4) * ref_w + sx + w];
+                    let r5 = &ref_data[(ybase + 5) * ref_w + sx..(ybase + 5) * ref_w + sx + w];
+                    let r6 = &ref_data[(ybase + 6) * ref_w + sx..(ybase + 6) * ref_w + sx + w];
+                    let r7 = &ref_data[(ybase + 7) * ref_w + sx..(ybase + 7) * ref_w + sx + w];
+                    for c in 0..w {
+                        let s = vcoeffs[0] * r0[c] as i32
+                            + vcoeffs[1] * r1[c] as i32
+                            + vcoeffs[2] * r2[c] as i32
+                            + vcoeffs[3] * r3[c] as i32
+                            + vcoeffs[4] * r4[c] as i32
+                            + vcoeffs[5] * r5[c] as i32
+                            + vcoeffs[6] * r6[c] as i32
+                            + vcoeffs[7] * r7[c] as i32;
+                        pred[r * w + c] = clip3(0, max_val, round2(s, 7));
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    // General scalar path (scaled or 2D unscaled).
     let mut intermediate = [0i32; MAX_INTERMEDIATE_HEIGHT * MAX_BLOCK_DIM];
     for r in 0..intermediate_height {
         let ref_y = ((y >> 4) + r - 3).clamp(0, last_y) as usize;
+        let row = &ref_data[ref_y * ref_w..ref_y * ref_w + ref_w];
         for c in 0..w {
             let p = x + x_step * (c as i64);
             let coeffs = &filters[(p & 15) as usize];
             let mut s = 0i32;
             for (t, &coeff) in coeffs.iter().enumerate() {
                 let ref_x = ((p >> 4) + t as i64 - 3).clamp(0, last_x) as usize;
-                s += coeff * ref_plane.get(ref_x, ref_y) as i32;
+                s += coeff * row[ref_x] as i32;
             }
             intermediate[(r as usize) * w + c] = clip1(round2(s, 7), bit_depth);
         }
@@ -892,6 +842,185 @@ pub(crate) fn block_inter_predict_scalar(
                 s += coeff * intermediate[(base_row + t) * w + c];
             }
             pred[r * w + c] = clip1(round2(s, 7), bit_depth);
+        }
+    }
+}
+
+/// Writes one reference list's inter prediction directly into `dst` (or averages it with `dst`
+/// when `compound` is true). Dispatches to the direct-to-u16 AVX2 kernels on `x86_64`, avoiding
+/// both the 32 KB `preds` stack zeroing and the scalar `i32 -> u16` copy-out loop.
+#[allow(clippy::too_many_arguments)]
+fn block_inter_predict_into_plane(
+    ref_plane: &Plane,
+    dst: &mut Plane,
+    dst_x: usize,
+    dst_y: usize,
+    x: i64,
+    y: i64,
+    x_step: i64,
+    y_step: i64,
+    w: usize,
+    h: usize,
+    interp_filter: u8,
+    bit_depth: u8,
+    compound: bool,
+) {
+    debug_assert!(w <= MAX_BLOCK_DIM && h <= MAX_BLOCK_DIM);
+    debug_assert!(dst_x >= dst.x0 && dst_x - dst.x0 + w <= dst.width);
+    debug_assert!(dst_y + h <= dst.height);
+
+    #[cfg(target_arch = "x86_64")]
+    if (w == 4 || w.is_multiple_of(8)) && crate::simd::avx2_enabled() {
+        let max_val = (1i32 << bit_depth) - 1;
+        let local_x = dst_x - dst.x0;
+        let dst_w = dst.width;
+        let last_x = ref_plane.width as i64 - 1;
+        let last_y = ref_plane.height as i64 - 1;
+
+        if x_step == 16 && y_step == 16 {
+            let x0 = x >> 4;
+            let y0 = y >> 4;
+            let fx = (x & 15) as usize;
+            let fy = (y & 15) as usize;
+            let x_ok = if fx == 0 {
+                x0 >= 0 && x0 + (w as i64 - 1) <= last_x
+            } else {
+                x0 - 3 >= 0 && x0 + (w as i64 - 1) + 4 <= last_x
+            };
+            let y_ok = if fy == 0 {
+                y0 >= 0 && y0 + (h as i64 - 1) <= last_y
+            } else {
+                y0 - 3 >= 0 && y0 + (h as i64 - 1) + 4 <= last_y
+            };
+            if x_ok && y_ok {
+                // SAFETY: `avx2_enabled()` confirmed; `x_ok && y_ok` proves every source pixel
+                // read by the active `(fx, fy)` branch lies in `ref_plane`, and `dst` bounds hold.
+                unsafe {
+                    if compound {
+                        crate::simd::block_inter_predict_u16_avx2::<true>(
+                            ref_plane.as_slice(),
+                            ref_plane.width,
+                            dst.as_mut_slice(),
+                            dst_w,
+                            local_x,
+                            dst_y,
+                            x0,
+                            y0,
+                            fx,
+                            fy,
+                            w,
+                            h,
+                            interp_filter,
+                            max_val,
+                        );
+                    } else {
+                        crate::simd::block_inter_predict_u16_avx2::<false>(
+                            ref_plane.as_slice(),
+                            ref_plane.width,
+                            dst.as_mut_slice(),
+                            dst_w,
+                            local_x,
+                            dst_y,
+                            x0,
+                            y0,
+                            fx,
+                            fy,
+                            w,
+                            h,
+                            interp_filter,
+                            max_val,
+                        );
+                    }
+                }
+                return;
+            }
+        }
+
+        let intermediate_height = (((h as i64 - 1) * y_step + 15) >> 4) + 8;
+        let span = (((x & 15) + x_step * (w as i64 - 1)) >> 4) + 8;
+        if intermediate_height as usize <= MAX_INTERMEDIATE_HEIGHT
+            && span as usize <= MAX_INTERMEDIATE_HEIGHT
+        {
+            // SAFETY: `avx2_enabled()` confirmed; `ref_plane` has `width * height` samples,
+            // every source read is clamped inside it, scratch bounds were checked, and `dst`
+            // bounds hold.
+            unsafe {
+                if compound {
+                    crate::simd::block_inter_predict_scaled_u16_avx2::<true>(
+                        ref_plane.as_slice(),
+                        ref_plane.width,
+                        ref_plane.height,
+                        dst.as_mut_slice(),
+                        dst_w,
+                        local_x,
+                        dst_y,
+                        x,
+                        y,
+                        x_step,
+                        y_step,
+                        w,
+                        h,
+                        intermediate_height as usize,
+                        interp_filter,
+                        max_val,
+                    );
+                } else {
+                    crate::simd::block_inter_predict_scaled_u16_avx2::<false>(
+                        ref_plane.as_slice(),
+                        ref_plane.width,
+                        ref_plane.height,
+                        dst.as_mut_slice(),
+                        dst_w,
+                        local_x,
+                        dst_y,
+                        x,
+                        y,
+                        x_step,
+                        y_step,
+                        w,
+                        h,
+                        intermediate_height as usize,
+                        interp_filter,
+                        max_val,
+                    );
+                }
+            }
+            return;
+        }
+    }
+
+    // Scalar fallback (non-x86_64 or `VP9DEC_NO_SIMD=1`).
+    let mut pred = [0i32; MAX_BLOCK_DIM * MAX_BLOCK_DIM];
+    block_inter_predict_scalar(
+        ref_plane,
+        x,
+        y,
+        x_step,
+        y_step,
+        w,
+        h,
+        interp_filter,
+        bit_depth,
+        &mut pred[..w * h],
+    );
+    let local_x = dst_x - dst.x0;
+    let dst_w = dst.width;
+    let dst_slice = dst.as_mut_slice();
+    if compound {
+        for i in 0..h {
+            let dst_row = &mut dst_slice[(dst_y + i) * dst_w + local_x..][..w];
+            let src_row = &pred[i * w..(i + 1) * w];
+            for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
+                *d = round2(*d as i32 + s, 1) as u16;
+            }
+        }
+    } else {
+        for i in 0..h {
+            let dst_row = &mut dst_slice[(dst_y + i) * dst_w + local_x..][..w];
+            let src_row = &pred[i * w..(i + 1) * w];
+            for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
+                *d = s as u16;
+            }
         }
     }
 }
@@ -920,17 +1049,17 @@ pub fn predict_inter(
     let is_compound = p.ref_frame[1] > INTRA_FRAME;
     let n_refs = 1 + is_compound as usize;
 
-    // Fixed-size scratch (w, h <= MAX_BLOCK_DIM): avoids a per-call heap allocation. Only the
-    // first w*h entries of each slot are written/read below.
-    let mut preds = [[0i32; MAX_BLOCK_DIM * MAX_BLOCK_DIM]; 2];
-    for (ref_list, pred_slot) in preds.iter_mut().enumerate().take(n_refs) {
+    for ref_list in 0..n_refs {
         let mv = select_mv(plane, ref_list, block_idx, p);
         let clamped = clamp_mv_for_plane(plane, mv, p);
         let view = p.refs[ref_list].expect("reference frame slot is missing (DPB not initialized)");
         let (start_x, start_y, step_x, step_y) =
             scale_mv_for_plane(plane, x, y, clamped, view.width, view.height, p);
-        block_inter_predict(
+        block_inter_predict_into_plane(
             view.plane,
+            dst,
+            x,
+            y,
             start_x,
             start_y,
             step_x,
@@ -939,19 +1068,8 @@ pub fn predict_inter(
             h,
             p.interp_filter,
             p.bit_depth,
-            &mut pred_slot[..w * h],
+            ref_list == 1,
         );
-    }
-
-    for i in 0..h {
-        for j in 0..w {
-            let value = if is_compound {
-                round2(preds[0][i * w + j] + preds[1][i * w + j], 1)
-            } else {
-                preds[0][i * w + j]
-            };
-            dst.set(x + j, y + i, value as u16);
-        }
     }
 }
 

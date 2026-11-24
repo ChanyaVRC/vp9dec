@@ -30,6 +30,7 @@ mod tests;
 
 pub use inter::{
     block_inter_predict_avx2, block_inter_predict_avx2_w4, block_inter_predict_scaled_avx2,
+    block_inter_predict_scaled_u16_avx2, block_inter_predict_u16_avx2,
 };
 pub use intra::{
     intra_pred_dc_avx2, intra_pred_fill_avx2, intra_pred_h_avx2, intra_pred_tm_avx2,
