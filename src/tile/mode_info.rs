@@ -65,6 +65,34 @@ impl MiInfo {
     }
 }
 
+/// Fills `sub_modes` for a sub-8x8 intra block (`mi_size < BLOCK_8X8`) by calling `read_sub`
+/// at each `(idy, idx)` sub-block origin; returns `(last_mode, sub_modes)`.
+fn decode_sub8x8_intra_modes<F: FnMut(u32, u32, &[u8; 4]) -> u8>(
+    mi_size: u8,
+    mut read_sub: F,
+) -> (u8, [u8; 4]) {
+    let mut sub_modes = [DC_PRED; 4];
+    let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
+    let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
+    let mut last_mode = DC_PRED;
+    let mut idy = 0u32;
+    while idy < 2 {
+        let mut idx = 0u32;
+        while idx < 2 {
+            let mode = read_sub(idy, idx, &sub_modes);
+            for y2 in 0..num4x4h {
+                for x2 in 0..num4x4w {
+                    sub_modes[((idy + y2) * 2 + idx + x2) as usize] = mode;
+                }
+            }
+            last_mode = mode;
+            idx += num4x4w;
+        }
+        idy += num4x4h;
+    }
+    (last_mode, sub_modes)
+}
+
 impl TileDecoder {
     /// `seg_feature_active( feature )` (spec §6.4.9).
     fn seg_feature_active(&self, segment_id: u8, feature: usize) -> bool {
@@ -224,9 +252,7 @@ impl TileDecoder {
         let skip = self.read_skip(r, row, col, avail_u, avail_l, segment_id);
         let tx_size = self.read_tx_size(r, mi_size, true, (row, col), (avail_u, avail_l));
 
-        let mut sub_modes = [DC_PRED; 4];
-        let y_mode;
-        if mi_size >= BLOCK_8X8 {
+        let (y_mode, sub_modes) = if mi_size >= BLOCK_8X8 {
             let above_mode = if avail_u {
                 self.mi_grid.get(row - 1, col).sub_modes[2]
             } else {
@@ -240,45 +266,28 @@ impl TileDecoder {
             let mode = r.read_tree(&INTRA_MODE_TREE, |node| {
                 KF_Y_MODE_PROBS[above_mode as usize][left_mode as usize][node]
             }) as u8;
-            y_mode = mode;
-            sub_modes = [mode; 4];
+            (mode, [mode; 4])
         } else {
-            let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
-            let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
-            let mut last_mode = DC_PRED;
-            let mut idy = 0u32;
-            while idy < 2 {
-                let mut idx = 0u32;
-                while idx < 2 {
-                    let above_mode = if idy > 0 {
-                        sub_modes[idx as usize]
-                    } else if avail_u {
-                        self.mi_grid.get(row - 1, col).sub_modes[(2 + idx) as usize]
-                    } else {
-                        DC_PRED
-                    };
-                    let left_mode = if idx > 0 {
-                        sub_modes[(idy * 2) as usize]
-                    } else if avail_l {
-                        self.mi_grid.get(row, col - 1).sub_modes[(1 + idy * 2) as usize]
-                    } else {
-                        DC_PRED
-                    };
-                    let mode = r.read_tree(&INTRA_MODE_TREE, |node| {
-                        KF_Y_MODE_PROBS[above_mode as usize][left_mode as usize][node]
-                    }) as u8;
-                    for y2 in 0..num4x4h {
-                        for x2 in 0..num4x4w {
-                            sub_modes[((idy + y2) * 2 + idx + x2) as usize] = mode;
-                        }
-                    }
-                    last_mode = mode;
-                    idx += num4x4w;
-                }
-                idy += num4x4h;
-            }
-            y_mode = last_mode;
-        }
+            decode_sub8x8_intra_modes(mi_size, |idy, idx, sub_modes| {
+                let above_mode = if idy > 0 {
+                    sub_modes[idx as usize]
+                } else if avail_u {
+                    self.mi_grid.get(row - 1, col).sub_modes[(2 + idx) as usize]
+                } else {
+                    DC_PRED
+                };
+                let left_mode = if idx > 0 {
+                    sub_modes[(idy * 2) as usize]
+                } else if avail_l {
+                    self.mi_grid.get(row, col - 1).sub_modes[(1 + idy * 2) as usize]
+                } else {
+                    DC_PRED
+                };
+                r.read_tree(&INTRA_MODE_TREE, |node| {
+                    KF_Y_MODE_PROBS[above_mode as usize][left_mode as usize][node]
+                }) as u8
+            })
+        };
 
         let uv_mode = r.read_tree(&INTRA_MODE_TREE, |node| {
             KF_UV_MODE_PROBS[y_mode as usize][node]
@@ -379,44 +388,25 @@ impl TileDecoder {
         skip: bool,
         segment_id: u8,
     ) -> Result<MiInfo, TileError> {
-        let mut sub_modes = [DC_PRED; 4];
-        let y_mode;
-        if mi_size >= BLOCK_8X8 {
+        let (y_mode, sub_modes) = if mi_size >= BLOCK_8X8 {
             let ctx = SIZE_GROUP_LOOKUP[mi_size as usize] as usize;
             let mode =
                 r.read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[ctx][node]) as u8;
             if self.collect_counts {
                 self.counts.intra_mode[ctx][mode as usize] += 1;
             }
-            y_mode = mode;
-            sub_modes = [mode; 4];
+            (mode, [mode; 4])
         } else {
-            let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
-            let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
-            let mut last_mode = DC_PRED;
-            let mut idy = 0u32;
-            while idy < 2 {
-                let mut idx = 0u32;
-                while idx < 2 {
-                    // sub_intra_mode: ctx is always 0 (spec §9.3.2).
-                    let mode = r
-                        .read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[0][node])
-                        as u8;
-                    if self.collect_counts {
-                        self.counts.intra_mode[0][mode as usize] += 1;
-                    }
-                    for y2 in 0..num4x4h {
-                        for x2 in 0..num4x4w {
-                            sub_modes[((idy + y2) * 2 + idx + x2) as usize] = mode;
-                        }
-                    }
-                    last_mode = mode;
-                    idx += num4x4w;
+            decode_sub8x8_intra_modes(mi_size, |_, _, _| {
+                // sub_intra_mode: ctx is always 0 (spec §9.3.2).
+                let mode =
+                    r.read_tree(&INTRA_MODE_TREE, |node| self.probs.y_mode_probs[0][node]) as u8;
+                if self.collect_counts {
+                    self.counts.intra_mode[0][mode as usize] += 1;
                 }
-                idy += num4x4h;
-            }
-            y_mode = last_mode;
-        }
+                mode
+            })
+        };
 
         let uv_mode = r.read_tree(&INTRA_MODE_TREE, |node| {
             self.probs.uv_mode_probs[y_mode as usize][node]

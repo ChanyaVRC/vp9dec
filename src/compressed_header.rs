@@ -320,22 +320,9 @@ fn read_tx_mode(r: &mut BoolDecoder, lossless: bool) -> u8 {
 
 /// `tx_mode_probs()` (spec §6.3.2). Called only when `tx_mode == TX_MODE_SELECT`.
 fn read_tx_mode_probs(r: &mut BoolDecoder, tx_probs: &mut [[[u8; 3]; 2]; 4]) {
-    // tx_probs_8x8[ TX_SIZE_CONTEXTS ][ TX_SIZES - 3 = 1 ]
-    for ctx in tx_probs[TX_8X8 as usize].iter_mut() {
-        for node in ctx.iter_mut().take(1) {
-            *node = diff_update_prob(r, *node);
-        }
-    }
-    // tx_probs_16x16[ TX_SIZE_CONTEXTS ][ TX_SIZES - 2 = 2 ]
-    for ctx in tx_probs[TX_16X16 as usize].iter_mut() {
-        for node in ctx.iter_mut().take(2) {
-            *node = diff_update_prob(r, *node);
-        }
-    }
-    // tx_probs_32x32[ TX_SIZE_CONTEXTS ][ TX_SIZES - 1 = 3 ]
-    for ctx in tx_probs[TX_32X32 as usize].iter_mut() {
-        for node in ctx.iter_mut().take(3) {
-            *node = diff_update_prob(r, *node);
+    for (tx_sz, nodes) in [(TX_8X8, 1), (TX_16X16, 2), (TX_32X32, 3)] {
+        for ctx in tx_probs[tx_sz as usize].iter_mut() {
+            diff_update_prob_slice(r, &mut ctx[..nodes]);
         }
     }
 }
@@ -344,8 +331,7 @@ fn read_tx_mode_probs(r: &mut BoolDecoder, tx_probs: &mut [[[u8; 3]; 2]; 4]) {
 fn read_coef_probs(r: &mut BoolDecoder, tx_mode: u8, coef_probs: &mut CoefProbs) {
     let max_tx_size = TX_MODE_TO_BIGGEST_TX_SIZE[tx_mode as usize];
     for tx_sz in 0..=max_tx_size {
-        let update_probs = r.flag();
-        if !update_probs {
+        if !r.flag() {
             continue;
         }
         for plane_probs in coef_probs[tx_sz as usize].iter_mut() {
@@ -353,9 +339,7 @@ fn read_coef_probs(r: &mut BoolDecoder, tx_mode: u8, coef_probs: &mut CoefProbs)
                 for (k, band_probs) in ref_probs.iter_mut().enumerate() {
                     let max_l = if k == 0 { 3 } else { 6 };
                     for ctx_probs in band_probs.iter_mut().take(max_l) {
-                        for prob in ctx_probs.iter_mut() {
-                            *prob = diff_update_prob(r, *prob);
-                        }
+                        diff_update_prob_slice(r, ctx_probs);
                     }
                 }
             }
@@ -368,26 +352,6 @@ fn diff_update_prob_slice(r: &mut BoolDecoder, probs: &mut [u8]) {
     for prob in probs.iter_mut() {
         *prob = diff_update_prob(r, *prob);
     }
-}
-
-/// `read_skip_prob()` (spec §6.3.8).
-fn read_skip_prob(r: &mut BoolDecoder, skip_prob: &mut [u8; 3]) {
-    diff_update_prob_slice(r, skip_prob);
-}
-
-/// `read_inter_mode_probs()` (spec §6.3.9).
-fn read_inter_mode_probs(r: &mut BoolDecoder, probs: &mut [[u8; 3]; 7]) {
-    diff_update_prob_slice(r, probs.as_flattened_mut());
-}
-
-/// `read_interp_filter_probs()` (spec §6.3.10).
-fn read_interp_filter_probs(r: &mut BoolDecoder, probs: &mut [[u8; 2]; 4]) {
-    diff_update_prob_slice(r, probs.as_flattened_mut());
-}
-
-/// `read_is_inter_probs()` (spec §6.3.11).
-fn read_is_inter_probs(r: &mut BoolDecoder, probs: &mut [u8; 4]) {
-    diff_update_prob_slice(r, probs);
 }
 
 /// `setup_compound_reference_mode()` (spec §6.3.18). Returns `(CompFixedRef, CompVarRef)`.
@@ -451,52 +415,33 @@ fn frame_reference_mode_probs(
     }
 }
 
-/// `read_y_mode_probs()` (spec §6.3.14). Updates the non-key-frame-only `y_mode_probs`.
-fn read_y_mode_probs(r: &mut BoolDecoder, probs: &mut [[u8; 9]; 4]) {
-    diff_update_prob_slice(r, probs.as_flattened_mut());
-}
-
-/// `read_partition_probs()` (spec §6.3.15). Updates the non-key-frame-only `partition_probs`.
-fn read_partition_probs(r: &mut BoolDecoder, probs: &mut [[u8; 3]; 16]) {
-    diff_update_prob_slice(r, probs.as_flattened_mut());
-}
-
-/// `update_mv_prob( prob )` (spec §6.3.17). Note that, unlike `diff_update_prob`,
-/// after reading whether to update via `B(252)`, this reads `L(7)` directly
-/// rather than using `decode_term_subexp`/`inv_remap_prob`.
+/// `update_mv_prob( prob )` (spec §6.3.17). Reads `B(252)` then `L(7)` directly.
 fn update_mv_prob(r: &mut BoolDecoder, prob: u8) -> u8 {
     if r.read_bool(252) {
-        let mv_prob = r.read_literal(7) as u8;
-        (mv_prob << 1) | 1
+        ((r.read_literal(7) as u8) << 1) | 1
     } else {
         prob
     }
 }
 
-/// `mv_probs()` (spec §6.3.16).
-fn mv_probs(r: &mut BoolDecoder, allow_high_precision_mv: bool, probs: &mut CompressedHeaderProbs) {
-    for prob in probs.mv_joint_probs.iter_mut() {
+fn update_mv_prob_slice(r: &mut BoolDecoder, probs: &mut [u8]) {
+    for prob in probs.iter_mut() {
         *prob = update_mv_prob(r, *prob);
     }
+}
+
+/// `mv_probs()` (spec §6.3.16).
+fn mv_probs(r: &mut BoolDecoder, allow_high_precision_mv: bool, probs: &mut CompressedHeaderProbs) {
+    update_mv_prob_slice(r, &mut probs.mv_joint_probs);
     for i in 0..2 {
         probs.mv_sign_prob[i] = update_mv_prob(r, probs.mv_sign_prob[i]);
-        for j in 0..probs.mv_class_probs[i].len() {
-            probs.mv_class_probs[i][j] = update_mv_prob(r, probs.mv_class_probs[i][j]);
-        }
+        update_mv_prob_slice(r, &mut probs.mv_class_probs[i]);
         probs.mv_class0_bit_prob[i] = update_mv_prob(r, probs.mv_class0_bit_prob[i]);
-        for j in 0..probs.mv_bits_prob[i].len() {
-            probs.mv_bits_prob[i][j] = update_mv_prob(r, probs.mv_bits_prob[i][j]);
-        }
+        update_mv_prob_slice(r, &mut probs.mv_bits_prob[i]);
     }
     for i in 0..2 {
-        for class0_fr in &mut probs.mv_class0_fr_probs[i] {
-            for prob in class0_fr.iter_mut() {
-                *prob = update_mv_prob(r, *prob);
-            }
-        }
-        for prob in probs.mv_fr_probs[i].iter_mut() {
-            *prob = update_mv_prob(r, *prob);
-        }
+        update_mv_prob_slice(r, probs.mv_class0_fr_probs[i].as_flattened_mut());
+        update_mv_prob_slice(r, &mut probs.mv_fr_probs[i]);
     }
     if allow_high_precision_mv {
         for i in 0..2 {
@@ -534,25 +479,23 @@ pub fn parse_compressed_header(
         read_tx_mode_probs(&mut r, &mut probs.tx_probs);
     }
     read_coef_probs(&mut r, tx_mode, &mut probs.coef_probs);
-    read_skip_prob(&mut r, &mut probs.skip_prob);
+    diff_update_prob_slice(&mut r, &mut probs.skip_prob);
 
     let mut reference_mode = SINGLE_REFERENCE;
     let mut comp_fixed_ref = 0u8;
     let mut comp_var_ref = [0u8; 2];
 
     if !header.frame_is_intra {
-        read_inter_mode_probs(&mut r, &mut probs.inter_mode_probs);
+        diff_update_prob_slice(&mut r, probs.inter_mode_probs.as_flattened_mut());
         if header.interpolation_filter == SWITCHABLE {
-            read_interp_filter_probs(&mut r, &mut probs.interp_filter_probs);
+            diff_update_prob_slice(&mut r, probs.interp_filter_probs.as_flattened_mut());
         }
-        read_is_inter_probs(&mut r, &mut probs.is_inter_prob);
-        let (rm, cfr, cvr) = frame_reference_mode(&mut r, &header.ref_frame_sign_bias);
-        reference_mode = rm;
-        comp_fixed_ref = cfr;
-        comp_var_ref = cvr;
+        diff_update_prob_slice(&mut r, &mut probs.is_inter_prob);
+        (reference_mode, comp_fixed_ref, comp_var_ref) =
+            frame_reference_mode(&mut r, &header.ref_frame_sign_bias);
         frame_reference_mode_probs(&mut r, reference_mode, &mut probs);
-        read_y_mode_probs(&mut r, &mut probs.y_mode_probs);
-        read_partition_probs(&mut r, &mut probs.partition_probs);
+        diff_update_prob_slice(&mut r, probs.y_mode_probs.as_flattened_mut());
+        diff_update_prob_slice(&mut r, probs.partition_probs.as_flattened_mut());
         mv_probs(&mut r, header.allow_high_precision_mv, &mut probs);
     }
 
