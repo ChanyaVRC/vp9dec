@@ -462,56 +462,38 @@ pub unsafe fn reconstruct_add_const_avx2(
     debug_assert!((start_y + n0 - 1) * plane_width + start_x + n0 <= plane_data.len());
 
     let base = plane_data.as_mut_ptr();
-    match n0 {
-        4 => {
-            let zero = _mm_setzero_si128();
-            let max_v = _mm_set1_epi16(max_val);
-            let d = _mm_set1_epi16(delta);
-            for i in 0..4 {
-                let row = base.add((start_y + i) * plane_width + start_x);
-                let pred = _mm_loadl_epi64(row as *const __m128i);
-                let clipped = _mm_min_epi16(_mm_max_epi16(_mm_add_epi16(pred, d), zero), max_v);
+    if n0 <= 8 {
+        let zero = _mm_setzero_si128();
+        let max_v = _mm_set1_epi16(max_val);
+        let d = _mm_set1_epi16(delta);
+        for i in 0..n0 {
+            let row = base.add((start_y + i) * plane_width + start_x);
+            let pred = if n0 == 4 {
+                _mm_loadl_epi64(row as *const __m128i)
+            } else {
+                _mm_loadu_si128(row as *const __m128i)
+            };
+            let clipped = _mm_min_epi16(_mm_max_epi16(_mm_add_epi16(pred, d), zero), max_v);
+            if n0 == 4 {
                 _mm_storel_epi64(row as *mut __m128i, clipped);
-            }
-        }
-        8 => {
-            let zero = _mm_setzero_si128();
-            let max_v = _mm_set1_epi16(max_val);
-            let d = _mm_set1_epi16(delta);
-            for i in 0..8 {
-                let row = base.add((start_y + i) * plane_width + start_x);
-                let pred = _mm_loadu_si128(row as *const __m128i);
-                let clipped = _mm_min_epi16(_mm_max_epi16(_mm_add_epi16(pred, d), zero), max_v);
+            } else {
                 _mm_storeu_si128(row as *mut __m128i, clipped);
             }
         }
-        16 => {
-            let zero = _mm256_setzero_si256();
-            let max_v = _mm256_set1_epi16(max_val);
-            let d = _mm256_set1_epi16(delta);
-            for i in 0..16 {
-                let row = base.add((start_y + i) * plane_width + start_x);
-                let pred = _mm256_loadu_si256(row as *const __m256i);
-                let clipped =
-                    _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(pred, d), zero), max_v);
-                _mm256_storeu_si256(row as *mut __m256i, clipped);
+    } else {
+        let zero = _mm256_setzero_si256();
+        let max_v = _mm256_set1_epi16(max_val);
+        let d = _mm256_set1_epi16(delta);
+        for i in 0..n0 {
+            let row = base.add((start_y + i) * plane_width + start_x);
+            let mut j = 0usize;
+            while j < n0 {
+                let p = _mm256_loadu_si256(row.add(j) as *const __m256i);
+                let c = _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(p, d), zero), max_v);
+                _mm256_storeu_si256(row.add(j) as *mut __m256i, c);
+                j += 16;
             }
         }
-        32 => {
-            let zero = _mm256_setzero_si256();
-            let max_v = _mm256_set1_epi16(max_val);
-            let d = _mm256_set1_epi16(delta);
-            for i in 0..32 {
-                let row = base.add((start_y + i) * plane_width + start_x);
-                let p0 = _mm256_loadu_si256(row as *const __m256i);
-                let p1 = _mm256_loadu_si256(row.add(16) as *const __m256i);
-                let c0 = _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(p0, d), zero), max_v);
-                let c1 = _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(p1, d), zero), max_v);
-                _mm256_storeu_si256(row as *mut __m256i, c0);
-                _mm256_storeu_si256(row.add(16) as *mut __m256i, c1);
-            }
-        }
-        _ => unreachable!(),
     }
 }
 
