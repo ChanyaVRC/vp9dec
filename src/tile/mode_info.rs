@@ -87,7 +87,7 @@ impl TileDecoder {
     /// `get_segment_id( )` (spec §6.4.14). The predicted segment id is the
     /// smallest value found in the on-screen region of `PrevSegmentIds`
     /// covered by the current block.
-    fn get_segment_id(&self, row: u32, col: u32, mi_size: u8) -> u8 {
+    fn get_segment_id(&self, row: u32, col: u32, mi_size: u8) -> Result<u8, TileError> {
         let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
         let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
         let xmis = (self.mi_cols - col).min(bw);
@@ -96,24 +96,34 @@ impl TileDecoder {
         for y in 0..ymis {
             for x in 0..xmis {
                 let idx = ((row + y) * self.mi_cols + (col + x)) as usize;
-                seg = seg.min(self.prev_segment_ids[idx]);
+                let prev = *self
+                    .prev_segment_ids
+                    .get(idx)
+                    .ok_or(TileError::CorruptTile)?;
+                seg = seg.min(prev);
             }
         }
-        seg
+        Ok(seg)
     }
 
     /// `inter_segment_id( )` (spec §6.4.12). Used for blocks in an inter frame
     /// (`!FrameIsIntra`), whether or not the individual block itself is inter-coded.
-    fn inter_segment_id(&mut self, r: &mut BoolDecoder, row: u32, col: u32, mi_size: u8) -> u8 {
+    fn inter_segment_id(
+        &mut self,
+        r: &mut BoolDecoder,
+        row: u32,
+        col: u32,
+        mi_size: u8,
+    ) -> Result<u8, TileError> {
         if !self.segmentation.enabled {
-            return 0;
+            return Ok(0);
         }
-        let predicted_segment_id = self.get_segment_id(row, col, mi_size);
+        let predicted_segment_id = self.get_segment_id(row, col, mi_size)?;
         if !self.segmentation.update_map {
-            return predicted_segment_id;
+            return Ok(predicted_segment_id);
         }
         if !self.segmentation.temporal_update {
-            return r.read_tree(&SEGMENT_TREE, |node| self.segmentation.tree_probs[node]) as u8;
+            return Ok(r.read_tree(&SEGMENT_TREE, |node| self.segmentation.tree_probs[node]) as u8);
         }
 
         let ctx = (self.left_seg_pred_context[(row % 8) as usize]
@@ -133,7 +143,7 @@ impl TileDecoder {
         for i in 0..bh {
             self.left_seg_pred_context[((row + i) % 8) as usize] = seg_id_predicted as u8;
         }
-        segment_id
+        Ok(segment_id)
     }
 
     /// `read_skip( )` (spec §6.4.8).
@@ -150,10 +160,12 @@ impl TileDecoder {
             return true;
         }
         let mut ctx = 0usize;
-        if avail_u && self.mi_grid.get(row - 1, col).skip() {
+        // SAFETY: `avail_u` guarantees `row > 0` and `(row - 1, col)` is in this tile/strip;
+        // `avail_l` guarantees `col > self.mi_col_start` and `(row, col - 1)` is in this strip.
+        if avail_u && unsafe { self.mi_grid.get_unchecked(row - 1, col) }.skip() {
             ctx += 1;
         }
-        if avail_l && self.mi_grid.get(row, col - 1).skip() {
+        if avail_l && unsafe { self.mi_grid.get_unchecked(row, col - 1) }.skip() {
             ctx += 1;
         }
         let skip = r.read_bool(self.probs.skip_prob[ctx]);
@@ -179,13 +191,15 @@ impl TileDecoder {
             let mut above = max_tx_size;
             let mut left = max_tx_size;
             if avail_u {
-                let n = self.mi_grid.get(row - 1, col);
+                // SAFETY: `avail_u` guarantees `row > 0` and `(row - 1, col)` is in strip bounds.
+                let n = unsafe { self.mi_grid.get_unchecked(row - 1, col) };
                 if !n.skip() {
                     above = n.tx_size();
                 }
             }
             if avail_l {
-                let n = self.mi_grid.get(row, col - 1);
+                // SAFETY: `avail_l` guarantees `col > mi_col_start` and `(row, col - 1)` is in strip bounds.
+                let n = unsafe { self.mi_grid.get_unchecked(row, col - 1) };
                 if !n.skip() {
                     left = n.tx_size();
                 }
@@ -228,12 +242,14 @@ impl TileDecoder {
 
         let (y_mode, sub_modes) = if mi_size >= BLOCK_8X8 {
             let above_mode = if avail_u {
-                self.mi_grid.get(row - 1, col).sub_modes()[2]
+                // SAFETY: `avail_u` guarantees `(row - 1, col)` is in strip bounds.
+                unsafe { self.mi_grid.get_unchecked(row - 1, col) }.sub_modes()[2]
             } else {
                 DC_PRED
             };
             let left_mode = if avail_l {
-                self.mi_grid.get(row, col - 1).sub_modes()[1]
+                // SAFETY: `avail_l` guarantees `(row, col - 1)` is in strip bounds.
+                unsafe { self.mi_grid.get_unchecked(row, col - 1) }.sub_modes()[1]
             } else {
                 DC_PRED
             };
@@ -246,14 +262,18 @@ impl TileDecoder {
                 let above_mode = if idy > 0 {
                     sub_modes[idx as usize]
                 } else if avail_u {
-                    self.mi_grid.get(row - 1, col).sub_modes()[(2 + idx) as usize]
+                    // SAFETY: `avail_u` guarantees `(row - 1, col)` is in strip bounds.
+                    unsafe { self.mi_grid.get_unchecked(row - 1, col) }.sub_modes()
+                        [(2 + idx) as usize]
                 } else {
                     DC_PRED
                 };
                 let left_mode = if idx > 0 {
                     sub_modes[(idy * 2) as usize]
                 } else if avail_l {
-                    self.mi_grid.get(row, col - 1).sub_modes()[(1 + idy * 2) as usize]
+                    // SAFETY: `avail_l` guarantees `(row, col - 1)` is in strip bounds.
+                    unsafe { self.mi_grid.get_unchecked(row, col - 1) }.sub_modes()
+                        [(1 + idy * 2) as usize]
                 } else {
                     DC_PRED
                 };
@@ -287,12 +307,14 @@ impl TileDecoder {
         avail_l: bool,
     ) -> Result<(MiInfo, Option<super::BlockMvs>), TileError> {
         let left_ref_frame = if avail_l {
-            self.mi_grid.get(row, col - 1).ref_frame()
+            // SAFETY: `avail_l` guarantees `(row, col - 1)` is in strip bounds.
+            unsafe { self.mi_grid.get_unchecked(row, col - 1) }.ref_frame()
         } else {
             [INTRA_FRAME, REF_NONE]
         };
         let above_ref_frame = if avail_u {
-            self.mi_grid.get(row - 1, col).ref_frame()
+            // SAFETY: `avail_u` guarantees `(row - 1, col)` is in strip bounds.
+            unsafe { self.mi_grid.get_unchecked(row - 1, col) }.ref_frame()
         } else {
             [INTRA_FRAME, REF_NONE]
         };
@@ -307,7 +329,7 @@ impl TileDecoder {
             above_single: above_ref_frame[1] == REF_NONE,
         };
 
-        let segment_id = self.inter_segment_id(r, row, col, mi_size);
+        let segment_id = self.inter_segment_id(r, row, col, mi_size)?;
         let skip = self.read_skip(r, row, col, avail_u, avail_l, segment_id);
         let is_inter = self.read_is_inter(r, &neighbors, segment_id);
         let tx_size = self.read_tx_size(
@@ -440,12 +462,14 @@ impl TileDecoder {
     /// filters disagree".
     fn interp_filter_ctx(&self, row: u32, col: u32, n: &NeighborRefInfo) -> usize {
         let left_interp = if n.avail_l && n.left_ref_frame[0] > INTRA_FRAME {
-            self.mi_grid.get(row, col - 1).interp_filter()
+            // SAFETY: `n.avail_l` guarantees `(row, col - 1)` is in strip bounds.
+            unsafe { self.mi_grid.get_unchecked(row, col - 1) }.interp_filter()
         } else {
             INTERP_FILTER_UNSET
         };
         let above_interp = if n.avail_u && n.above_ref_frame[0] > INTRA_FRAME {
-            self.mi_grid.get(row - 1, col).interp_filter()
+            // SAFETY: `n.avail_u` guarantees `(row - 1, col)` is in strip bounds.
+            unsafe { self.mi_grid.get_unchecked(row - 1, col) }.interp_filter()
         } else {
             INTERP_FILTER_UNSET
         };

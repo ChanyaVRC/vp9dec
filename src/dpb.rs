@@ -63,18 +63,6 @@ impl Dpb {
         self.slots.get(idx as usize)?.clone()
     }
 
-    /// Step 1 of `Reference frame update process` (spec §8.10).
-    /// Stores an `Arc` clone of `data` into every slot whose bit is set in
-    /// `refresh_frame_flags` (the caller builds the frame's pixel data once; this only
-    /// bumps a refcount per slot, not a deep copy).
-    pub fn update(&mut self, refresh_frame_flags: u8, data: &Arc<RefFrameData>) {
-        for (slot, entry) in self.slots.iter_mut().enumerate() {
-            if (refresh_frame_flags >> slot) & 1 == 1 {
-                *entry = Some(data.clone());
-            }
-        }
-    }
-
     /// Maximum superblock-padded `(y_elems, uv_elems)` across all live DPB slots (used to bound
     /// working-plane capacity reuse across spatial SVC layers without retaining stale resizes).
     pub(crate) fn max_sb_plane_elems(&self) -> (usize, usize) {

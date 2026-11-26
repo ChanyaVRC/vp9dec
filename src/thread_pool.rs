@@ -121,9 +121,46 @@ impl ThreadPool {
         }
     }
 
+    /// Ensures at least `needed_workers` persistent worker threads are spawned.
+    ///
+    /// Returns `true` if the pool now has at least `needed_workers` workers, or `false` if OS
+    /// thread creation failed (leaving any previously spawned workers intact and asleep).
+    pub(crate) fn ensure_workers(&mut self, needed_workers: usize) -> bool {
+        self.ensure_workers_with(needed_workers, |shared, worker_id, initial_gen| {
+            thread::Builder::new()
+                .name(format!("vp9dec-worker-{worker_id}"))
+                .spawn(move || worker_loop(shared, worker_id, initial_gen))
+        })
+    }
+
+    fn ensure_workers_with<S>(&mut self, needed_workers: usize, mut spawn: S) -> bool
+    where
+        S: FnMut(Arc<PoolShared>, usize, u64) -> std::io::Result<JoinHandle<()>>,
+    {
+        if self.workers.len() >= needed_workers {
+            return true;
+        }
+        let initial_gen = lock_unpoisoned(&self.shared.state).generation;
+        while self.workers.len() < needed_workers {
+            let worker_id = self.workers.len() + 1;
+            let shared = Arc::clone(&self.shared);
+            match spawn(shared, worker_id, initial_gen) {
+                Ok(handle) => self.workers.push(handle),
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
     /// Executes `f(0), f(1), ..., f(n_tasks - 1)` in parallel: task `0` runs on the calling
     /// thread and tasks `1..n_tasks` run on persistent worker threads. Blocks until all tasks
     /// finish (including on panic, propagating the first panic once all workers settle).
+    ///
+    /// If spawning worker threads fails (e.g. container thread limit), falls back gracefully to
+    /// running `f(0..n_tasks)` sequentially on the calling thread instead of panicking. Callers
+    /// whose tasks synchronize with one another (such as the loop-filter wavefront) should call
+    /// [`Self::ensure_workers`] first and fall back to a sequential algorithm when it returns
+    /// `false`.
     pub(crate) fn parallel_for<F>(&mut self, n_tasks: usize, f: F)
     where
         F: Fn(usize) + Sync,
@@ -143,17 +180,11 @@ impl ThreadPool {
         }
 
         let needed_workers = n_tasks - 1;
-        if self.workers.len() < needed_workers {
-            let initial_gen = lock_unpoisoned(&self.shared.state).generation;
-            while self.workers.len() < needed_workers {
-                let worker_id = self.workers.len() + 1;
-                let shared = Arc::clone(&self.shared);
-                let handle = thread::Builder::new()
-                    .name(format!("vp9dec-worker-{worker_id}"))
-                    .spawn(move || worker_loop(shared, worker_id, initial_gen))
-                    .expect("failed to spawn vp9dec worker thread");
-                self.workers.push(handle);
+        if !self.ensure_workers(needed_workers) {
+            for i in 0..n_tasks {
+                f(i);
             }
+            return;
         }
 
         // Publish the new generation under `state` lock before waking workers.
@@ -304,5 +335,33 @@ mod tests {
             sum.fetch_add(i + 1, Ordering::Relaxed);
         });
         assert_eq!(sum.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn ensure_workers_returns_false_on_spawn_error_and_stays_usable() {
+        let mut pool = ThreadPool::new();
+        // Simulate OS refusing thread creation after spawning 1 worker.
+        let mut attempts = 0usize;
+        let ok = pool.ensure_workers_with(3, |shared, worker_id, initial_gen| {
+            attempts += 1;
+            if attempts == 1 {
+                std::thread::Builder::new()
+                    .spawn(move || super::worker_loop(shared, worker_id, initial_gen))
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "simulated thread limit",
+                ))
+            }
+        });
+        assert!(!ok);
+        assert_eq!(pool.workers.len(), 1);
+
+        // Pool stays completely usable for tasks fitting existing workers and for later growth.
+        let sum = AtomicUsize::new(0);
+        pool.parallel_for(2, |i| {
+            sum.fetch_add(i + 1, Ordering::Relaxed);
+        });
+        assert_eq!(sum.load(Ordering::Relaxed), 3);
     }
 }

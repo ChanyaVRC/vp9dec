@@ -70,11 +70,30 @@ fn get_segment_id_takes_min_over_block_region() {
         Arc::new(prev_segment_ids),
     );
     // BLOCK_32X32 at (0,0) covers the whole 4x4 region -> min is 1.
-    assert_eq!(decoder.get_segment_id(0, 0, BLOCK_32X32), 1);
+    assert_eq!(decoder.get_segment_id(0, 0, BLOCK_32X32), Ok(1));
     // BLOCK_8X8 at (1,1) covers only PrevSegmentIds[1][1] = 1.
-    assert_eq!(decoder.get_segment_id(1, 1, BLOCK_8X8), 1);
+    assert_eq!(decoder.get_segment_id(1, 1, BLOCK_8X8), Ok(1));
     // BLOCK_8X8 at (0,0) covers only PrevSegmentIds[0][0] = 3.
-    assert_eq!(decoder.get_segment_id(0, 0, BLOCK_8X8), 3);
+    assert_eq!(decoder.get_segment_id(0, 0, BLOCK_8X8), Ok(3));
+}
+
+#[test]
+fn get_segment_id_rejects_short_prev_map_without_panicking() {
+    let header = minimal_header(32, 32);
+    let compressed = minimal_compressed_header();
+    let decoder = TileDecoder::new_with_prev(
+        &header,
+        header.color_config.unwrap(),
+        &compressed,
+        false,
+        None,
+        [None, None, None],
+        Arc::new(vec![0u8; 1]),
+    );
+    assert_eq!(
+        decoder.get_segment_id(0, 0, BLOCK_32X32),
+        Err(TileError::CorruptTile)
+    );
 }
 
 /// `inter_segment_id()` (spec §6.4.12): when `seg_id_predicted == 1`, `segment_id` is
@@ -104,7 +123,7 @@ fn inter_segment_id_temporal_prediction_uses_prev_map() {
     let buf = enc.finish();
     let mut r = BoolDecoder::new(&buf).expect("valid bitstream");
 
-    assert_eq!(decoder.inter_segment_id(&mut r, 0, 0, BLOCK_8X8), 6);
+    assert_eq!(decoder.inter_segment_id(&mut r, 0, 0, BLOCK_8X8), Ok(6));
 }
 
 /// `read_skip()` (spec §6.4.8): when `seg_feature_active( SEG_LVL_SKIP )`, `skip` is

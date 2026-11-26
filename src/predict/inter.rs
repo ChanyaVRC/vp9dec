@@ -410,7 +410,8 @@ fn block_inter_predict_into_plane(
     );
     let local_x = dst_x - dst.x0;
     for i in 0..h {
-        let dst_row = &mut dst.row_mut(dst_y + i)[local_x..local_x + w];
+        // SAFETY: `dst_y + i < dst_y + h <= dst.height` (checked by debug_assert above).
+        let dst_row = &mut unsafe { dst.row_mut_unchecked(dst_y + i) }[local_x..local_x + w];
         let src_row = &pred[i * w..(i + 1) * w];
         if compound {
             for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {

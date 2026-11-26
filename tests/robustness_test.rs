@@ -19,7 +19,8 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use vp9dec::ivf::IvfReader;
-use vp9dec::Decoder;
+use vp9dec::test_support::BitWriter;
+use vp9dec::{BoolCoderError, DecodeError, Decoder, DecoderLimits, HeaderError, TileError};
 
 /// Source location (`file:line:col`) of the most recent panic, recorded by the fuzz's panic hook
 /// -- a caught panic payload carries only the message, not the location that pinpoints the fix.
@@ -262,5 +263,339 @@ fn malformed_input_never_panics() {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+// =========================================================================
+// Targeted regression tests for stateful error recovery, DPB edge cases,
+// trailing zero padding, and resource limits (Fable review V-1..V-6).
+// =========================================================================
+
+fn write_header_tail(
+    w: &mut BitWriter,
+    width: u32,
+    seg_enabled_no_update: bool,
+    tile_cols_log2: u32,
+    comp_len: usize,
+) {
+    // loop_filter_params (level=0, sharpness=0, delta_enabled=0)
+    w.push_bits(0, 6);
+    w.push_bits(0, 3);
+    w.push_flag(false);
+    // quantization_params (base_q_idx=60, no deltas)
+    w.push_bits(60, 8);
+    w.push_flag(false);
+    w.push_flag(false);
+    w.push_flag(false);
+    // segmentation_params
+    if seg_enabled_no_update {
+        w.push_flag(true); // enabled
+        w.push_flag(false); // update_map = 0
+        w.push_flag(false); // update_data = 0
+    } else {
+        w.push_flag(false);
+    }
+    // tile_info
+    let sb64_cols = width.div_ceil(64);
+    let mut min_log2 = 0u32;
+    while (64u32 << min_log2) < sb64_cols {
+        min_log2 += 1;
+    }
+    let mut max_log2 = 1u32;
+    while (sb64_cols >> max_log2) >= 4 {
+        max_log2 += 1;
+    }
+    max_log2 -= 1;
+    assert!((min_log2..=max_log2).contains(&tile_cols_log2));
+    for _ in min_log2..tile_cols_log2 {
+        w.push_flag(true);
+    }
+    if tile_cols_log2 < max_log2 {
+        w.push_flag(false);
+    }
+    w.push_flag(false); // tile_rows_log2 = 0
+    w.push_bits(comp_len as u32, 16);
+}
+
+fn synth_keyframe(width: u32, height: u32, tile_cols_log2: u32, tile: &[u8]) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.push_bits(2, 2); // frame_marker
+    w.push_bits(0, 2); // profile 0
+    w.push_flag(false); // show_existing_frame
+    w.push_bits(0, 1); // KEY_FRAME
+    w.push_flag(true); // show_frame
+    w.push_flag(false); // error_resilient_mode
+    w.push_bits(0x49, 8);
+    w.push_bits(0x83, 8);
+    w.push_bits(0x42, 8);
+    w.push_bits(1, 3); // CS_BT_601
+    w.push_flag(false); // color_range
+    w.push_bits(width - 1, 16);
+    w.push_bits(height - 1, 16);
+    w.push_flag(false); // render_size
+    w.push_flag(false); // refresh_frame_context
+    w.push_flag(true); // frame_parallel_decoding_mode
+    w.push_bits(0, 2); // frame_context_idx
+    let comp = [0u8];
+    write_header_tail(&mut w, width, false, tile_cols_log2, comp.len());
+    let mut out = w.finish();
+    out.extend_from_slice(&comp);
+    out.extend_from_slice(tile);
+    out
+}
+
+fn synth_inter_frame(
+    size: Option<(u32, u32)>,
+    seg_enabled_no_update: bool,
+    comp: &[u8],
+    tile: &[u8],
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.push_bits(2, 2); // frame_marker
+    w.push_bits(0, 2); // profile 0
+    w.push_flag(false); // show_existing_frame
+    w.push_bits(1, 1); // NON_KEY_FRAME
+    w.push_flag(true); // show_frame
+    w.push_flag(false); // error_resilient_mode
+    w.push_bits(0, 2); // reset_frame_context
+    w.push_bits(0xFF, 8); // refresh_frame_flags
+    for _ in 0..3 {
+        w.push_bits(0, 3); // ref_frame_idx = 0
+        w.push_flag(false); // sign_bias
+    }
+    let width = match size {
+        None => {
+            w.push_flag(true); // found_ref = 1 on ref_frame_idx[0]
+            64
+        }
+        Some((wd, ht)) => {
+            w.push_flag(false);
+            w.push_flag(false);
+            w.push_flag(false);
+            w.push_bits(wd - 1, 16);
+            w.push_bits(ht - 1, 16);
+            wd
+        }
+    };
+    w.push_flag(false); // render_size
+    w.push_flag(false); // allow_high_precision_mv
+    w.push_flag(true); // is_filter_switchable
+    w.push_flag(false); // refresh_frame_context
+    w.push_flag(true); // frame_parallel_decoding_mode
+    w.push_bits(0, 2); // frame_context_idx
+    write_header_tail(&mut w, width, seg_enabled_no_update, 0, comp.len());
+    let mut out = w.finish();
+    out.extend_from_slice(comp);
+    out.extend_from_slice(tile);
+    out
+}
+
+fn synth_profile1_444_intra_only(width: u32, height: u32, comp: &[u8], tile: &[u8]) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.push_bits(2, 2); // frame_marker
+    w.push_bits(1, 1); // profile_low_bit = 1
+    w.push_bits(0, 1); // profile_high_bit = 0 -> profile 1
+    w.push_flag(false); // show_existing_frame
+    w.push_bits(1, 1); // NON_KEY_FRAME
+    w.push_flag(false); // show_frame = 0 (required for intra_only)
+    w.push_flag(false); // error_resilient_mode
+    w.push_flag(true); // intra_only = 1
+    w.push_bits(0, 2); // reset_frame_context
+    w.push_bits(0x49, 8);
+    w.push_bits(0x83, 8);
+    w.push_bits(0x42, 8);
+    w.push_bits(1, 3); // CS_BT_601
+    w.push_flag(false); // color_range
+    w.push_bits(0, 1); // subsampling_x = 0 (4:4:4)
+    w.push_bits(0, 1); // subsampling_y = 0 (4:4:4)
+    w.push_bits(0, 1); // reserved_zero
+    w.push_bits(0x00, 8); // refresh_frame_flags
+    w.push_bits(width - 1, 16);
+    w.push_bits(height - 1, 16);
+    w.push_flag(false); // render_size
+    w.push_flag(false); // refresh_frame_context
+    w.push_flag(true); // frame_parallel_decoding_mode
+    w.push_bits(0, 2); // frame_context_idx
+    write_header_tail(&mut w, width, false, 0, comp.len());
+    let mut out = w.finish();
+    out.extend_from_slice(comp);
+    out.extend_from_slice(tile);
+    out
+}
+
+fn minimal_valid_64x64_zero_tile_len() -> usize {
+    for n in 1..600 {
+        let mut d = Decoder::new();
+        if d.decode_frame(&synth_keyframe(64, 64, 0, &vec![0u8; n]))
+            .is_ok()
+        {
+            return n;
+        }
+    }
+    panic!("no valid all-zero tile size found for 64x64 keyframe");
+}
+
+#[test]
+fn prev_segment_ids_stays_consistent_after_failed_resized_frame() {
+    // Regression test for V-1:
+    // Frame A: 64x64 keyframe (Ok)
+    // Frame B: 8x8 inter frame failing in compressed header (and a second variant failing in tile)
+    // Frame C: 64x64 inter frame with segmentation enabled, update_map=0 (must not panic)
+    let tile_len = minimal_valid_64x64_zero_tile_len();
+    let kf = synth_keyframe(64, 64, 0, &vec![0u8; tile_len]);
+    let seg_inter = synth_inter_frame(None, true, &[0], &vec![0u8; tile_len]);
+
+    // Variant 1: Frame B fails at compressed header marker bit.
+    let mut d = Decoder::new();
+    d.decode_frame(&kf).expect("frame A (64x64 keyframe)");
+    let bad_ch = synth_inter_frame(Some((8, 8)), false, &[0x80], &[0]);
+    assert!(matches!(
+        d.decode_frame(&bad_ch),
+        Err(DecodeError::CompressedHeader(_))
+    ));
+    let _ = d.decode_frame(&seg_inter);
+
+    // Variant 2: Frame B passes compressed header and fails in tile decode.
+    let mut d2 = Decoder::new();
+    d2.decode_frame(&kf).expect("frame A (64x64 keyframe)");
+    let bad_tile = synth_inter_frame(Some((8, 8)), false, &[0], &[0x80]);
+    assert!(matches!(
+        d2.decode_frame(&bad_tile),
+        Err(DecodeError::Tile(_))
+    ));
+    let _ = d2.decode_frame(&seg_inter);
+}
+
+#[test]
+fn empty_dpb_found_ref_and_zero_slot_inter_never_panic() {
+    // Regression test for V-2:
+    // (a) Inter frame with found_ref=1 on an empty DPB must return Err (never Ok 0x0 frame).
+    let mut d = Decoder::new();
+    let empty_found_ref = synth_inter_frame(None, false, &[0], &[0]);
+    assert_eq!(
+        d.decode_frame(&empty_found_ref),
+        Err(DecodeError::Header(HeaderError::InvalidFrameSize))
+    );
+
+    // (b) Subsequent 64x64 inter frame referencing unwritten DPB slots must return Err cleanly
+    // in both AVX2 SIMD and VP9DEC_NO_SIMD=1 scalar paths (never panic in clamp).
+    let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
+    for _ in 0..40 {
+        let mut tile: Vec<u8> = (0..200).map(|_| (rng.next_u64() >> 24) as u8).collect();
+        tile[0] &= 0x7F;
+        let inter = synth_inter_frame(Some((64, 64)), false, &[0], &tile);
+        let res = d.decode_frame(&inter);
+        assert!(res.is_err(), "inter frame with empty DPB must fail cleanly");
+    }
+}
+
+#[test]
+fn trailing_zero_padding_accepted_and_nonzero_garbage_rejected() {
+    // Regression test for V-4: spec §9.2.3 permits arbitrary trailing zero padding, while
+    // non-zero trailing garbage past TILE_UNDER_READ_LIMIT_BITS must still return CorruptTile.
+    let n = minimal_valid_64x64_zero_tile_len();
+    let baseline = Decoder::new()
+        .decode_frame(&synth_keyframe(64, 64, 0, &vec![0u8; n]))
+        .expect("baseline keyframe must decode");
+
+    for extra in [64usize, 129, 200, 1000] {
+        let padded = Decoder::new()
+            .decode_frame(&synth_keyframe(64, 64, 0, &vec![0u8; n + extra]))
+            .unwrap_or_else(|e| panic!("+{extra} trailing zero bytes should decode, got {e:?}"));
+        assert_eq!(padded, baseline, "+{extra} trailing zeros changed output");
+    }
+
+    // Trailing non-zero garbage > 1024 bits must be rejected as CorruptTile.
+    let mut garbage = vec![0u8; n + 200];
+    garbage[n + 199] = 0x01;
+    assert_eq!(
+        Decoder::new().decode_frame(&synth_keyframe(64, 64, 0, &garbage)),
+        Err(DecodeError::Tile(TileError::CorruptTile))
+    );
+}
+
+#[test]
+fn decoder_limits_and_pre_allocation_tile_checks() {
+    // Regression test for V-5: custom limits and cheap pre-allocation rejections.
+    let n = minimal_valid_64x64_zero_tile_len();
+    let kf_64 = synth_keyframe(64, 64, 0, &vec![0u8; n]);
+
+    let limits = DecoderLimits {
+        max_luma_samples: 64 * 64,
+        max_width: 64,
+        max_height: 64,
+    };
+    let mut d = Decoder::with_limits(limits);
+    d.decode_frame(&kf_64)
+        .expect("64x64 fits within 64x64 limits");
+
+    // Exceeds max_width.
+    assert_eq!(
+        d.decode_frame(&synth_keyframe(128, 64, 0, &[0])),
+        Err(DecodeError::Header(HeaderError::FrameSizeTooLarge))
+    );
+    // Exceeds max_height.
+    assert_eq!(
+        d.decode_frame(&synth_keyframe(64, 128, 0, &[0])),
+        Err(DecodeError::Header(HeaderError::FrameSizeTooLarge))
+    );
+    // Exceeds max_luma_samples with unbounded per-axis dimensions.
+    let mut d_samples = Decoder::with_limits(DecoderLimits {
+        max_luma_samples: 64 * 64,
+        ..DecoderLimits::default()
+    });
+    assert_eq!(
+        d_samples.decode_frame(&synth_keyframe(128, 64, 0, &[0])),
+        Err(DecodeError::Header(HeaderError::FrameSizeTooLarge))
+    );
+
+    // Pre-allocation tile layout rejections on a large 4096x2048 header:
+    let mut d_big = Decoder::new();
+    // Empty single-tile payload.
+    assert_eq!(
+        d_big.decode_frame(&synth_keyframe(4096, 2048, 0, &[])),
+        Err(DecodeError::Tile(TileError::BoolCoder(
+            BoolCoderError::EmptyBuffer
+        )))
+    );
+    // Bad marker bit on single-tile payload.
+    assert_eq!(
+        d_big.decode_frame(&synth_keyframe(4096, 2048, 0, &[0x80])),
+        Err(DecodeError::Tile(TileError::BoolCoder(
+            BoolCoderError::InvalidMarker
+        )))
+    );
+    // 4-tile header (tile_cols_log2=2) with fewer bytes than the 3x4-byte size headers + 4 tiles.
+    assert_eq!(
+        d_big.decode_frame(&synth_keyframe(4096, 2048, 2, &[0u8; 5])),
+        Err(DecodeError::Tile(TileError::InvalidTileSize))
+    );
+    // Valid marker 1-byte truncated tile on a large frame fails fast via periodic over-read check.
+    assert_eq!(
+        d_big.decode_frame(&synth_keyframe(4096, 2048, 0, &[0x00])),
+        Err(DecodeError::Tile(TileError::CorruptTile))
+    );
+}
+
+#[test]
+fn failed_intra_only_does_not_poison_last_color_config() {
+    // Regression test for V-6: a failing profile-1 4:4:4 intra-only frame must not overwrite
+    // `last_color_config` and break subsequent valid profile-0 4:2:0 inter frames.
+    let n = minimal_valid_64x64_zero_tile_len();
+    let mut d = Decoder::new();
+    d.decode_frame(&synth_keyframe(64, 64, 0, &vec![0u8; n]))
+        .expect("initial 4:2:0 keyframe must decode");
+
+    let corrupt_444 = synth_profile1_444_intra_only(64, 64, &[0x80], &[0]);
+    assert!(matches!(
+        d.decode_frame(&corrupt_444),
+        Err(DecodeError::CompressedHeader(_))
+    ));
+
+    // A subsequent 4:2:0 inter frame must NOT fail with RefFrameFormatMismatch.
+    let inter = synth_inter_frame(None, false, &[0], &vec![0u8; n]);
+    assert_ne!(
+        d.decode_frame(&inter),
+        Err(DecodeError::Header(HeaderError::RefFrameFormatMismatch))
     );
 }

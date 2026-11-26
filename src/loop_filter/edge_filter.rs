@@ -19,23 +19,35 @@ pub(super) type LvlLookup = [[[i32; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SE
 /// frame from `(sharpness, bit_depth)` so edge filtering avoids recomputing strength per block.
 pub(super) type StrengthTable = [(i32, i32, i32); 64];
 
-/// Pixel read/write access to one plane for the loop filter. Abstracts over the safe sequential
+/// Pixel read/write access to one plane for the loop filter. Abstracts over the sequential
 /// [`Plane`] path and the raw `PlaneView` path used by the intra-plane wavefront.
 pub(super) trait PlaneAccess {
-    fn lf_get(&self, x: usize, y: usize) -> u16;
-    fn lf_set(&mut self, x: usize, y: usize, v: u16);
+    /// Reads pixel `(x, y)` without release bounds checks.
+    ///
+    /// # Safety
+    /// Caller must ensure `(x, y)` lies inside the plane's bounds and does not race a concurrent
+    /// write on another wavefront worker.
+    unsafe fn lf_get(&self, x: usize, y: usize) -> u16;
+    /// Writes pixel `(x, y)` without release bounds checks.
+    ///
+    /// # Safety
+    /// Caller must ensure `(x, y)` lies inside the plane's bounds and no other wavefront worker
+    /// reads or writes `(x, y)` concurrently.
+    unsafe fn lf_set(&mut self, x: usize, y: usize, v: u16);
     fn lf_base_ptr(&mut self) -> *mut u16;
     fn lf_stride(&self) -> usize;
 }
 
 impl PlaneAccess for Plane {
     #[inline]
-    fn lf_get(&self, x: usize, y: usize) -> u16 {
-        self.get(x, y)
+    unsafe fn lf_get(&self, x: usize, y: usize) -> u16 {
+        // SAFETY: caller upholds `PlaneAccess::lf_get` bounds contract.
+        self.get_unchecked(x, y)
     }
     #[inline]
-    fn lf_set(&mut self, x: usize, y: usize, v: u16) {
-        self.set(x, y, v);
+    unsafe fn lf_set(&mut self, x: usize, y: usize, v: u16) {
+        // SAFETY: caller upholds `PlaneAccess::lf_set` bounds contract.
+        self.set_unchecked(x, y, v);
     }
     #[inline]
     fn lf_base_ptr(&mut self) -> *mut u16 {
@@ -179,14 +191,20 @@ pub(super) fn filter_size_process(
 fn get_off<P: PlaneAccess>(plane: &P, x: usize, y: usize, dx: i64, dy: i64, k: i64) -> i32 {
     let px = (x as i64 + dx * k) as usize;
     let py = (y as i64 + dy * k) as usize;
-    plane.lf_get(px, py) as i32
+    // SAFETY: `superblock_loop_filter` skips `edge_coord == 0`, caps `filter_size` at chroma
+    // boundaries (`filter_size_process`), and operates on superblock-padded planes, so every tap
+    // `p7..q7` stays inside plane bounds and within this worker's synchronized wavefront region.
+    unsafe { plane.lf_get(px, py) as i32 }
 }
 
 #[inline]
 fn set_off<P: PlaneAccess>(plane: &mut P, x: usize, y: usize, dx: i64, dy: i64, k: i64, v: i32) {
     let px = (x as i64 + dx * k) as usize;
     let py = (y as i64 + dy * k) as usize;
-    plane.lf_set(px, py, v as u16);
+    // SAFETY: same plane-bound and wavefront-exclusivity invariant as `get_off`.
+    unsafe {
+        plane.lf_set(px, py, v as u16);
+    }
 }
 
 /// Spec §8.8.5.1 "Filter mask process". Returns `(hevMask, filterMask, flatMask, flatMask2)`.

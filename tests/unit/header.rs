@@ -168,6 +168,15 @@ fn build_minimal_inter_frame_header() -> Vec<u8> {
 }
 
 #[test]
+fn rejects_inter_frame_found_ref_on_empty_dpb_slot() {
+    let data = build_minimal_inter_frame_header();
+    assert_eq!(
+        parse_uncompressed_header(&data, &PersistentState::default()),
+        Err(HeaderError::InvalidFrameSize)
+    );
+}
+
+#[test]
 fn parses_inter_frame_using_ref_frame_size() {
     let data = build_minimal_inter_frame_header();
     let mut prev = PersistentState::default();

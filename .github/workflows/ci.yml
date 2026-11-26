@@ -22,6 +22,8 @@ jobs:
         run: rustup component add rustfmt clippy
       - name: Format check
         run: cargo fmt --all --check
+      - name: Check default features (without test-support)
+        run: cargo check --lib --examples
       # Matches the project's documented lint gate (CLAUDE.md): warnings are surfaced but not
       # denied, so a pre-existing lint doesn't block CI. Tighten to `-- -D warnings` once the
       # tree is warning-clean.
@@ -72,6 +74,13 @@ jobs:
         run: cargo test --release
         env:
           VP9DEC_NO_SIMD: "1"
+      - name: Test robustness/fuzz (release + debug-assertions)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --release --test robustness_test --test structured_fuzz_test
+        env:
+          RUSTFLAGS: "-C debug-assertions=on"
+          VP9DEC_FUZZ_ITERS: "200"
+          VP9DEC_FUZZ_LONG_ITERS: "1000"
 
   test-aarch64:
     name: test / ubuntu-24.04-arm (native aarch64)

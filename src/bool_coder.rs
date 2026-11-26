@@ -218,6 +218,7 @@ impl<'a> BoolDecoder<'a> {
     /// Number of raw bits this decoder has requested past the end of its buffer. Conformant
     /// decodes end with only a small tail of these; a large value means the arithmetic decoder
     /// desynced and ran off the end -- i.e. the tile/header was corrupt.
+    #[inline]
     pub fn over_read_bits(&self) -> usize {
         self.consumed_bits().saturating_sub(self.data.len() * 8)
     }

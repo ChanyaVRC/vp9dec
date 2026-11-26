@@ -54,11 +54,15 @@ pub enum HeaderError {
     /// `color_space == CS_RGB` and `profile_low_bit == 0`
     /// (violates a spec conformance requirement: RGB is not usable in profiles 0 and 2).
     InvalidColorConfigForProfile,
-    /// `FrameWidth * FrameHeight` exceeds [`MAX_FRAME_LUMA_SAMPLES`] -- a resource-limit
-    /// rejection (not a spec constraint: the bitstream's 16-bit dimensions permit up to
-    /// 65536x65536, whose frame buffer cannot be allocated). Guards against a malformed
-    /// header's absurd size aborting the process on the allocation (an out-of-memory DoS).
+    /// `FrameWidth * FrameHeight` exceeds the decoder's configured allocation limits
+    /// (by default `1 << 27` luma samples) -- a resource-limit rejection (not a spec
+    /// constraint: the bitstream's 16-bit dimensions permit up to 65536x65536, whose frame buffer
+    /// cannot be allocated). Guards against a malformed header's absurd size aborting the process
+    /// on the allocation (an out-of-memory DoS).
     FrameSizeTooLarge,
+    /// Frame dimensions are zero (e.g. `frame_size_with_refs` signaled `found_ref = 1` for a DPB
+    /// slot that has never been written).
+    InvalidFrameSize,
     /// An inter frame's reference has a different bit depth or chroma subsampling than the
     /// current frame (spec §8.5.1 / libvpx `valid_ref_frame_img_fmt`: motion compensation
     /// across mismatched sample formats is not permitted). A malformed stream mixing e.g.
@@ -76,6 +80,9 @@ impl fmt::Display for HeaderError {
             }
             HeaderError::FrameSizeTooLarge => {
                 f.write_str("frame dimensions exceed decoder allocation limit")
+            }
+            HeaderError::InvalidFrameSize => {
+                f.write_str("frame dimensions are zero or reference an uninitialized DPB slot")
             }
             HeaderError::RefFrameFormatMismatch => {
                 f.write_str("reference frame bit depth or subsampling does not match current frame")
@@ -419,21 +426,23 @@ fn parse_render_size(r: &mut BitReader, width: u32, height: u32) -> (u32, u32) {
 /// `frame_size_with_refs()` (spec §6.2.5). If `found_ref == 1` for any of the
 /// slots pointed to by `ref_frame_idx`, that slot's size (passed in externally
 /// as `ref_frame_sizes`) is used directly as `FrameWidth`/`FrameHeight`. If
-/// none is found, `frame_size()` is read instead.
+/// none is found, `frame_size()` is read instead. Rejects a `found_ref == 1`
+/// pointing to a never-written `(0, 0)` DPB slot as [`HeaderError::InvalidFrameSize`].
 fn parse_frame_size_with_refs(
     r: &mut BitReader,
     ref_frame_idx: [u8; 3],
     ref_frame_sizes: &[(u32, u32); NUM_REF_FRAMES],
-) -> (u32, u32) {
-    let mut found = None;
+) -> Result<(u32, u32), HeaderError> {
     for &idx in ref_frame_idx.iter() {
-        let found_ref = r.flag();
-        if found_ref {
-            found = Some(ref_frame_sizes[idx as usize]);
-            break;
+        if r.flag() {
+            let (w, h) = ref_frame_sizes[idx as usize];
+            if w == 0 || h == 0 {
+                return Err(HeaderError::InvalidFrameSize);
+            }
+            return Ok((w, h));
         }
     }
-    found.unwrap_or_else(|| parse_frame_size(r))
+    Ok(parse_frame_size(r))
 }
 
 /// `read_interpolation_filter()` (spec §6.2.7).
@@ -775,7 +784,7 @@ pub fn parse_uncompressed_header(
                 ref_frame_idx[i] = r.f(3) as u8;
                 ref_frame_sign_bias[LAST_FRAME as usize + i] = r.flag();
             }
-            let (w, h) = parse_frame_size_with_refs(&mut r, ref_frame_idx, &prev.ref_frame_sizes);
+            let (w, h) = parse_frame_size_with_refs(&mut r, ref_frame_idx, &prev.ref_frame_sizes)?;
             (None, w, h, rff, false)
         }
     };
