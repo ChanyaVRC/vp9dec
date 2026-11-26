@@ -164,7 +164,9 @@ impl TileDecoder {
             let cc = col as i32 + dc;
             if self.is_inside(cr, cc) {
                 different_ref_found = true;
-                let cand = self.mi_grid.get(cr as u32, cc as u32);
+                // SAFETY: `is_inside(cr, cc)` guarantees `0 <= cr < mi_rows` and
+                // `mi_col_start <= cc < mi_col_end`, inside `self.mi_grid`'s strip.
+                let cand = unsafe { self.mi_grid.get_unchecked(cr as u32, cc as u32) };
                 context_counter += MODE_2_COUNTER[cand.y_mode() as usize] as u32;
                 let cand_rf = cand.ref_frame();
                 for (j, &rf) in cand_rf.iter().enumerate() {
@@ -191,8 +193,10 @@ impl TileDecoder {
                 let cc = col as i32 + dc;
                 if self.is_inside(cr, cc) {
                     different_ref_found = true;
+                    // SAFETY: `is_inside(cr, cc)` guarantees `(cr, cc)` is within strip bounds.
+                    let cand = unsafe { self.mi_grid.get_unchecked(cr as u32, cc as u32) };
                     Self::add_same_ref_frame_mv(
-                        self.mi_grid.get(cr as u32, cc as u32),
+                        cand,
                         ref_frame,
                         &mut ref_list_mv,
                         &mut ref_mv_count,
@@ -206,12 +210,10 @@ impl TileDecoder {
 
         if ref_mv_count < 2 {
             if let Some(prev) = self.prev_mi_grid_if_enabled() {
-                Self::add_same_ref_frame_mv(
-                    prev.get(row, col),
-                    ref_frame,
-                    &mut ref_list_mv,
-                    &mut ref_mv_count,
-                );
+                // SAFETY: `use_prev_frame_mvs` requires matching frame dimensions, so
+                // `(row, col)` is within `prev`'s whole-frame grid bounds.
+                let cand = unsafe { prev.get_unchecked(row, col) };
+                Self::add_same_ref_frame_mv(cand, ref_frame, &mut ref_list_mv, &mut ref_mv_count);
             }
         }
 
@@ -220,8 +222,10 @@ impl TileDecoder {
                 let cr = row as i32 + dr;
                 let cc = col as i32 + dc;
                 if self.is_inside(cr, cc) {
+                    // SAFETY: `is_inside(cr, cc)` guarantees `(cr, cc)` is within strip bounds.
+                    let cand = unsafe { self.mi_grid.get_unchecked(cr as u32, cc as u32) };
                     self.add_diff_ref_frame_mv(
-                        self.mi_grid.get(cr as u32, cc as u32),
+                        cand,
                         ref_frame,
                         &mut ref_list_mv,
                         &mut ref_mv_count,
@@ -235,12 +239,9 @@ impl TileDecoder {
 
         if ref_mv_count < 2 {
             if let Some(prev) = self.prev_mi_grid_if_enabled() {
-                self.add_diff_ref_frame_mv(
-                    prev.get(row, col),
-                    ref_frame,
-                    &mut ref_list_mv,
-                    &mut ref_mv_count,
-                );
+                // SAFETY: `use_prev_frame_mvs` guarantees matching dimensions for `prev`.
+                let cand = unsafe { prev.get_unchecked(row, col) };
+                self.add_diff_ref_frame_mv(cand, ref_frame, &mut ref_list_mv, &mut ref_mv_count);
             }
         }
 

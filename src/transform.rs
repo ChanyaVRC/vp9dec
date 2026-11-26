@@ -438,42 +438,21 @@ fn iadst(t: &mut [i64], n: u32) {
     }
 }
 
-/// Spec §8.7.1.2-8.7.1.3: inverse DCT (size 4).
-pub fn idct4(t: &mut [i64; 4]) {
-    idct_permute(&mut t[..], 2);
-    idct(&mut t[..], 2);
-}
-
-/// Spec §8.7.1.2-8.7.1.3: inverse DCT (size 8).
-pub fn idct8(t: &mut [i64; 8]) {
-    idct_permute(&mut t[..], 3);
-    idct(&mut t[..], 3);
-}
-
-/// Spec §8.7.1.2-8.7.1.3: inverse DCT (size 16).
-pub fn idct16(t: &mut [i64; 16]) {
-    idct_permute(&mut t[..], 4);
-    idct(&mut t[..], 4);
-}
-
-/// Spec §8.7.1.2-8.7.1.3: inverse DCT (size 32).
-pub fn idct32(t: &mut [i64; 32]) {
-    idct_permute(&mut t[..], 5);
-    idct(&mut t[..], 5);
-}
-
 /// Spec §8.7.1.4-8.7.1.6: inverse ADST (size 4).
-pub fn iadst4(t: &mut [i64; 4]) {
+#[cfg(test)]
+pub(crate) fn iadst4(t: &mut [i64; 4]) {
     iadst4_impl(&mut t[..]);
 }
 
 /// Spec §8.7.1.4-8.7.1.5, 8.7.1.7: inverse ADST (size 8).
-pub fn iadst8(t: &mut [i64; 8]) {
+#[cfg(test)]
+pub(crate) fn iadst8(t: &mut [i64; 8]) {
     iadst8_impl(&mut t[..]);
 }
 
 /// Spec §8.7.1.4-8.7.1.5, 8.7.1.8: inverse ADST (size 16).
-pub fn iadst16(t: &mut [i64; 16]) {
+#[cfg(test)]
+pub(crate) fn iadst16(t: &mut [i64; 16]) {
     iadst16_impl(&mut t[..]);
 }
 

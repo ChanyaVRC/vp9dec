@@ -208,7 +208,11 @@ skill; change-navigation is the `vp9dec-architecture` skill.
   spec constants.
 - **Memory-compaction invariants (`MiInfo`, `RefPlane`, `BorrowedStrip`).** `MiInfo` is bit-packed
   to 24 bytes (representative `mv` + packed flags + `extra` holding either 4 intra `sub_modes` or
-  a sparse index into `MiGrid::sub_mvs`, which is cleared before archiving `prev_mi_grid`). 8-bit
+  a sparse index into `MiGrid::sub_mvs`). **`MiInfo::extra` sub-8x8 MV indices are only valid
+  during tile decoding within the owning worker**: tile-parallel workers write into their own
+  `sub_mvs` and clear it on detach, leaving `extra` dangling in the parent grid after tile decode
+  finishes (and `clear_sub_mvs` clears it before archiving `prev_mi_grid`, which only reads
+  representative `mv` and `ref_frame`). 8-bit
   DPB reference frames store packed `u8` samples (`RefPlaneData::U8`) widened on the fly during
   motion compensation, while 10/12-bit DPB references keep cropped-in-place `u16` planes. During
   tile-parallel decode, column workers bind non-owning `BorrowedStrip(*mut u16)` / `BorrowedStrip(*mut MiInfo)`

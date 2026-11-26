@@ -46,7 +46,7 @@ use vp9dec::prob_tables::{
     DC_PRED, DEFAULT_SKIP_PROB, H_PRED, INTRA_MODE_TREE, KF_PARTITION_PROBS, KF_UV_MODE_PROBS,
     KF_Y_MODE_PROBS, LAST_FRAME, PARTITION_NONE, PARTITION_TREE, V_PRED,
 };
-use vp9dec::test_support::BoolEncoder;
+use vp9dec::test_support::{BitWriter, BoolEncoder};
 use vp9dec::Decoder;
 
 /// First panic source location in the current caught attempt. Decoder worker threads use the
@@ -677,6 +677,402 @@ fn structure_aware_mutations_never_panic() {
     assert!(
         failures.is_empty(),
         "{} structured fuzz failure(s); first {} shown:\n{}",
+        failures.len(),
+        failures.len().min(25),
+        failures
+            .iter()
+            .take(25)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+// =========================================================================
+// Generative multi-frame sequence fuzzing (V-10): constructs spec-valid
+// uncompressed headers across profiles 0-3, subsamplings, bit depths,
+// segmentation, resolution switches, intra-only, show_existing_frame, and
+// empty-DPB `found_ref`, feeding 2..=8 frames into one `Decoder` and
+// continuing past `Err` to exercise cross-frame error recovery.
+// =========================================================================
+
+fn gen_chance(rng: &mut Rng, num: usize, den: usize) -> bool {
+    rng.below(den) < num
+}
+
+fn gen_color(w: &mut BitWriter, rng: &mut Rng, profile: u32) {
+    if profile >= 2 {
+        w.push_bits(rng.below(2) as u32, 1);
+    }
+    let odd = (profile & 1) == 1;
+    let cs = if odd && gen_chance(rng, 1, 6) {
+        7
+    } else {
+        rng.below(7) as u32
+    };
+    w.push_bits(cs, 3);
+    if cs != 7 {
+        w.push_bits(rng.below(2) as u32, 1);
+        if odd {
+            w.push_bits(rng.below(2) as u32, 1);
+            w.push_bits(rng.below(2) as u32, 1);
+            w.push_bits(0, 1);
+        }
+    } else if odd {
+        w.push_bits(0, 1);
+    }
+}
+
+fn gen_dim(rng: &mut Rng) -> u32 {
+    match rng.below(7) {
+        0 => 1 + rng.below(8) as u32,
+        1 => 1 + rng.below(70) as u32,
+        2 => 60 + rng.below(10) as u32,
+        3 => 128 + rng.below(140) as u32,
+        4 => 256 + rng.below(64) as u32,
+        5 => 64,
+        _ => 128,
+    }
+}
+
+fn gen_frame(
+    rng: &mut Rng,
+    key: bool,
+    zero_tiles: bool,
+    sizes: &mut [(u32, u32); 8],
+    profile: u32,
+    allow_empty_ref: bool,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.push_bits(2, 2);
+    w.push_bits(profile & 1, 1);
+    w.push_bits(profile >> 1, 1);
+    if profile == 3 {
+        w.push_bits(0, 1);
+    }
+    if !key && gen_chance(rng, 1, 20) {
+        w.push_flag(true); // show_existing_frame
+        w.push_bits(rng.below(8) as u32, 3);
+        return w.finish();
+    }
+    w.push_flag(false); // show_existing_frame
+    w.push_bits(u32::from(!key), 1);
+    let show = gen_chance(rng, 3, 4);
+    w.push_flag(show);
+    let er = gen_chance(rng, 1, 4);
+    w.push_flag(er);
+
+    let (wd, ht);
+    let mut intra = key;
+    let rff: u32;
+    if key {
+        w.push_bits(0x49, 8);
+        w.push_bits(0x83, 8);
+        w.push_bits(0x42, 8);
+        gen_color(&mut w, rng, profile);
+        wd = gen_dim(rng);
+        ht = gen_dim(rng);
+        w.push_bits(wd - 1, 16);
+        w.push_bits(ht - 1, 16);
+        rff = 0xFF;
+    } else {
+        let io = if !show {
+            let b = gen_chance(rng, 1, 3);
+            w.push_flag(b);
+            b
+        } else {
+            false
+        };
+        if !er {
+            w.push_bits(rng.below(4) as u32, 2);
+        }
+        rff = if gen_chance(rng, 1, 2) {
+            rng.below(256) as u32
+        } else {
+            0xFF
+        };
+        if io {
+            intra = true;
+            w.push_bits(0x49, 8);
+            w.push_bits(0x83, 8);
+            w.push_bits(0x42, 8);
+            if profile > 0 {
+                gen_color(&mut w, rng, profile);
+            }
+            w.push_bits(rff, 8);
+            wd = gen_dim(rng);
+            ht = gen_dim(rng);
+            w.push_bits(wd - 1, 16);
+            w.push_bits(ht - 1, 16);
+        } else {
+            w.push_bits(rff, 8);
+            let mut idx = [0usize; 3];
+            for slot in &mut idx {
+                *slot = rng.below(8);
+                w.push_bits(*slot as u32, 3);
+                w.push_flag(gen_chance(rng, 1, 2));
+            }
+            let mut got = None;
+            for slot in idx {
+                let s = sizes[slot];
+                let b = gen_chance(rng, 1, 3) && (allow_empty_ref || s.0 != 0);
+                w.push_flag(b);
+                if b {
+                    got = Some(s);
+                    break;
+                }
+            }
+            match got {
+                Some(s) => {
+                    (wd, ht) = s;
+                }
+                None => {
+                    wd = gen_dim(rng);
+                    ht = gen_dim(rng);
+                    w.push_bits(wd - 1, 16);
+                    w.push_bits(ht - 1, 16);
+                }
+            }
+        }
+    }
+    w.push_flag(false); // render_size
+    if !intra {
+        w.push_flag(gen_chance(rng, 1, 2));
+        if gen_chance(rng, 1, 2) {
+            w.push_flag(true);
+        } else {
+            w.push_flag(false);
+            w.push_bits(rng.below(4) as u32, 2);
+        }
+    }
+    if !er {
+        w.push_flag(gen_chance(rng, 1, 2));
+        w.push_flag(gen_chance(rng, 1, 2));
+    }
+    w.push_bits(rng.below(4) as u32, 2);
+    w.push_bits(
+        if gen_chance(rng, 1, 4) {
+            0
+        } else {
+            rng.below(64) as u32
+        },
+        6,
+    );
+    w.push_bits(rng.below(8) as u32, 3);
+    let de = gen_chance(rng, 1, 2);
+    w.push_flag(de);
+    if de && gen_chance(rng, 1, 2) {
+        w.push_flag(true);
+        for _ in 0..6 {
+            let b = gen_chance(rng, 1, 2);
+            w.push_flag(b);
+            if b {
+                w.push_bits(rng.below(64) as u32, 6);
+                w.push_flag(gen_chance(rng, 1, 2));
+            }
+        }
+    } else if de {
+        w.push_flag(false);
+    }
+    w.push_bits(
+        if gen_chance(rng, 1, 8) {
+            0
+        } else {
+            rng.below(256) as u32
+        },
+        8,
+    );
+    for _ in 0..3 {
+        let b = gen_chance(rng, 1, 4);
+        w.push_flag(b);
+        if b {
+            w.push_bits(rng.below(16) as u32, 4);
+            w.push_flag(gen_chance(rng, 1, 2));
+        }
+    }
+    let seg = gen_chance(rng, 1, 2);
+    w.push_flag(seg);
+    if seg {
+        let um = gen_chance(rng, 1, 2);
+        w.push_flag(um);
+        if um {
+            for _ in 0..7 {
+                let b = gen_chance(rng, 1, 2);
+                w.push_flag(b);
+                if b {
+                    w.push_bits(rng.below(256) as u32, 8);
+                }
+            }
+            let temporal = gen_chance(rng, 1, 2);
+            w.push_flag(temporal);
+            if temporal {
+                for _ in 0..3 {
+                    let b = gen_chance(rng, 1, 2);
+                    w.push_flag(b);
+                    if b {
+                        w.push_bits(rng.below(256) as u32, 8);
+                    }
+                }
+            }
+        }
+        let ud = gen_chance(rng, 1, 2);
+        w.push_flag(ud);
+        if ud {
+            w.push_flag(gen_chance(rng, 1, 2));
+            for _ in 0..8 {
+                for (lvl, bits) in [8u32, 6, 2, 0].into_iter().enumerate() {
+                    let b = gen_chance(rng, 1, 3);
+                    w.push_flag(b);
+                    if b {
+                        if bits > 0 {
+                            w.push_bits(rng.below(1 << bits) as u32, bits);
+                        }
+                        if lvl < 2 {
+                            w.push_flag(gen_chance(rng, 1, 2));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let sb = wd.div_ceil(64);
+    let mut minl = 0u32;
+    while (64u32 << minl) < sb {
+        minl += 1;
+    }
+    let mut maxl = 1u32;
+    while (sb >> maxl) >= 4 {
+        maxl += 1;
+    }
+    maxl -= 1;
+    let mut cl = minl;
+    while cl < maxl {
+        let b = gen_chance(rng, 2, 3);
+        w.push_flag(b);
+        if b {
+            cl += 1;
+        } else {
+            break;
+        }
+    }
+    let mut rl = rng.below(2) as u32;
+    w.push_bits(rl, 1);
+    if rl == 1 {
+        let b = rng.below(2) as u32;
+        w.push_bits(b, 1);
+        rl += b;
+    }
+    let comp_len = 1 + rng.below(24);
+    w.push_bits(comp_len as u32, 16);
+    let mut v = w.finish();
+    let bad_comp = gen_chance(rng, 1, 8);
+    for i in 0..comp_len {
+        let b = if zero_tiles { 0 } else { rng.next_u64() as u8 };
+        v.push(if i == 0 {
+            if bad_comp {
+                b | 0x80
+            } else {
+                b & 0x7F
+            }
+        } else {
+            b
+        });
+    }
+    let n_tiles = (1usize << cl) * (1usize << rl);
+    for t in 0..n_tiles {
+        let len = if zero_tiles {
+            1 + rng.below(6)
+        } else {
+            1 + rng.below(256)
+        };
+        if t + 1 != n_tiles {
+            v.extend_from_slice(&(len as u32).to_be_bytes());
+        }
+        let style = rng.below(4);
+        for i in 0..len {
+            let b = if zero_tiles || style == 0 {
+                0
+            } else if style == 1 {
+                0xFF
+            } else {
+                rng.next_u64() as u8
+            };
+            v.push(if i == 0 { b & 0x7F } else { b });
+        }
+    }
+    for (s, size) in sizes.iter_mut().enumerate() {
+        if (rff >> s) & 1 == 1 {
+            *size = (wd, ht);
+        }
+    }
+    v
+}
+
+#[test]
+fn generative_multiframe_sequences_never_panic() {
+    let sequences = long_attempts().unwrap_or(if cfg!(debug_assertions) { 200 } else { 600 });
+    let (failures, total_frames, decoded_ok) = PanicHookGuard::run(
+        Box::new(|info| {
+            let location = info
+                .location()
+                .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+                .unwrap_or_default();
+            let mut recorded = PANIC_LOC.lock().unwrap();
+            if recorded.is_none() {
+                *recorded = Some(location);
+            }
+        }),
+        || {
+            let mut failures = Vec::new();
+            let mut total_frames = 0usize;
+            let mut decoded_ok = 0usize;
+            for seq_idx in 0..sequences {
+                let seed = ((seq_idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
+                let mut rng = Rng::new(seed);
+                let profile = if gen_chance(&mut rng, 1, 2) {
+                    0
+                } else {
+                    rng.below(4) as u32
+                };
+                let allow_empty_ref = gen_chance(&mut rng, 1, 2);
+                let skip_key = gen_chance(&mut rng, 1, 6);
+                let mut sizes = [(0u32, 0u32); 8];
+                let mut dec = Decoder::new();
+                let n_frames = 2 + rng.below(7);
+                for frame_idx in 0..n_frames {
+                    let key = (frame_idx == 0 && !skip_key) || gen_chance(&mut rng, 1, 10);
+                    let zero = gen_chance(&mut rng, 1, 2);
+                    let mut shadow = sizes;
+                    let pkt = gen_frame(&mut rng, key, zero, &mut shadow, profile, allow_empty_ref);
+                    total_frames += 1;
+                    match caught(|| dec.decode_frame(&pkt)) {
+                        Ok(Ok(_)) => {
+                            decoded_ok += 1;
+                            sizes = shadow;
+                        }
+                        Ok(Err(_)) => {}
+                        Err(msg) => {
+                            let failure = format!(
+                                "gen-seq[{seq_idx}] seed={seed:#x} frame={frame_idx}: {msg}"
+                            );
+                            eprintln!("[PANIC] {failure}");
+                            failures.push(failure);
+                            break;
+                        }
+                    }
+                }
+            }
+            (failures, total_frames, decoded_ok)
+        },
+    );
+
+    eprintln!(
+        "[gen-multiframe] sequences={sequences} frames={total_frames} decoded_ok={decoded_ok} panics={}",
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} generative sequence panic(s); first {} shown:\n{}",
         failures.len(),
         failures.len().min(25),
         failures

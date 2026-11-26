@@ -78,7 +78,8 @@ impl Clone for Plane {
             PlaneStorage::BorrowedStrip(_) => {
                 let mut data = Vec::with_capacity(self.width * self.height);
                 for y in 0..self.height {
-                    data.extend_from_slice(self.row(y));
+                    // SAFETY: `y < self.height`.
+                    data.extend_from_slice(unsafe { self.row_unchecked(y) });
                 }
                 Self {
                     width: self.width,
@@ -248,47 +249,85 @@ impl Plane {
     }
 
     /// Read-only slice of row `y` strictly within this plane/strip's `[0..self.width]` columns.
+    ///
+    /// # Safety
+    /// Caller must ensure `y < self.height`.
     #[inline]
-    pub(crate) fn row(&self, y: usize) -> &[u16] {
-        debug_assert!(y < self.height, "Plane::row out of range");
-        // SAFETY: `y < self.height`; columns `[0..self.width]` of row `y` are valid and exclusively
-        // readable by this plane/strip.
-        unsafe { std::slice::from_raw_parts(self.base_ptr().add(y * self.stride), self.width) }
+    pub(crate) unsafe fn row_unchecked(&self, y: usize) -> &[u16] {
+        debug_assert!(y < self.height, "Plane::row_unchecked out of range");
+        // SAFETY: caller guarantees `y < self.height`; columns `[0..self.width]` of row `y` are
+        // valid and exclusively readable by this plane/strip.
+        std::slice::from_raw_parts(self.base_ptr().add(y * self.stride), self.width)
     }
 
     /// Mutable slice of row `y` strictly within this plane/strip's `[0..self.width]` columns
     /// (disjoint across concurrent tile-column strips).
+    ///
+    /// # Safety
+    /// Caller must ensure `y < self.height`.
     #[inline]
-    pub(crate) fn row_mut(&mut self, y: usize) -> &mut [u16] {
-        debug_assert!(y < self.height, "Plane::row_mut out of range");
+    pub(crate) unsafe fn row_mut_unchecked(&mut self, y: usize) -> &mut [u16] {
+        debug_assert!(y < self.height, "Plane::row_mut_unchecked out of range");
         let stride = self.stride;
         let width = self.width;
-        // SAFETY: `y < self.height`; columns `[0..width]` of row `y` are valid and exclusively
-        // owned by this plane/strip (never overlapping any sibling strip).
-        unsafe { std::slice::from_raw_parts_mut(self.base_ptr_mut().add(y * stride), width) }
+        // SAFETY: caller guarantees `y < self.height`; columns `[0..width]` of row `y` are valid
+        // and exclusively owned by this plane/strip (never overlapping any sibling strip).
+        std::slice::from_raw_parts_mut(self.base_ptr_mut().add(y * stride), width)
     }
 
+    /// Bounds-checked pixel read (panics if out of range even in release builds).
+    #[cfg(test)]
     #[inline]
-    pub fn get(&self, x: usize, y: usize) -> u16 {
-        debug_assert!(
+    pub(crate) fn get(&self, x: usize, y: usize) -> u16 {
+        assert!(
             x >= self.x0 && x - self.x0 < self.width && y < self.height,
             "Plane::get out of range"
         );
-        // SAFETY: `(x - self.x0, y)` lies strictly within `[0..self.width) x [0..self.height)`.
-        unsafe { *self.base_ptr().add(y * self.stride + (x - self.x0)) }
+        // SAFETY: bounds verified by `assert!` above.
+        unsafe { self.get_unchecked(x, y) }
     }
 
+    /// Unchecked pixel read for hot decode/prediction/loop-filter paths.
+    ///
+    /// # Safety
+    /// Caller must ensure `x >= self.x0`, `x - self.x0 < self.width`, and `y < self.height`.
     #[inline]
-    pub fn set(&mut self, x: usize, y: usize, v: u16) {
+    pub(crate) unsafe fn get_unchecked(&self, x: usize, y: usize) -> u16 {
         debug_assert!(
+            x >= self.x0 && x - self.x0 < self.width && y < self.height,
+            "Plane::get_unchecked out of range"
+        );
+        // SAFETY: caller guarantees `(x - self.x0, y)` lies strictly within `[0..width) x [0..height)`.
+        *self.base_ptr().add(y * self.stride + (x - self.x0))
+    }
+
+    /// Bounds-checked pixel write (panics if out of range even in release builds).
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn set(&mut self, x: usize, y: usize, v: u16) {
+        assert!(
             x >= self.x0 && x - self.x0 < self.width && y < self.height,
             "Plane::set out of range"
         );
-        let offset = y * self.stride + (x - self.x0);
-        // SAFETY: `(x - self.x0, y)` lies strictly within `[0..self.width) x [0..self.height)`.
+        // SAFETY: bounds verified by `assert!` above.
         unsafe {
-            *self.base_ptr_mut().add(offset) = v;
+            self.set_unchecked(x, y, v);
         }
+    }
+
+    /// Unchecked pixel write for hot decode/prediction/loop-filter paths.
+    ///
+    /// # Safety
+    /// Caller must ensure `x >= self.x0`, `x - self.x0 < self.width`, and `y < self.height`.
+    #[inline]
+    pub(crate) unsafe fn set_unchecked(&mut self, x: usize, y: usize, v: u16) {
+        debug_assert!(
+            x >= self.x0 && x - self.x0 < self.width && y < self.height,
+            "Plane::set_unchecked out of range"
+        );
+        let offset = y * self.stride + (x - self.x0);
+        // SAFETY: caller guarantees `(x - self.x0, y)` lies strictly within `[0..width) x [0..height)`.
+        *self.base_ptr_mut().add(offset) = v;
     }
 
     /// Raw row-major buffer (row stride == [`Self::stride`]), valid only on owned whole-frame or
@@ -340,11 +379,18 @@ impl Plane {
     /// Narrows the cropped `(crop_width, crop_height)` region of this plane to `u8` into `out`,
     /// reusing `out`'s allocation when its capacity already suffices.
     pub(crate) fn narrow_u8_into(&self, crop_width: usize, crop_height: usize, out: &mut Vec<u8>) {
-        debug_assert_eq!(self.x0, 0, "crop is only meaningful on a whole-frame plane");
+        assert_eq!(self.x0, 0, "crop is only meaningful on a whole-frame plane");
         let data = self.as_slice();
-        debug_assert!(crop_width <= self.stride);
-        debug_assert!(crop_height * self.stride <= data.len());
-        let total = crop_width * crop_height;
+        assert!(crop_width <= self.stride, "crop_width exceeds plane stride");
+        assert!(
+            crop_height
+                .checked_mul(self.stride)
+                .is_some_and(|n| n <= data.len()),
+            "crop_height * stride exceeds plane backing length"
+        );
+        let total = crop_width
+            .checked_mul(crop_height)
+            .expect("crop dimensions overflow usize");
         out.clear();
         out.reserve(total);
 

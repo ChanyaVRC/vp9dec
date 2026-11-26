@@ -10,48 +10,65 @@
 
 pub mod ivf;
 
-// Modules below are crate-internal; a subset remain `#[doc(hidden)] pub mod` only so the
-// pure-std integration tests in tests/ and examples/ can reach them -- not a stable API.
+// Crate-internal modules. `bench_timing` stays `#[doc(hidden)] pub` for `examples/bench.rs`
+// (contains no `unsafe`). A subset of internal modules are exposed as `#[doc(hidden)] pub`
+// strictly under `feature = "test-support"` for the integration test suite; default builds keep
+// every internal module `pub(crate)` so internal unchecked/low-level types are never part of the
+// public API surface.
 #[doc(hidden)]
 pub mod bench_timing;
 pub(crate) mod bit_reader;
-#[doc(hidden)]
-pub mod bool_coder;
+pub(crate) mod bool_coder;
 pub(crate) mod common;
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod compressed_header;
-#[doc(hidden)]
-pub mod counts;
-#[doc(hidden)]
-pub mod dpb;
-#[doc(hidden)]
-pub mod framebuffer;
+#[cfg(not(feature = "test-support"))]
+pub(crate) mod compressed_header;
+pub(crate) mod counts;
+pub(crate) mod dpb;
+pub(crate) mod framebuffer;
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod header;
+#[cfg(not(feature = "test-support"))]
+pub(crate) mod header;
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod loop_filter;
+#[cfg(not(feature = "test-support"))]
+pub(crate) mod loop_filter;
 pub(crate) mod mv_ref_tables;
-#[doc(hidden)]
-pub mod predict;
+pub(crate) mod predict;
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod prob_tables;
+#[cfg(not(feature = "test-support"))]
+pub(crate) mod prob_tables;
 pub(crate) mod quant;
 pub(crate) mod scan;
 /// AVX2 SIMD kernels (inter prediction, intra prediction, loop filter, inverse transforms);
 /// x86_64-only, see the hub `src/simd.rs` and its submodules.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "test-support"))]
 #[doc(hidden)]
 pub mod simd;
+#[cfg(all(target_arch = "x86_64", not(feature = "test-support")))]
+pub(crate) mod simd;
 pub(crate) mod subpel;
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod superframe;
+#[cfg(not(feature = "test-support"))]
+pub(crate) mod superframe;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub(crate) mod thread_pool;
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod tile;
-#[doc(hidden)]
-pub mod transform;
+#[cfg(not(feature = "test-support"))]
+pub(crate) mod tile;
+pub(crate) mod transform;
 #[cfg(test)]
 #[path = "../tests/unit/support.rs"]
 mod unit_test_support;
@@ -59,16 +76,19 @@ mod unit_test_support;
 use std::fmt;
 use std::sync::Arc;
 
-use compressed_header::{
-    parse_compressed_header, CompressedHeaderError, FrameContext, FrameContextStore,
-};
+pub use bool_coder::BoolCoderError;
+pub use compressed_header::CompressedHeaderError;
+pub use header::HeaderError;
+pub use tile::TileError;
+
+use compressed_header::{parse_compressed_header, FrameContext, FrameContextStore};
 use counts::{adapt_coef_probs, adapt_noncoef_probs};
 use dpb::{Dpb, RefFrameData};
 use header::{
-    parse_uncompressed_header, ColorConfig, FrameHeader, FrameType, HeaderError, LoopFilterDeltas,
+    parse_uncompressed_header, ColorConfig, FrameHeader, FrameType, LoopFilterDeltas,
     PersistentState, SegFeaturePersist,
 };
-use tile::{MiGrid, TileDecoder, TileError};
+use tile::{MiGrid, TileDecoder};
 
 /// Error type covering everything that can cause [`Decoder::decode_frame`] to fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,22 +321,49 @@ pub struct DecodedFrame {
     pub frame: Option<Frame>,
 }
 
+/// Configurable resource limits enforced before allocating per-frame decode buffers.
+///
+/// Defaults match the crate's historical limits (`max_luma_samples = 1 << 27`, unbounded
+/// per-axis `max_width` / `max_height`). Pass a stricter configuration to
+/// [`Decoder::with_limits`] to bound worst-case memory usage on untrusted streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecoderLimits {
+    /// Maximum allowed `width * height` (luma samples per frame).
+    pub max_luma_samples: u64,
+    /// Maximum allowed frame width in pixels.
+    pub max_width: u32,
+    /// Maximum allowed frame height in pixels.
+    pub max_height: u32,
+}
+
+impl Default for DecoderLimits {
+    fn default() -> Self {
+        Self {
+            max_luma_samples: header::MAX_FRAME_LUMA_SAMPLES,
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+        }
+    }
+}
+
 /// A stateful decoder for decoding multiple frames in sequence.
 ///
 /// VP9 carries the following state across frames, so frames cannot be processed
 /// independently one by one:
 /// - Reference frame slots (`RefFrameWidth`/`RefFrameHeight`, spec §6.2.5
-///   `frame_size_with_refs`) and the actual pixel data ([`Dpb`], spec §8.10).
+///   `frame_size_with_refs`) and the actual pixel data (`Dpb`, spec §8.10).
 /// - Frame contexts (the 4 probability table slots selected by `frame_context_idx`,
-///   spec §7.1.2 `load_probs`/`save_probs`). See [`FrameContextStore`].
+///   spec §7.1.2 `load_probs`/`save_probs`).
 /// - The previous frame's `Mvs`/`RefFrames`, referenced when `UsePrevFrameMvs`
 ///   (spec §7.2.6) is true (this implementation keeps the previous frame's
-///   [`MiGrid`] in its entirety).
+///   mode-info grid in its entirety).
 /// - The loop filter's `ref_deltas`/`mode_deltas` (spec §7.2, reset only by
 ///   `setup_past_independence()`).
 /// - `LastFrameType` (spec §7.2; used in the `updateFactor` calculation for
 ///   probability adaptation, spec §8.4.3).
 pub struct Decoder {
+    /// Allocation limits enforced before per-frame working buffers are allocated.
+    limits: DecoderLimits,
     /// Cross-frame state spec §7.2 requires: `RefFrameWidth`/`RefFrameHeight`, the loop
     /// filter's `ref_deltas`/`mode_deltas`, and the segmentation feature state -- see
     /// [`PersistentState`].
@@ -344,6 +391,10 @@ pub struct Decoder {
     /// so the per-frame clone-in to `TileDecoder` (unconditional, unlike `prev_mi_grid`) is
     /// a refcount bump rather than a deep clone.
     prev_segment_ids: Arc<Vec<u8>>,
+    /// Explicit `(mi_cols, mi_rows)` dimensions matching `prev_segment_ids`. Stored alongside
+    /// the map and committed only when a frame succeeds so a failed frame can never leave the
+    /// map length out of sync with `prev_frame_dims`.
+    prev_segment_ids_dims: Option<(u32, u32)>,
     /// `LastFrameType` (spec §7.2). Not updated on `show_existing_frame` frames.
     last_frame_type: Option<FrameType>,
     /// Recycled whole-frame `[Plane; 3]` working buffers (and evicted 10/12-bit DPB planes),
@@ -387,7 +438,13 @@ impl Default for Decoder {
 
 impl Decoder {
     pub fn new() -> Self {
+        Self::with_limits(DecoderLimits::default())
+    }
+
+    /// Creates a new [`Decoder`] enforcing custom pre-allocation [`DecoderLimits`].
+    pub fn with_limits(limits: DecoderLimits) -> Self {
         Self {
+            limits,
             persist: PersistentState::default(),
             frame_contexts: Box::new(FrameContextStore::new()),
             prev_frame_dims: None,
@@ -396,6 +453,7 @@ impl Decoder {
             last_color_config: None,
             dpb: Dpb::new(),
             prev_segment_ids: Arc::new(Vec::new()),
+            prev_segment_ids_dims: None,
             last_frame_type: None,
             plane_pool: Vec::new(),
             ref_u8_pool: Vec::new(),
@@ -496,47 +554,66 @@ impl Decoder {
         );
     }
 
-    /// Resets `PrevSegmentIds` to all-zero when the spec requires it, before tile decode
-    /// (an error-resilient inter frame reads the map during its own decode):
+    /// Prepares the `PrevSegmentIds` buffer to pass into `TileDecoder` without mutating
+    /// persistent decoder state yet (committed only after tile decode succeeds):
     /// - `compute_image_size()` step 1 (spec §7.2.6): first invocation or
-    ///   FrameWidth/FrameHeight changed since the previous invocation (detected via
-    ///   `prev_frame_dims`, read before `decode_frame` overwrites it at the end).
+    ///   FrameWidth/FrameHeight changed since the previous invocation (checked via both
+    ///   `prev_frame_dims` and `prev_segment_ids_dims`).
     /// - `setup_past_independence()` (spec §7.2): `FrameIsIntra || error_resilient_mode`
-    ///   (the caller passes this as `setup_past_independence`).
-    fn clear_prev_segment_ids_if_needed(
-        &mut self,
+    ///   (passed as `setup_past_independence`).
+    ///
+    /// Returns `(map, cleared)` where `cleared` is true when a fresh all-zero map was created.
+    fn prepare_prev_segment_ids(
+        &self,
         dims: (u32, u32),
         image_size: &header::ImageSize,
         setup_past_independence: bool,
-    ) {
-        if setup_past_independence || self.prev_frame_dims != Some(dims) {
-            self.prev_segment_ids = Arc::new(vec![
-                0u8;
-                (image_size.mi_cols * image_size.mi_rows)
-                    as usize
-            ]);
+    ) -> (Arc<Vec<u8>>, bool) {
+        let mi_dims = (image_size.mi_cols, image_size.mi_rows);
+        if setup_past_independence
+            || self.prev_frame_dims != Some(dims)
+            || self.prev_segment_ids_dims != Some(mi_dims)
+        {
+            (
+                Arc::new(vec![
+                    0u8;
+                    (image_size.mi_cols * image_size.mi_rows) as usize
+                ]),
+                true,
+            )
+        } else {
+            (Arc::clone(&self.prev_segment_ids), false)
         }
     }
 
-    /// Spec §8.1 step 3: `PrevSegmentIds` is refreshed from this frame's `SegmentIds` (read
-    /// out of `grid`) only when segmentation_enabled && segmentation_update_map (not gated by
-    /// show_frame). Otherwise it is left as-is (already reset to zero by
-    /// [`Self::clear_prev_segment_ids_if_needed`] if the size changed).
-    fn refresh_prev_segment_ids(
+    /// Spec §8.1 step 3: commits `PrevSegmentIds` on the success path. Refreshes from this
+    /// frame's `SegmentIds` (read out of `grid`) when `segmentation_enabled &&
+    /// segmentation_update_map`; otherwise persists the cleared zero map if
+    /// [`Self::prepare_prev_segment_ids`] reset it for this frame.
+    fn commit_prev_segment_ids(
         &mut self,
         header: &header::NewFrameHeader,
         image_size: &header::ImageSize,
         grid: &MiGrid,
+        frame_prev_segment_ids: Arc<Vec<u8>>,
+        cleared: bool,
     ) {
+        let mi_dims = (image_size.mi_cols, image_size.mi_rows);
         if header.segmentation.enabled && header.segmentation.update_map {
             let mut new_map = vec![0u8; (image_size.mi_cols * image_size.mi_rows) as usize];
             for row in 0..image_size.mi_rows {
                 for col in 0..image_size.mi_cols {
+                    // SAFETY: `row < mi_rows <= grid.rows()` and `col < mi_cols <= grid.cols()`
+                    // on this whole-frame owned grid (`col0 == 0`).
                     new_map[(row * image_size.mi_cols + col) as usize] =
-                        grid.get(row, col).segment_id();
+                        unsafe { grid.get_unchecked(row, col) }.segment_id();
                 }
             }
             self.prev_segment_ids = Arc::new(new_map);
+            self.prev_segment_ids_dims = Some(mi_dims);
+        } else if cleared {
+            self.prev_segment_ids = frame_prev_segment_ids;
+            self.prev_segment_ids_dims = Some(mi_dims);
         }
     }
 
@@ -668,6 +745,16 @@ impl Decoder {
     /// others still report their `info`. Internal state (reference frame buffers, frame
     /// context, previous frame's MVs, etc.) is updated for every constituent frame,
     /// shown or hidden.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if any constituent frame in `chunk` is malformed or exceeds the
+    /// configured [`DecoderLimits`]. If a later constituent frame inside a multi-frame
+    /// superframe fails, `decode_frame` returns `Err` (discarding any earlier constituents'
+    /// [`DecodedFrame`] outputs from this call), while internal decoder state remains updated
+    /// from the earlier constituents in that superframe that succeeded. A failing constituent
+    /// frame itself does not commit its own persistent state (DPB, frame contexts,
+    /// `last_color_config`, or `PrevSegmentIds`).
     pub fn decode_frame(&mut self, chunk: &[u8]) -> Result<Vec<DecodedFrame>, DecodeError> {
         let mut decoded = Vec::new();
         for frame_data in superframe::split_superframe(chunk) {
@@ -693,38 +780,42 @@ impl Decoder {
         Ok(decoded)
     }
 
-    /// Resolves this frame's effective [`ColorConfig`] and remembers it when `frame_is_intra`.
+    /// Resolves this frame's effective [`ColorConfig`] without mutating decoder state.
     ///
     /// `header.color_config` is `Some` on key frames and intra-only frames; inter frames inherit
     /// the most recent intra frame's config (falling back to a neutral 8-bit 4:2:0 placeholder if
-    /// an inter frame arrives before any intra frame).
-    fn resolve_color_config(&mut self, header: &header::NewFrameHeader) -> ColorConfig {
-        let color_config = header.color_config.unwrap_or_else(|| {
+    /// an inter frame arrives before any intra frame). `last_color_config` is updated only after
+    /// the frame decodes successfully (see [`Self::update_persistent_state`]).
+    fn resolve_color_config(&self, header: &header::NewFrameHeader) -> ColorConfig {
+        header.color_config.unwrap_or_else(|| {
             self.last_color_config
                 .unwrap_or_else(ColorConfig::fallback_inter)
-        });
-        if header.frame_is_intra {
-            self.last_color_config = Some(color_config);
-        }
-        color_config
+        })
     }
 
-    /// Runs `setup_past_independence()`'s `save_probs` context resets (spec §7.2) when
-    /// `FrameIsIntra || error_resilient_mode`.
-    fn reset_frame_contexts_if_needed(&mut self, header: &header::NewFrameHeader) {
+    /// Computes which stored frame context slot(s) `setup_past_independence()` (spec §7.2) will
+    /// reset when this frame succeeds.
+    fn pending_frame_context_reset(header: &header::NewFrameHeader) -> FrameContextReset {
         if header.frame_is_intra || header.error_resilient_mode {
-            match frame_context_reset(
+            frame_context_reset(
                 header.frame_type,
                 header.error_resilient_mode,
                 header.reset_frame_context,
                 header.frame_context_idx,
-            ) {
-                FrameContextReset::All => self.frame_contexts.reset_all(),
-                FrameContextReset::Slot(idx) => {
-                    self.frame_contexts.save(idx, FrameContext::default())
-                }
-                FrameContextReset::None => {}
+            )
+        } else {
+            FrameContextReset::None
+        }
+    }
+
+    /// Applies a deferred [`FrameContextReset`] on the success path.
+    fn apply_frame_context_reset(&mut self, reset: FrameContextReset) {
+        match reset {
+            FrameContextReset::All => self.frame_contexts.reset_all(),
+            FrameContextReset::Slot(idx) => {
+                self.frame_contexts.save(idx, FrameContext::default());
             }
+            FrameContextReset::None => {}
         }
     }
 
@@ -756,13 +847,21 @@ impl Decoder {
         Ok(resolved_refs)
     }
 
-    /// Updates cross-frame persistent state (dimensions, show flag, loop-filter deltas,
-    /// segmentation feature persistence, and `LastFrameType`) after a newly decoded frame.
-    fn update_persistent_state(&mut self, header: &header::NewFrameHeader) {
+    /// Updates cross-frame persistent state (dimensions, show flag, color config, loop-filter
+    /// deltas, segmentation feature persistence, and `LastFrameType`) after a newly decoded frame
+    /// succeeds.
+    fn update_persistent_state(
+        &mut self,
+        header: &header::NewFrameHeader,
+        color_config: ColorConfig,
+    ) {
         // compute_image_size is never called for show_existing_frame, so by the time we
         // reach here it has always been called (spec §7.2.6). Recorded for UsePrevFrameMvs.
         self.prev_frame_dims = Some((header.width, header.height));
         self.prev_show_frame = Some(header.show_frame);
+        if header.frame_is_intra {
+            self.last_color_config = Some(color_config);
+        }
         self.persist.loop_filter_deltas = LoopFilterDeltas {
             ref_deltas: header.loop_filter.ref_deltas,
             mode_deltas: header.loop_filter.mode_deltas,
@@ -814,6 +913,20 @@ impl Decoder {
             }
         };
 
+        // Unconditionally reject zero dimensions before any arithmetic or allocation.
+        if header.width == 0 || header.height == 0 {
+            return Err(DecodeError::Header(HeaderError::InvalidFrameSize));
+        }
+
+        // Reject an absurd or over-limit frame size before it reaches the buffer allocations
+        // below (which use `vec![]` and would abort the process on failure, not return an error).
+        if header.width > self.limits.max_width
+            || header.height > self.limits.max_height
+            || header.width as u64 * header.height as u64 > self.limits.max_luma_samples
+        {
+            return Err(DecodeError::Header(HeaderError::FrameSizeTooLarge));
+        }
+
         let color_config = self.resolve_color_config(&header);
 
         let compressed_start = consumed;
@@ -824,6 +937,7 @@ impl Decoder {
             return Err(DecodeError::TruncatedFrame);
         }
         let compressed_bytes = &frame_data[compressed_start..compressed_end];
+        let tile_data = &frame_data[compressed_end..];
 
         // UsePrevFrameMvs (spec §7.2.6).
         let use_prev_frame_mvs = !header.frame_is_intra
@@ -831,33 +945,33 @@ impl Decoder {
             && self.prev_frame_dims == Some((header.width, header.height))
             && self.prev_show_frame == Some(true);
 
-        // Reject an absurd frame size before it reaches the buffer allocations below (which
-        // use `vec![]` and would abort the process on failure, not return an error).
-        if header.width as u64 * header.height as u64 > header::MAX_FRAME_LUMA_SAMPLES {
-            return Err(DecodeError::Header(HeaderError::FrameSizeTooLarge));
-        }
-
-        let image_size = header::compute_image_size(header.width, header.height);
-        self.clear_prev_segment_ids_if_needed(
-            (header.width, header.height),
-            &image_size,
-            header.frame_is_intra || header.error_resilient_mode,
-        );
-        self.reset_frame_contexts_if_needed(&header);
-
-        // Load the frame context slot once to seed forward updates in `parse_compressed_header`
-        // (by value, avoiding a second ~3.5 KB clone on non-refresh, error-resilient, and
-        // frame-parallel frames). When backward adaptation runs after tile decode, the slot in
-        // `self.frame_contexts` is still untouched and is loaded then.
+        // Compute any context reset without mutating `self.frame_contexts` until the frame
+        // succeeds, while seeding `parse_compressed_header` with the exact post-reset slot.
         let ctx_idx = header.effective_frame_context_idx();
+        let ctx_reset = Self::pending_frame_context_reset(&header);
+        let starting_probs = match ctx_reset {
+            FrameContextReset::All => FrameContext::default(),
+            FrameContextReset::Slot(idx) if idx == ctx_idx => FrameContext::default(),
+            _ => self.frame_contexts.load(ctx_idx),
+        };
         let compressed = {
             let _t = bench_timing::StageTimer::start(bench_timing::Stage::CompressedHeader);
-            parse_compressed_header(compressed_bytes, &header, self.frame_contexts.load(ctx_idx))?
+            parse_compressed_header(compressed_bytes, &header, starting_probs)?
         };
 
         let resolved_refs = self.resolve_and_validate_refs(&header, &color_config)?;
 
-        let tile_data = &frame_data[compressed_end..];
+        // Cheap pre-allocation structural check on tile headers/sizes/marker bits so tiny
+        // truncated packets fail before allocating multi-megabyte working planes or `MiGrid`.
+        tile::validate_tile_layout(tile_data, header.tile_cols_log2, header.tile_rows_log2)?;
+
+        let image_size = header::compute_image_size(header.width, header.height);
+        let (frame_prev_segment_ids, seg_ids_cleared) = self.prepare_prev_segment_ids(
+            (header.width, header.height),
+            &image_size,
+            header.frame_is_intra || header.error_resilient_mode,
+        );
+
         let prev_grid = if use_prev_frame_mvs {
             self.prev_mi_grid.clone()
         } else {
@@ -884,7 +998,7 @@ impl Decoder {
             use_prev_frame_mvs,
             prev_grid,
             resolved_refs,
-            self.prev_segment_ids.clone(),
+            Arc::clone(&frame_prev_segment_ids),
             backward_adapt,
             recycled,
         );
@@ -907,7 +1021,14 @@ impl Decoder {
         // timer lives to the end of the function (no more fallible `?` calls follow).
         let _dpb_t = bench_timing::StageTimer::start(bench_timing::Stage::DpbOutput);
 
-        self.refresh_prev_segment_ids(&header, &image_size, tile_decoder.mi_grid());
+        self.commit_prev_segment_ids(
+            &header,
+            &image_size,
+            tile_decoder.mi_grid(),
+            frame_prev_segment_ids,
+            seg_ids_cleared,
+        );
+        self.apply_frame_context_reset(ctx_reset);
 
         // Backward adaptation (spec §6.1.2) needs `tile_decoder.counts()` before `tile_decoder`
         // is consumed; FPM / error-resilient refresh saves `compressed.probs` directly after
@@ -924,7 +1045,7 @@ impl Decoder {
             self.frame_contexts.save(ctx_idx, final_probs);
         }
 
-        self.update_persistent_state(&header);
+        self.update_persistent_state(&header, color_config);
         let info = build_frame_decode_info(&header);
 
         // Last use of tile_decoder: consume it to drop its read-only `Arc`s to DPB slots,

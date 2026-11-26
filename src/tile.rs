@@ -70,19 +70,18 @@ pub enum TileError {
     InvalidPartition,
     /// An inter block references a DPB slot that holds no decoded frame (malformed bitstream).
     MissingReference,
-    /// An inter block references a frame more than twice the current frame's width or height.
-    /// Spec §8.5.2.3's conformance bounds (`2 * FrameWidth >= RefFrameWidth[ refIdx ]` and the
-    /// height analog) cap the motion-compensation scaling step at 32 (1/16-pel units), and
-    /// every scaled inter-prediction scratch buffer (scalar and AVX2; see
-    /// `subpel::MAX_INTERMEDIATE_HEIGHT`) is sized to exactly that bound -- a malformed
-    /// stream using a larger ratio is rejected here instead of overflowing them. Checked per
-    /// block, not at reference resolution: a conformant stream may *list* an out-of-range
-    /// slot it never predicts from (3-layer SVC does; see `Decoder::decode_one_frame`).
+    /// An inter block references a frame outside VP9 spec §8.5.2.3's scaling bounds
+    /// (`2 * FrameWidth >= RefFrameWidth`, `16 * RefFrameWidth >= FrameWidth`, and the height
+    /// analogs; or zero dimensions). The 2x upper bound caps the motion-compensation scaling
+    /// step at 32 (1/16-pel units), sizing every scaled inter-prediction scratch buffer
+    /// (scalar and AVX2; see `subpel::MAX_INTERMEDIATE_HEIGHT`). Checked per block, not at
+    /// reference resolution: a conformant stream may *list* an out-of-range slot it never
+    /// predicts from (3-layer SVC does; see `Decoder::decode_one_frame`).
     RefFrameSizeOutOfRange,
-    /// The tile's arithmetic decoder ran far past the end of the tile buffer (see
-    /// [`crate::bool_coder::BoolDecoder::over_read_bits`]). A conformant tile holds just enough
-    /// coded bits for its blocks; running thousands of bits past the end means the decode
-    /// desynced on corrupt data (libvpx rejects the same via its reader's `has_error`).
+    /// The tile's arithmetic decoder ran far past the end of the tile buffer (or left a large
+    /// non-zero unused tail). A conformant tile holds just enough coded bits for its blocks;
+    /// running thousands of bits past the end means the decode desynced on corrupt data (libvpx
+    /// rejects the same via its reader's `has_error`).
     CorruptTile,
 }
 
@@ -132,20 +131,96 @@ const TILE_OVER_READ_LIMIT_BITS: usize = 128;
 /// short (the smallest such case observed left ~10k). See [`TileError::CorruptTile`].
 const TILE_UNDER_READ_LIMIT_BITS: usize = 1024;
 
+/// Returns `true` if every unread trailing bit in `tile_bytes` starting at bit index `bit_pos`
+/// (MSB-first within each byte) is zero, matching spec §9.2.3 `exit_bool()`'s zero-padding rule.
+fn trailing_bits_are_zero(tile_bytes: &[u8], bit_pos: usize) -> bool {
+    let byte_idx = bit_pos / 8;
+    if byte_idx >= tile_bytes.len() {
+        return true;
+    }
+    let bit_rem = bit_pos % 8;
+    let tail = if bit_rem == 0 {
+        &tile_bytes[byte_idx..]
+    } else {
+        let mask = 0xFFu8 >> bit_rem;
+        if (tile_bytes[byte_idx] & mask) != 0 {
+            return false;
+        }
+        &tile_bytes[byte_idx + 1..]
+    };
+    tail.iter().all(|&b| b == 0)
+}
+
+/// Validates tile-size headers, non-empty tile payloads, and bool-decoder marker bits before
+/// allocating per-frame working buffers (`Plane`s / `MiGrid`).
+pub(crate) fn validate_tile_layout(
+    mut data: &[u8],
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+) -> Result<(), TileError> {
+    let tile_cols = 1usize
+        .checked_shl(tile_cols_log2)
+        .ok_or(TileError::InvalidTileSize)?;
+    let tile_rows = 1usize
+        .checked_shl(tile_rows_log2)
+        .ok_or(TileError::InvalidTileSize)?;
+    let num_tiles = tile_cols
+        .checked_mul(tile_rows)
+        .ok_or(TileError::InvalidTileSize)?;
+    let min_bytes = num_tiles
+        .checked_mul(5)
+        .and_then(|v| v.checked_sub(4))
+        .ok_or(TileError::InvalidTileSize)?;
+    if data.len() < min_bytes {
+        if num_tiles == 1 && data.is_empty() {
+            return Err(TileError::BoolCoder(BoolCoderError::EmptyBuffer));
+        }
+        return Err(TileError::InvalidTileSize);
+    }
+    for i in 0..num_tiles {
+        let last = i + 1 == num_tiles;
+        let size = if last {
+            data.len()
+        } else {
+            let Some((size_bytes, rest)) = data.split_first_chunk::<4>() else {
+                return Err(TileError::InvalidTileSize);
+            };
+            data = rest;
+            u32::from_be_bytes(*size_bytes) as usize
+        };
+        if data.len() < size {
+            return Err(TileError::InvalidTileSize);
+        }
+        let (tile_bytes, rest) = data.split_at(size);
+        let Some(&first) = tile_bytes.first() else {
+            return Err(TileError::BoolCoder(BoolCoderError::EmptyBuffer));
+        };
+        // `BoolDecoder::new` requires the first `read_bool(128)` marker bit (MSB of byte 0) == 0.
+        if (first & 0x80) != 0 {
+            return Err(TileError::BoolCoder(BoolCoderError::InvalidMarker));
+        }
+        data = rest;
+    }
+    Ok(())
+}
+
 /// Rejects a decoded tile whose arithmetic decoder finished far off its buffer end.
 ///
 /// A conformant tile's arithmetic decoder finishes flush against its buffer: the
 /// whole official corpus lands within 14 bits of the end and never over-reads.
 /// A tile whose coded data has been corrupted desyncs and ends far off that mark
-/// -- either running thousands of bits PAST the end (`over_read_bits`), or
-/// finishing the frame's fixed block count having consumed thousands of bits too
-/// FEW (a large unused tail). Either way the tile isn't decodable; reject it
-/// rather than emit garbage (libvpx rejects the same class via its reader's
-/// `has_error`). The bounds sit ~70x above the largest conformant slack and ~10x
-/// below the smallest corruption seen, so no valid stream trips them.
+/// -- either running past the end (`over_read_bits`), or finishing the frame's
+/// fixed block count leaving a large non-zero unused tail. Spec-legal trailing
+/// zero padding (spec §9.2.3 `exit_bool()`) of arbitrary length is accepted when
+/// every remaining unread tail bit is zero; any non-zero bit in a large unused
+/// tail is rejected as [`TileError::CorruptTile`].
 fn check_tile_read_bounds(r: &BoolDecoder, tile_bytes: &[u8]) -> Result<(), TileError> {
-    let unused_bits = (tile_bytes.len() * 8).saturating_sub(r.bit_position());
-    if r.over_read_bits() > TILE_OVER_READ_LIMIT_BITS || unused_bits > TILE_UNDER_READ_LIMIT_BITS {
+    if r.over_read_bits() > TILE_OVER_READ_LIMIT_BITS {
+        return Err(TileError::CorruptTile);
+    }
+    let bit_pos = r.bit_position();
+    let unused_bits = (tile_bytes.len() * 8).saturating_sub(bit_pos);
+    if unused_bits > TILE_UNDER_READ_LIMIT_BITS && !trailing_bits_are_zero(tile_bytes, bit_pos) {
         return Err(TileError::CorruptTile);
     }
     Ok(())
@@ -163,7 +238,10 @@ pub(super) const NO_SUB_MVS: u32 = u32::MAX;
 ///   | `tx_size` (0..=3, bits 4..6) | `interp_filter` (0..=3, bits 6..8)
 /// - `seg_skip_uv`: `segment_id` (0..=7, bits 0..3) | `skip` (bit 3) | `uv_mode` (0..=9, bits 4..8)
 /// - `extra`: for intra blocks (`ref_frame0() == INTRA_FRAME`), 4 packed `sub_modes` bytes;
-///   for inter blocks, an index into `MiGrid::sub_mvs` when `mi_size() < BLOCK_8X8` else `NO_SUB_MVS`.
+///   for inter blocks, an index into the owning `MiGrid::sub_mvs` when `mi_size() < BLOCK_8X8`
+///   else `NO_SUB_MVS`. That index is only valid during tile decoding within the worker that
+///   wrote it (tile-parallel workers detach and clear their local `sub_mvs`, and
+///   `clear_sub_mvs` clears it before archiving `prev_mi_grid`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MiInfo {
     /// `Mvs[ refList ]` (representative MV == `BlockMvs[ refList ][ 3 ]`, spec §6.4.4).
@@ -477,11 +555,24 @@ impl MiGrid {
         idx
     }
 
+    /// Returns sub-block `idx`'s MV for `ref_list` (`idx == 3` or blocks without distinct
+    /// sub-8x8 MVs return `info.mv[ref_list]`).
+    ///
+    /// Only valid during tile decoding on the owning `MiGrid` / column worker: tile-parallel
+    /// workers keep sub-8x8 MVs in their own `sub_mvs` and clear it on detach, leaving
+    /// `info.extra` dangling in the parent frame grid after tile decode finishes.
     #[inline]
     pub(super) fn get_sub_mv(&self, info: &MiInfo, ref_list: usize, idx: usize) -> Mv {
         if idx == 3 || info.extra == NO_SUB_MVS {
             info.mv[ref_list]
         } else {
+            debug_assert!(
+                (info.extra as usize) < self.sub_mvs.len(),
+                "MiInfo::extra ({}) out of range for sub_mvs (len={}); \
+                 sub-8x8 MV indices are only valid within the owning tile worker during decode",
+                info.extra,
+                self.sub_mvs.len()
+            );
             self.sub_mvs[info.extra as usize][ref_list][idx]
         }
     }
@@ -510,52 +601,73 @@ impl MiGrid {
         }
     }
 
+    /// Bounds-checked MI lookup (panics if out of range even in release builds).
     #[inline]
     pub fn get(&self, row: u32, col: u32) -> &MiInfo {
-        debug_assert!(
+        assert!(
             (row as usize) < self.rows
                 && col >= self.col0
                 && ((col - self.col0) as usize) < self.cols,
             "MiGrid::get out of range"
         );
-        // SAFETY: `(row, col - self.col0)` lies strictly inside `[0..self.rows) x [0..self.cols)`.
-        unsafe {
-            &*self
-                .base_ptr()
-                .add(row as usize * self.stride + (col - self.col0) as usize)
-        }
+        // SAFETY: bounds verified by `assert!` above.
+        unsafe { self.get_unchecked(row, col) }
+    }
+
+    /// Unchecked MI lookup for hot decode/loop-filter paths.
+    ///
+    /// # Safety
+    /// Caller must ensure `(row as usize) < self.rows`, `col >= self.col0`, and
+    /// `((col - self.col0) as usize) < self.cols`.
+    #[inline]
+    pub(crate) unsafe fn get_unchecked(&self, row: u32, col: u32) -> &MiInfo {
+        debug_assert!(
+            (row as usize) < self.rows
+                && col >= self.col0
+                && ((col - self.col0) as usize) < self.cols,
+            "MiGrid::get_unchecked out of range"
+        );
+        // SAFETY: caller guarantees `(row, col - self.col0)` lies inside `[0..self.rows) x [0..self.cols)`.
+        &*self
+            .base_ptr()
+            .add(row as usize * self.stride + (col - self.col0) as usize)
     }
 
     #[cfg(test)]
     fn get_mut(&mut self, row: u32, col: u32) -> &mut MiInfo {
-        debug_assert!(
+        assert!(
             (row as usize) < self.rows
                 && col >= self.col0
                 && ((col - self.col0) as usize) < self.cols,
             "MiGrid::get_mut out of range"
         );
         let offset = row as usize * self.stride + (col - self.col0) as usize;
-        // SAFETY: `(row, col - self.col0)` lies strictly inside `[0..self.rows) x [0..self.cols)`.
+        // SAFETY: bounds verified by `assert!` above.
         unsafe { &mut *self.base_ptr_mut().add(offset) }
     }
 
+    /// Fills rectangle `[row..row + bh) x [col..col + bw)` with `info` without release bounds checks.
+    ///
+    /// # Safety
+    /// Caller must ensure `col >= self.col0`, `((col - self.col0) as usize) + bw as usize <= self.cols`,
+    /// and `(row as usize) + (bh as usize) <= self.rows`.
     #[inline]
-    fn fill_rect(&mut self, row: u32, col: u32, bw: u32, bh: u32, info: MiInfo) {
+    unsafe fn fill_rect_unchecked(&mut self, row: u32, col: u32, bw: u32, bh: u32, info: MiInfo) {
+        debug_assert!(
+            col >= self.col0
+                && ((col - self.col0) as usize) + (bw as usize) <= self.cols
+                && (row as usize) + (bh as usize) <= self.rows,
+            "MiGrid::fill_rect_unchecked out of range"
+        );
         let c = (col - self.col0) as usize;
         let bw = bw as usize;
-        debug_assert!(
-            col >= self.col0 && c + bw <= self.cols && (row as usize) + (bh as usize) <= self.rows,
-            "MiGrid::fill_rect out of range"
-        );
         let stride = self.stride;
         let base = self.base_ptr_mut();
         for r in 0..bh as usize {
-            // SAFETY: each row slice `[c..c + bw]` lies strictly within this grid/strip's
-            // disjoint column range `[0..self.cols)` and `row + r < self.rows`.
-            unsafe {
-                std::slice::from_raw_parts_mut(base.add((row as usize + r) * stride + c), bw)
-                    .fill(info);
-            }
+            // SAFETY: caller guarantees each row slice `[c..c + bw]` lies strictly within this
+            // grid/strip's disjoint column range `[0..self.cols)` and `row + r < self.rows`.
+            std::slice::from_raw_parts_mut(base.add((row as usize + r) * stride + c), bw)
+                .fill(info);
         }
     }
 }
@@ -1075,6 +1187,12 @@ impl TileDecoder {
                 self.decode_partition(r, row, col, BLOCK_64X64)?;
                 col += 8;
             }
+            // Fail fast on severely truncated tiles (monotonically non-decreasing, so if
+            // `over_read_bits()` already exceeds the end-of-tile bound here it is guaranteed
+            // to fail `check_tile_read_bounds`).
+            if r.over_read_bits() > TILE_OVER_READ_LIMIT_BITS {
+                return Err(TileError::CorruptTile);
+            }
             row += 8;
         }
         Ok(())
@@ -1239,14 +1357,16 @@ impl TileDecoder {
                 if rf > INTRA_FRAME {
                     match self.resolved_refs[(rf - LAST_FRAME) as usize].as_deref() {
                         None => return Err(TileError::MissingReference),
-                        // Spec §8.5.2.3's conformance bound (2x per axis) caps the reference-
-                        // scaling step at 32; the motion-compensation scratch buffers (scalar
-                        // and AVX2, `subpel::MAX_INTERMEDIATE_HEIGHT`) are sized to exactly
-                        // that. A larger ratio would overflow the scalar scratch's slice
-                        // bounds (panic), so reject the block's reference before predicting.
+                        // Spec §8.5.2.3's conformance bounds: 2x upper bound (caps reference-
+                        // scaling step at 32, sizing `subpel::MAX_INTERMEDIATE_HEIGHT`), 1/16x
+                        // lower bound, and non-zero reference dimensions (defense-in-depth).
                         Some(r)
-                            if r.width as u64 > 2 * self.frame_width as u64
-                                || r.height as u64 > 2 * self.frame_height as u64 =>
+                            if r.width == 0
+                                || r.height == 0
+                                || (r.width as u64) > 2 * (self.frame_width as u64)
+                                || (r.height as u64) > 2 * (self.frame_height as u64)
+                                || 16 * (r.width as u64) < (self.frame_width as u64)
+                                || 16 * (r.height as u64) < (self.frame_height as u64) =>
                         {
                             return Err(TileError::RefFrameSizeOutOfRange);
                         }
@@ -1279,7 +1399,11 @@ impl TileDecoder {
 
         let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize] as u32;
         let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[subsize as usize] as u32;
-        self.mi_grid.fill_rect(row, col, bw, bh, info);
+        // SAFETY: `decode_partition` keeps every block `[row..row+bh) x [col..col+bw)` aligned
+        // inside this tile/strip's superblock-padded `mi_grid` bounds.
+        unsafe {
+            self.mi_grid.fill_rect_unchecked(row, col, bw, bh, info);
+        }
         Ok(())
     }
 }

@@ -134,19 +134,16 @@ impl PlaneView {
 
 impl PlaneAccess for PlaneView {
     #[inline]
-    fn lf_get(&self, x: usize, y: usize) -> u16 {
-        // SAFETY: `offset` bounds-checks (debug). The wavefront guarantees any pixel this worker
-        // reads is either its own or one another worker finished-and-published (Acquire) first, so
-        // the read never races a concurrent write.
-        unsafe { *self.ptr.add(self.offset(x, y)) }
+    unsafe fn lf_get(&self, x: usize, y: usize) -> u16 {
+        // SAFETY: caller upholds `PlaneAccess::lf_get` bounds and wavefront-ordering contract;
+        // `offset` additionally checks bounds in debug builds.
+        *self.ptr.add(self.offset(x, y))
     }
     #[inline]
-    fn lf_set(&mut self, x: usize, y: usize, v: u16) {
-        // SAFETY: `offset` bounds-checks (debug). The wavefront guarantees this worker has sole
-        // access to (x, y) at this time (no other worker's superblock touches it concurrently).
-        unsafe {
-            *self.ptr.add(self.offset(x, y)) = v;
-        }
+    unsafe fn lf_set(&mut self, x: usize, y: usize, v: u16) {
+        // SAFETY: caller upholds `PlaneAccess::lf_set` bounds and wavefront-exclusivity contract;
+        // `offset` additionally checks bounds in debug builds.
+        *self.ptr.add(self.offset(x, y)) = v;
     }
     #[inline]
     fn lf_base_ptr(&mut self) -> *mut u16 {
@@ -242,7 +239,9 @@ fn edge_group_params(
 
     let loop_col = ((x >> 3) >> sub_x) << sub_x;
     let loop_row = ((y >> 3) >> sub_y) << sub_y;
-    let mi = ctx.mi_grid.get(loop_row, loop_col);
+    // SAFETY: `x < 8 * mi_cols` and `y < 8 * mi_rows` (checked above), so `loop_col < mi_cols`
+    // and `loop_row < mi_rows` lie strictly inside the whole-frame `mi_grid`.
+    let mi = unsafe { ctx.mi_grid.get_unchecked(loop_row, loop_col) };
 
     let mi_size = mi.mi_size();
     let tx_size = mi.tx_size();
@@ -565,36 +564,9 @@ fn wavefront_filter_planes(
 
 /// Frame-wide entry point for spec §8.8 "Loop filter process".
 ///
-/// `planes` is `CurrFrame` (equivalent to `TileDecoder::planes`/`planes_mut`,
-/// a buffer allocated out to superblock boundaries); `mi_grid` is the mode
-/// info grid; `mi_cols`/`mi_rows` is the non-padded, mi-unit frame size
-/// obtained from `compute_image_size()`.
-#[allow(clippy::too_many_arguments)]
-pub fn loop_filter_frame(
-    planes: &mut [Plane; 3],
-    mi_grid: &MiGrid,
-    mi_cols: u32,
-    mi_rows: u32,
-    subsampling_x: u32,
-    subsampling_y: u32,
-    lf: &LoopFilterParams,
-    seg: &SegmentationParams,
-    bit_depth: u8,
-) {
-    loop_filter_frame_with_pool(
-        planes,
-        mi_grid,
-        mi_cols,
-        mi_rows,
-        subsampling_x,
-        subsampling_y,
-        lf,
-        seg,
-        bit_depth,
-        None,
-    );
-}
-
+/// `planes` is `CurrFrame` (equivalent to `TileDecoder::planes`, a buffer allocated out to
+/// superblock boundaries); `mi_grid` is the mode info grid; `mi_cols`/`mi_rows` is the
+/// non-padded, mi-unit frame size obtained from `compute_image_size()`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn loop_filter_frame_with_pool(
     planes: &mut [Plane; 3],
@@ -606,7 +578,7 @@ pub(crate) fn loop_filter_frame_with_pool(
     lf: &LoopFilterParams,
     seg: &SegmentationParams,
     bit_depth: u8,
-    pool: Option<&mut crate::thread_pool::ThreadPool>,
+    mut pool: Option<&mut crate::thread_pool::ThreadPool>,
 ) {
     let ctx = LoopFilterContext {
         mi_grid,
@@ -653,7 +625,16 @@ pub(crate) fn loop_filter_frame_with_pool(
         }
     };
 
-    if n_threads <= 1 {
+    // Wavefront workers synchronize across superblock rows (`sb_row = t, t + n_threads, ...`),
+    // so running wavefront tasks sequentially on one thread would deadlock once `sb_row >= n_threads`.
+    // Ensure the pool actually has `n_threads - 1` live workers before entering the wavefront;
+    // if thread spawning fails (e.g. OS thread limit), fall back cleanly to `loop_filter_plane`.
+    let can_wavefront = n_threads > 1
+        && pool
+            .as_deref_mut()
+            .is_none_or(|p| p.ensure_workers(n_threads - 1));
+
+    if !can_wavefront {
         for (plane_idx, plane) in planes.iter_mut().enumerate() {
             loop_filter_plane(plane, plane_idx, &ctx);
         }

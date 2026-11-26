@@ -56,46 +56,63 @@ fn frame_context_reset_intra_only_reset_frame_context_0_or_1_resets_nothing() {
     );
 }
 
-/// `PrevSegmentIds` reset lifecycle (`clear_prev_segment_ids_if_needed`):
-/// zeroed by `setup_past_independence()` (spec §7.2) and by the first-frame /
-/// size-change condition of `compute_image_size()` (spec §7.2.6); retained for a
-/// same-size non-intra non-error-resilient frame.
+/// `PrevSegmentIds` reset lifecycle (`prepare_prev_segment_ids`):
+/// zeroed by `setup_past_independence()` (spec §7.2), by the first-frame /
+/// size-change condition of `compute_image_size()` (spec §7.2.6), and by any
+/// mismatch with `prev_segment_ids_dims`; retained for a same-size non-intra
+/// non-error-resilient frame without mutating `Decoder` before commit.
 #[test]
 fn prev_segment_ids_reset_lifecycle() {
     // 16x16 -> MiCols = MiRows = 2 (4 entries).
     let dims = (16u32, 16u32);
     let image_size = header::compute_image_size(dims.0, dims.1);
+    let mi_dims = (image_size.mi_cols, image_size.mi_rows);
     let seeded = || {
         let mut d = Decoder::new();
         d.prev_frame_dims = Some(dims);
         d.prev_segment_ids = Arc::new(vec![5u8; 4]);
+        d.prev_segment_ids_dims = Some(mi_dims);
         d
     };
 
-    // Same size, no setup_past_independence: the map is retained.
-    let mut d = seeded();
-    d.clear_prev_segment_ids_if_needed(dims, &image_size, false);
-    assert_eq!(*d.prev_segment_ids, vec![5u8; 4]);
+    // Same size, matching map dims, no setup_past_independence: the map is retained.
+    let d = seeded();
+    let (map, cleared) = d.prepare_prev_segment_ids(dims, &image_size, false);
+    assert!(!cleared);
+    assert_eq!(*map, vec![5u8; 4]);
 
     // setup_past_independence (FrameIsIntra || error_resilient_mode): zeroed even
-    // though the size is unchanged.
-    let mut d = seeded();
-    d.clear_prev_segment_ids_if_needed(dims, &image_size, true);
-    assert_eq!(*d.prev_segment_ids, vec![0u8; 4]);
+    // though the size is unchanged; decoder's stored map stays untouched until commit.
+    let d = seeded();
+    let (map, cleared) = d.prepare_prev_segment_ids(dims, &image_size, true);
+    assert!(cleared);
+    assert_eq!(*map, vec![0u8; 4]);
+    assert_eq!(*d.prev_segment_ids, vec![5u8; 4]);
 
     // Size change (compute_image_size step 1): zeroed (and resized) even without
     // setup_past_independence.
-    let mut d = seeded();
+    let d = seeded();
     let new_dims = (24u32, 16u32); // MiCols = 3, MiRows = 2 -> 6 entries.
     let new_image_size = header::compute_image_size(new_dims.0, new_dims.1);
-    d.clear_prev_segment_ids_if_needed(new_dims, &new_image_size, false);
-    assert_eq!(*d.prev_segment_ids, vec![0u8; 6]);
+    let (map, cleared) = d.prepare_prev_segment_ids(new_dims, &new_image_size, false);
+    assert!(cleared);
+    assert_eq!(*map, vec![0u8; 6]);
+    assert_eq!(*d.prev_segment_ids, vec![5u8; 4]);
+
+    // Explicit prev_segment_ids_dims mismatch forces a fresh zeroed map even if
+    // prev_frame_dims happens to match.
+    let mut d = seeded();
+    d.prev_segment_ids_dims = Some((1, 1));
+    let (map, cleared) = d.prepare_prev_segment_ids(dims, &image_size, false);
+    assert!(cleared);
+    assert_eq!(*map, vec![0u8; 4]);
 
     // First invocation (prev_frame_dims == None): zeroed.
     let mut d = Decoder::new();
     d.prev_segment_ids = Arc::new(vec![5u8; 4]);
-    d.clear_prev_segment_ids_if_needed(dims, &image_size, false);
-    assert_eq!(*d.prev_segment_ids, vec![0u8; 4]);
+    let (map, cleared) = d.prepare_prev_segment_ids(dims, &image_size, false);
+    assert!(cleared);
+    assert_eq!(*map, vec![0u8; 4]);
 }
 
 /// A `FrameContext` distinguishable from `FrameContext::default()`, standing in for a

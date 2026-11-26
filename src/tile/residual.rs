@@ -407,7 +407,9 @@ impl TileDecoder {
         let delta = clamped_delta as i32;
         let max_i32 = max_val as i32;
         for i in 0..n0 {
-            let row = &mut self.planes[plane].row_mut(start_y + i)[local_x..local_x + n0];
+            // SAFETY: `start_y + i < start_y + n0 <= planes[plane].height` (superblock-padded).
+            let row = &mut unsafe { self.planes[plane].row_mut_unchecked(start_y + i) }
+                [local_x..local_x + n0];
             for px in row {
                 *px = (*px as i32 + delta).clamp(0, max_i32) as u16;
             }
@@ -654,7 +656,9 @@ impl TileDecoder {
         );
         let max_val = (1i64 << self.bit_depth) - 1;
         for i in 0..n0 {
-            let row = &mut self.planes[plane].row_mut(start_y + i)[local_x..local_x + n0];
+            // SAFETY: `start_y + i < start_y + n0 <= planes[plane].height` (superblock-padded).
+            let row = &mut unsafe { self.planes[plane].row_mut_unchecked(start_y + i) }
+                [local_x..local_x + n0];
             let dq_row = &self.scratch.dequant_buf[i * n0..(i + 1) * n0];
             for (px, &dq) in row.iter_mut().zip(dq_row.iter()) {
                 *px = (*px as i64 + dq).clamp(0, max_val) as u16;

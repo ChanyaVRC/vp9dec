@@ -13,7 +13,9 @@ use crate::prob_tables::{
 #[inline]
 fn load_clamped_above(plane: &Plane, x: usize, y: usize, max_x: usize, dst: &mut [u16]) {
     for (i, slot) in dst.iter_mut().enumerate() {
-        *slot = plane.get((x + i).min(max_x), y - 1);
+        // SAFETY: `y >= 1` (`have_above`), `x >= plane.x0`, and `min(x + i, max_x)` stays inside
+        // this tile/strip's horizontal bounds.
+        *slot = unsafe { plane.get_unchecked((x + i).min(max_x), y - 1) };
     }
 }
 
@@ -21,7 +23,9 @@ fn load_clamped_above(plane: &Plane, x: usize, y: usize, max_x: usize, dst: &mut
 #[inline]
 fn load_clamped_left(plane: &Plane, x: usize, y: usize, max_y: usize, dst: &mut [u16]) {
     for (i, slot) in dst.iter_mut().enumerate() {
-        *slot = plane.get(x - 1, (y + i).min(max_y));
+        // SAFETY: `x - 1 >= plane.x0` (`have_left` is gated at tile start) and
+        // `min(y + i, max_y) < plane.height`.
+        *slot = unsafe { plane.get_unchecked(x - 1, (y + i).min(max_y)) };
     }
 }
 
@@ -196,7 +200,8 @@ fn predict_intra_avx2(
         }
         TM_PRED => {
             let top_left = if have_above && have_left {
-                plane.get(x.saturating_sub(1).min(max_x), y - 1)
+                // SAFETY: `have_above && have_left` guarantees `(x - 1, y - 1)` is inside the strip.
+                unsafe { plane.get_unchecked(x.saturating_sub(1).min(max_x), y - 1) }
             } else if have_above {
                 base + 1
             } else {
@@ -255,20 +260,23 @@ pub(crate) fn predict_intra_scalar(
     let above_row = &mut above_row_buf[..2 * size + 1];
     for i in 0..size {
         above_row[i + 1] = if have_above {
-            plane.get((x + i).min(max_x), y - 1) as i32
+            // SAFETY: `have_above` guarantees `y >= 1` and `(x + i).min(max_x)` lies in strip bounds.
+            unsafe { plane.get_unchecked((x + i).min(max_x), y - 1) as i32 }
         } else {
             base - 1
         };
     }
     for i in size..2 * size {
         above_row[i + 1] = if have_above && not_on_right && tx_size == TX_4X4 {
-            plane.get((x + i).min(max_x), y - 1) as i32
+            // SAFETY: `not_on_right` keeps the above-right 4x4 within the current tile/strip.
+            unsafe { plane.get_unchecked((x + i).min(max_x), y - 1) as i32 }
         } else {
             above_row[size]
         };
     }
     above_row[0] = if have_above && have_left {
-        plane.get(x.saturating_sub(1).min(max_x), y - 1) as i32
+        // SAFETY: `have_above && have_left` guarantees `(x - 1, y - 1)` lies in strip bounds.
+        unsafe { plane.get_unchecked(x.saturating_sub(1).min(max_x), y - 1) as i32 }
     } else if have_above {
         base + 1
     } else {
@@ -280,7 +288,8 @@ pub(crate) fn predict_intra_scalar(
     let left_col = &mut left_col_buf[..size];
     for (i, slot) in left_col.iter_mut().enumerate() {
         *slot = if have_left {
-            plane.get(x - 1, (y + i).min(max_y)) as i32
+            // SAFETY: `have_left` guarantees `x - 1 >= plane.x0` and `(y + i).min(max_y) < plane.height`.
+            unsafe { plane.get_unchecked(x - 1, (y + i).min(max_y)) as i32 }
         } else {
             base + 1
         };
@@ -444,7 +453,10 @@ pub(crate) fn predict_intra_scalar(
 
     for i in 0..size {
         for j in 0..size {
-            plane.set(x + j, y + i, pred[at(i, j)] as u16);
+            // SAFETY: caller's block `[x..x + size) x [y..y + size)` lies within `plane`'s strip.
+            unsafe {
+                plane.set_unchecked(x + j, y + i, pred[at(i, j)] as u16);
+            }
         }
     }
 }
